@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { View, Text, StyleSheet, FlatList, TouchableOpacity, Platform } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
-import { sendLocalNotification } from '../../utils/Notifications';
+import { sendLocalNotification } from '../../src/utils/Notifications';
 import { LinearGradient } from 'expo-linear-gradient';
 
 // Mock Data

@@ -1,64 +1,233 @@
 import { View, Text, StyleSheet, ScrollView, TouchableOpacity, FlatList, Image } from 'react-native';
-import { useEffect, useState } from 'react';
-import { auth, db } from '../../../firebaseConfig';
-import { doc, getDoc, collection, query, limit, getDocs, onSnapshot, where } from 'firebase/firestore';
+import { useEffect, useState, useRef } from 'react';
+import { sendLocalNotification } from '../../../src/utils/Notifications';
+import { auth, db } from '../../../src/services/firebaseConfig';
+import { doc, getDoc, collection, getDocs, onSnapshot, query, where, limit, or } from 'firebase/firestore';
+import { onAuthStateChanged } from 'firebase/auth';
 import { FontAwesome } from '@expo/vector-icons';
 import { router } from 'expo-router';
+import * as Location from 'expo-location';
+import { User, Meeting, Notification } from '../../../src/types';
+
+const getDistanceFromLatLonInKm = (lat1: number, lon1: number, lat2: number, lon2: number) => {
+  const R = 6371; // Radius of the earth in km
+  const dLat = (lat2 - lat1) * (Math.PI / 180);
+  const dLon = (lon2 - lon1) * (Math.PI / 180);
+  const a = 
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(lat1 * (Math.PI / 180)) * Math.cos(lat2 * (Math.PI / 180)) * 
+    Math.sin(dLon / 2) * Math.sin(dLon / 2); 
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)); 
+  return R * c; // Distance in km
+};
+
+// Helper function para formatar a data do evento
+const MONTH_NAMES = ['JAN', 'FEV', 'MAR', 'ABR', 'MAI', 'JUN', 'JUL', 'AGO', 'SET', 'OUT', 'NOV', 'DEZ'];
+
+const formatEventDate = (dateString: string | undefined) => {
+  if (!dateString) return { day: '--', month: '---' };
+
+  try {
+    // Normaliza a data: substitui / por - e faz trim
+    const normalized = dateString.trim().replace(/\//g, '-');
+    const parts = normalized.split('-');
+
+    if (parts.length === 3) {
+      // Formato YYYY-MM-DD
+      const monthIndex = parseInt(parts[1], 10) - 1;
+      const day = parseInt(parts[2], 10);
+
+      return {
+        day: day.toString().padStart(2, '0'),
+        month: MONTH_NAMES[monthIndex] || '---'
+      };
+    }
+  } catch (e) {
+    console.warn('Error parsing date:', dateString, e);
+  }
+
+  return { day: '--', month: '---' };
+};
 
 export default function HomeScreen() {
-  const [userProfile, setUserProfile] = useState<any>(null);
-  const [highlights, setHighlights] = useState<any[]>([]);
-  const [myEvents, setMyEvents] = useState<any[]>([]);
+  const [userProfile, setUserProfile] = useState<User | null>(null);
+  const [highlights, setHighlights] = useState<Meeting[]>([]);
+  const [allUpcomingEvents, setAllUpcomingEvents] = useState<Meeting[]>([]);
+  const [myEvents, setMyEvents] = useState<Meeting[]>([]);
+  const [location, setLocation] = useState<Location.LocationObject | null>(null);
+  const [nearbyEvents, setNearbyEvents] = useState<Meeting[]>([]);
+
   const [unreadCount, setUnreadCount] = useState(0);
 
+  // Ref to track first load and prevent notification spam
+  const isFirstNotificationLoad = useRef(true);
+
+  // Solicitar localização
   useEffect(() => {
-    if (auth.currentUser) {
-      // Fetch Profile
-      getDoc(doc(db, 'users', auth.currentUser.uid)).then(snap => {
-        if (snap.exists()) setUserProfile(snap.data());
+    (async () => {
+      let { status } = await Location.requestForegroundPermissionsAsync();
+      if (status === 'granted') {
+        let loc = await Location.getCurrentPositionAsync({});
+        setLocation(loc);
+      }
+    })();
+  }, []);
+
+  // Calcular Eventos Próximos de forma independente dos destaques
+  useEffect(() => {
+    if (location && allUpcomingEvents.length > 0) {
+      const withDistance = allUpcomingEvents
+        .filter(m => m.lat && m.lng && m.type !== 'online')
+        .map(m => {
+          const dist = getDistanceFromLatLonInKm(location.coords.latitude, location.coords.longitude, m.lat!, m.lng!);
+          return { ...m, distance: dist };
+        });
+      withDistance.sort((a, b) => a.distance - b.distance);
+      setNearbyEvents(withDistance.slice(0, 5));
+    }
+  }, [location, allUpcomingEvents]);
+
+  useEffect(() => {
+    let unsubConversations: any;
+    let unsubNotifications: any;
+
+    const unsubscribeAuth = onAuthStateChanged(auth, (user) => {
+      if (!user) {
+        if (unsubConversations) unsubConversations();
+        if (unsubNotifications) unsubNotifications();
+        return;
+      }
+      
+      const currentUid = user.uid;
+
+      getDoc(doc(db, 'users', currentUid)).then(snap => {
+        if (snap.exists()) {
+          setUserProfile({ uid: snap.id, ...snap.data() } as User);
+        }
       });
 
-      // Listen for Unread Messages
-      const qUnread = query(
+      // Listen for Unread Messages & Notifications
+      const qConversations = query(
         collection(db, 'conversations'),
-        where('participants', 'array-contains', auth.currentUser.uid)
+        where('participants', 'array-contains', currentUid),
+        limit(20)
       );
 
-      const unsubscribe = onSnapshot(qUnread, (snapshot) => {
+      const qNotifications = query(
+        collection(db, 'notifications'),
+        where('userId', '==', currentUid),
+        where('read', '==', false),
+        limit(50)
+      );
+
+      let msgCount = 0;
+      let noteCount = 0;
+      const updateTotal = () => setUnreadCount(msgCount + noteCount);
+
+      unsubConversations = onSnapshot(qConversations, (snapshot) => {
         let count = 0;
         snapshot.docs.forEach(doc => {
           const data = doc.data();
-          // Check if unreadCounts exists and has count for me
-          if (data.unreadCounts && data.unreadCounts[auth.currentUser!.uid]) {
-            count += data.unreadCounts[auth.currentUser!.uid];
+          if (data.unreadCounts && data.unreadCounts[currentUid]) {
+            count += data.unreadCounts[currentUid];
           }
         });
-        setUnreadCount(count);
+        msgCount = count;
+        updateTotal();
+      }, (error) => {
+        console.warn('Error in conversations listener:', error);
       });
 
-      // Fetch My Joined Events (Placeholder logic)
-      const qEvents = query(collection(db, 'meetings'), limit(3));
-      getDocs(qEvents).then(snap => {
-        setMyEvents(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+      unsubNotifications = onSnapshot(qNotifications, (snapshot) => {
+        noteCount = snapshot.size;
+        updateTotal();
+
+        // Handle local notifications for new items (skipping first load)
+        if (isFirstNotificationLoad.current) {
+          isFirstNotificationLoad.current = false;
+          return;
+        }
+
+        snapshot.docChanges().forEach((change) => {
+          if (change.type === "added") {
+            const data = change.doc.data();
+            const notificationTitle = data.title || 'Nova Notificação';
+            const notificationBody = data.message || data.body || 'Você tem uma nova interação no Reunion Hub.';
+            sendLocalNotification(notificationTitle, notificationBody);
+          }
+        });
+      }, (error) => {
+        console.warn('Error in notifications listener:', error);
       });
 
-      // Fetch Highlights (Placeholder logic)
-      getDocs(qEvents).then(snap => {
-        setHighlights(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+      // Fetch and Filter Meetings Scalably
+      const now = new Date();
+      const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+
+      // 1. Meus Eventos: Buscar de forma limitada onde sou participante
+      const qMyEvents = query(
+        collection(db, 'meetings'),
+        where('attendees', 'array-contains', currentUid),
+        limit(30)
+      );
+      
+      getDocs(qMyEvents).then(snap => {
+         const myEventsData = snap.docs.map(d => ({ id: d.id, ...d.data() } as Meeting));
+         const futureMyEvents = myEventsData.filter((m) => {
+            if (!m.date) return false;
+            return m.date.replace(/\//g, '-') >= todayStr;
+         });
+         futureMyEvents.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+         setMyEvents(futureMyEvents.slice(0, 5));
       });
 
-      return () => unsubscribe();
-    }
-  }, []);
+      // 2. Destaques: Buscar eventos futuros gerais (limite para não travar o banco)
+      const qHighlights = query(
+        collection(db, 'meetings'),
+        where('date', '>=', todayStr),
+        limit(20) // Proteção anti-faturamento
+      );
 
-  const renderEventCard = ({ item }: { item: any }) => (
-    <TouchableOpacity style={styles.eventCard} onPress={() => router.push(`/meeting/${item.id}`)}>
+      getDocs(qHighlights).then(snap => {
+         const highlightsData = snap.docs.map(d => ({ id: d.id, ...d.data() } as Meeting));
+         const userInterests = userProfile?.interests || [];
+         
+         const upcomingHighlights = highlightsData.filter((m) => {
+           const isOwn = m.createdBy === currentUid || (m.attendees && currentUid ? m.attendees.includes(currentUid) : false);
+           return !isOwn; // Não destaca meus próprios eventos
+         });
+
+         // Guarda todos para calcular a distância depois
+         setAllUpcomingEvents(upcomingHighlights);
+
+         // Ordenar por relevância (match de interesses) para os destaques
+         const sortedHighlights = [...upcomingHighlights].sort((a, b) => {
+           const matchA = (a.interests || []).filter((i: string) => userInterests.includes(i)).length;
+           const matchB = (b.interests || []).filter((i: string) => userInterests.includes(i)).length;
+           if (matchA !== matchB) return matchB - matchA;
+           return (b.attendees?.length || 0) - (a.attendees?.length || 0);
+         });
+
+         setHighlights(sortedHighlights.slice(0, 5));
+      });
+
+    });
+
+    return () => {
+      unsubscribeAuth();
+      if (unsubConversations) unsubConversations();
+      if (unsubNotifications) unsubNotifications();
+    };
+  }, [userProfile?.interests]);
+
+  const renderEventCard = ({ item }: { item: Meeting }) => (
+    <TouchableOpacity style={styles.eventCard} onPress={() => router.push(`/event/${item.id}` as never)}>
       <View style={styles.eventHeader}>
         <FontAwesome name="calendar" size={14} color="#6366f1" />
-        <Text style={styles.eventDate}>{item.date}</Text>
+        <Text style={styles.eventDate}>{item.date || 'Data a definir'}</Text>
       </View>
       <Text style={styles.eventTitle} numberOfLines={1}>{item.title}</Text>
-      <Text style={styles.eventLoc} numberOfLines={1}>{item.locationName}</Text>
+      <Text style={styles.eventLoc} numberOfLines={1}>{item.locationName || 'Local a definir'}</Text>
     </TouchableOpacity>
   );
 
@@ -81,10 +250,10 @@ export default function HomeScreen() {
           <View style={styles.headerActions}>
             <TouchableOpacity
               style={styles.iconBtn}
-              onPress={() => router.push('/(drawer)/notifications')}
+              onPress={() => router.push('/notifications')}
             >
               <FontAwesome
-                name="bell-o" // Always outline unless we want to change it
+                name={unreadCount > 0 ? "bell" : "bell-o"}
                 size={22}
                 color={unreadCount > 0 ? "#ef4444" : "#6b7280"}
               />
@@ -95,9 +264,9 @@ export default function HomeScreen() {
               )}
             </TouchableOpacity>
 
-            <TouchableOpacity style={styles.profileBtn} onPress={() => router.push('/(drawer)/(tabs)/profile')}>
+            <TouchableOpacity style={styles.profileBtn} onPress={() => router.push('/profile')}>
               {auth.currentUser?.photoURL ? (
-                <Image source={{ uri: auth.currentUser.photoURL }} style={styles.profileImg} />
+                <Image source={{ uri: auth.currentUser.photoURL || '' }} style={styles.profileImg} />
               ) : (
                 <Text style={styles.profileInitial}>{auth.currentUser?.displayName?.charAt(0) || 'U'}</Text>
               )}
@@ -118,13 +287,12 @@ export default function HomeScreen() {
       <View style={styles.section}>
         <View style={styles.sectionHeader}>
           <Text style={styles.sectionTitle}>Destaques para você</Text>
-          <TouchableOpacity><Text style={styles.seeAll}>Ver todos</Text></TouchableOpacity>
         </View>
 
         {userProfile?.interests && userProfile.interests.length > 0 ? (
           <Text style={styles.interestTag}>Baseado em: {userProfile.interests.join(', ')}</Text>
         ) : (
-          <TouchableOpacity style={styles.addInterestBtn} onPress={() => router.push('/(drawer)/(tabs)/profile')}>
+          <TouchableOpacity style={styles.addInterestBtn} onPress={() => router.push('/profile')}>
             <Text style={styles.addInterestText}>+ Adicionar Interesses</Text>
           </TouchableOpacity>
         )}
@@ -145,18 +313,53 @@ export default function HomeScreen() {
         {myEvents.length === 0 ? (
           <Text style={styles.emptyText}>Você não tem eventos próximos.</Text>
         ) : (
-          myEvents.map(event => (
-            <TouchableOpacity key={event.id} style={styles.listCard} onPress={() => router.push(`/meeting/${event.id}`)}>
-              <View style={styles.dateBox}>
-                <Text style={styles.dateDay}>19</Text>
-                <Text style={styles.dateMonth}>DEZ</Text>
-              </View>
-              <View style={styles.listContent}>
-                <Text style={styles.listTitle}>{event.title}</Text>
-                <Text style={styles.listTime}>{event.time || '14:00'} • {event.locationName}</Text>
-              </View>
-            </TouchableOpacity>
-          ))
+          myEvents.map(event => {
+            const { day, month } = formatEventDate(event.date);
+            return (
+              <TouchableOpacity key={event.id} style={styles.listCard} onPress={() => router.push(`/event/${event.id}` as any)}>
+                <View style={styles.dateBox}>
+                  <Text style={styles.dateDay}>{day}</Text>
+                  <Text style={styles.dateMonth}>{month}</Text>
+                </View>
+                <View style={styles.listContent}>
+                  <Text style={styles.listTitle}>{event.title}</Text>
+                  <Text style={styles.listTime}>{event.time || 'Horário a definir'} • {event.locationName || 'Local a definir'}</Text>
+                </View>
+              </TouchableOpacity>
+            );
+          })
+        )}
+      </View>
+
+      {/* Nearby Events Section */}
+      <View style={styles.section}>
+        <View style={styles.sectionHeader}>
+          <Text style={styles.sectionTitle}>Eventos Próximos a Você</Text>
+        </View>
+        {!location ? (
+          <Text style={styles.emptyText}>Permita o acesso à localização para ver eventos próximos.</Text>
+        ) : nearbyEvents.length === 0 ? (
+          <Text style={styles.emptyText}>Nenhum evento presencial próximo encontrado no momento.</Text>
+        ) : (
+          <FlatList
+            horizontal
+            data={nearbyEvents}
+            keyExtractor={item => item.id}
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={styles.horizontalList}
+            renderItem={({ item }) => (
+              <TouchableOpacity style={styles.eventCard} onPress={() => router.push(`/event/${item.id}` as any)}>
+                <View style={styles.eventHeader}>
+                  <FontAwesome name="map-marker" size={14} color="#ec4899" />
+                  <Text style={[styles.eventDate, { color: '#ec4899' }]}>
+                    A {(item.distance ?? 0).toFixed(1)} km daqui
+                  </Text>
+                </View>
+                <Text style={styles.eventTitle} numberOfLines={1}>{item.title}</Text>
+                <Text style={styles.eventLoc} numberOfLines={1}>{item.locationName || 'Local a definir'}</Text>
+              </TouchableOpacity>
+            )}
+          />
         )}
       </View>
     </ScrollView>

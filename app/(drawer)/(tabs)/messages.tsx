@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { View, Text, StyleSheet, FlatList, TouchableOpacity, Image, Modal, TextInput, Alert, ActivityIndicator } from 'react-native';
 import { FontAwesome, Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import { auth, db } from '../../../firebaseConfig';
+import { auth, db } from '../../../src/services/firebaseConfig';
 import { collection, query, where, onSnapshot, doc, getDoc, setDoc, serverTimestamp, getDocs, orderBy, limit } from 'firebase/firestore';
 
 export default function MessagesScreen() {
@@ -35,27 +35,27 @@ export default function MessagesScreen() {
         return () => unsubscribe();
     }, []);
 
+    /**
+     * Inicia uma nova conversa baseada no Nick informado.
+     * Busca o usuário pelo nick único e cria/abre a conversa determinística.
+     */
     const startNewChat = async () => {
-        if (!targetNick.trim()) {
+        const trimmedNick = targetNick.trim().toLowerCase();
+        if (!trimmedNick) {
             Alert.alert('Erro', 'Por favor digite o Nick do usuário.');
-            return;
-        }
-
-        if (targetNick.trim() === auth.currentUser?.displayName) { // Basic check, better to check UID match after query
-            Alert.alert('Erro', 'Você não pode enviar mensagem para si mesmo.');
             return;
         }
 
         setCreatingChat(true);
 
         try {
-            // 1. Find User by Nick
+            // 1. Localizar Usuário pelo Nick (searchName é indexado e case-insensitive)
             const usersRef = collection(db, 'users');
-            const q = query(usersRef, where('searchName', '==', targetNick.trim().toLowerCase()));
-            const querySnapshot = await getDocs(q);
+            const qUsers = query(usersRef, where('searchName', '==', trimmedNick));
+            const querySnapshot = await getDocs(qUsers);
 
             if (querySnapshot.empty) {
-                Alert.alert('Erro', 'Usuário não encontrado.');
+                Alert.alert('Erro', 'Usuário não encontrado. Verifique o Nick e tente novamente.');
                 setCreatingChat(false);
                 return;
             }
@@ -70,9 +70,9 @@ export default function MessagesScreen() {
                 return;
             }
 
-            // 2. Create/Get Conversation
-            // Use sorted UIDs for 1:1 chat ID to prevent duplicates
-            const uids = [auth.currentUser?.uid, targetUid].sort();
+            // 2. Criar ou Obter Conversa
+            // Usamos um ID determinístico baseado na ordenação alfabética dos UIDs
+            const uids = [auth.currentUser!.uid, targetUid].sort();
             const chatId = `${uids[0]}_${uids[1]}`;
             const chatRef = doc(db, 'conversations', chatId);
 
@@ -82,30 +82,29 @@ export default function MessagesScreen() {
                 await setDoc(chatRef, {
                     participants: uids,
                     participantNames: {
-                        [auth.currentUser!.uid]: auth.currentUser?.displayName || 'Unknown',
-                        [targetUid]: targetUser.nick || targetUser.displayName || 'Unknown'
+                        [auth.currentUser!.uid]: auth.currentUser?.displayName || 'Eu',
+                        [targetUid]: targetUser.nick || targetUser.displayName || 'Usuário'
                     },
-                    lastMessage: 'Chat iniciado',
+                    lastMessage: 'Conversa iniciada',
                     lastMessageTimestamp: serverTimestamp(),
-                    unreadCounts: { [targetUid]: 1 }
+                    unreadCounts: { [auth.currentUser!.uid]: 0, [targetUid]: 0 }
                 });
             }
 
-            // 3. Navigate to Chat
+            // 3. Navegar para o Chat
             setShowNewChatModal(false);
             setTargetNick('');
             router.push({
-                pathname: '/chat/[id]',
+                pathname: '/conversation/[id]',
                 params: {
                     id: chatId,
                     name: targetUser.nick || targetUser.displayName || 'Usuário'
                 }
             });
-            // Alert.alert('Sucesso', 'Chat criado! Selecione na lista para conversar.'); // Removed alert as we navigate now
 
         } catch (error) {
-            console.error(error);
-            Alert.alert('Erro', 'Falha ao criar chat.');
+            console.error("Error creating chat:", error);
+            Alert.alert('Erro', 'Não foi possível iniciar a conversa. Verifique sua conexão.');
         } finally {
             setCreatingChat(false);
         }
@@ -123,7 +122,7 @@ export default function MessagesScreen() {
             <TouchableOpacity
                 style={styles.conversationItem}
                 onPress={() => router.push({
-                    pathname: '/chat/[id]',
+                    pathname: '/conversation/[id]',
                     params: { id: item.id, name: otherName }
                 })}
             >

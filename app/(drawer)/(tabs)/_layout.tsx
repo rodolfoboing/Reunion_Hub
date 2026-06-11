@@ -3,9 +3,9 @@ import FontAwesome from '@expo/vector-icons/FontAwesome';
 import { Link, Tabs } from 'expo-router';
 import { Pressable } from 'react-native';
 
-import Colors from '@/constants/Colors';
-import { useColorScheme } from '@/components/useColorScheme';
-import { useClientOnlyValue } from '@/components/useClientOnlyValue';
+import Colors from '@/src/constants/Colors';
+import { useColorScheme } from '@/src/components/useColorScheme';
+import { useClientOnlyValue } from '@/src/components/useClientOnlyValue';
 
 // You can explore the built-in icon families and icons on the web at https://icons.expo.fyi/
 function TabBarIcon(props: {
@@ -37,9 +37,17 @@ export default function TabLayout() {
       <Tabs.Screen
         name="explore"
         options={{
-          title: 'Explorar',
+          title: 'Explorar Eventos',
           headerShown: false,
           tabBarIcon: ({ color }) => <TabBarIcon name="compass" color={color} />,
+        }}
+      />
+      <Tabs.Screen
+        name="agenda"
+        options={{
+          title: 'Minha Agenda',
+          headerShown: false,
+          tabBarIcon: ({ color }) => <TabBarIcon name="calendar" color={color} />,
         }}
       />
       <Tabs.Screen
@@ -50,39 +58,11 @@ export default function TabLayout() {
           tabBarIcon: ({ color }) => <TabBarIcon name="comment" color={color} />,
         }}
       />
-      <Tabs.Screen
-        name="meetings"
-        options={{
-          href: null, // Ocultando a aba antiga de eventos pois agora está em Explorar
-          title: 'Eventos',
-          tabBarIcon: ({ color }) => <TabBarIcon name="list" color={color} />,
-        }}
-      />
-      <Tabs.Screen
-        name="map"
-        options={{
-          href: null, // Ocultando a aba antiga de mapa
-          title: 'Mapa',
-          tabBarIcon: ({ color }) => <TabBarIcon name="map-marker" color={color} />,
-        }}
-      />
-      <Tabs.Screen
-        name="profile"
-        options={{
-          href: null, // Ocultando a aba antiga de mapa
-          title: 'Perfil',
-          headerShown: false,
-          tabBarIcon: ({ color }) => <TabBarIcon name="user" color={color} />,
-        }}
-      />
-      <Tabs.Screen
-        name="agenda"
-        options={{
-          title: 'Agenda',
-          headerShown: false,
-          tabBarIcon: ({ color }) => <TabBarIcon name="calendar" color={color} />,
-        }}
-      />
+      {/* Escondendo os componentes colocalizados da barra inferior */}
+      <Tabs.Screen name="_components/explore/CreateEventModal" options={{ href: null }} />
+      <Tabs.Screen name="_components/explore/LocationPickerModal" options={{ href: null }} />
+      <Tabs.Screen name="_components/explore/PlaceModal" options={{ href: null }} />
+      <Tabs.Screen name="_hooks/useExploreData" options={{ href: null }} />
     </Tabs>
   );
 }

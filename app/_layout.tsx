@@ -6,9 +6,10 @@ import * as SplashScreen from 'expo-splash-screen';
 import React, { useEffect, useState } from 'react';
 import { View, Text } from 'react-native';
 import 'react-native-reanimated';
-import { auth } from '../firebaseConfig'; // Import auth
-import { useColorScheme } from '@/components/useColorScheme';
-import { setupNotifications } from '../utils/Notifications';
+import { auth, db } from '../src/services/firebaseConfig'; // Import auth
+import { doc, getDoc } from 'firebase/firestore';
+import { useColorScheme } from '@/src/components/useColorScheme';
+import { setupNotifications } from '../src/utils/Notifications';
 
 export {
   // Catch any errors thrown by the Layout component.
@@ -16,8 +17,8 @@ export {
 } from 'expo-router';
 
 export const unstable_settings = {
-  // Alteração 1: O ponto de partida agora é o Drawer, não as Tabs diretas
-  initialRouteName: '(drawer)',
+  // Alteração 1: O ponto de partida agora é (auth) se não estiver logado
+  initialRouteName: '(auth)',
 };
 
 // Prevent the splash screen from auto-hiding before asset loading is complete.
@@ -64,7 +65,22 @@ export default function RootLayout() {
 
       if (!user) {
         // Redireciona para login se não houver usuário
-        router.replace('/(drawer)/login');
+        router.replace('/login');
+      } else {
+        // Verifica se o perfil está completo
+        const checkProfile = async () => {
+          try {
+            const docRef = doc(db, 'users', user.uid);
+            const docSnap = await getDoc(docRef);
+            if (docSnap.exists() && docSnap.data().isProfileComplete === false) {
+              console.log("[ReunionHub Debug] Perfil incompleto, redirecionando para onboarding.");
+              router.replace('/onboarding' as any);
+            }
+          } catch (error) {
+            console.error("Erro ao checar perfil completo", error);
+          }
+        };
+        checkProfile();
       }
     }
   }, [loaded, authInitialized, user]);
@@ -106,9 +122,10 @@ function RootLayoutNav() {
   return (
     <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
       <Stack>
-        {/* Alteração 2: Apontamos para a pasta (drawer) */}
+        {/* Alteração 2: Stack com grupos (main) e (auth) */}
         <Stack.Screen name="(drawer)" options={{ headerShown: false }} />
-        <Stack.Screen name="modal" options={{ presentation: 'modal' }} />
+        <Stack.Screen name="(auth)" options={{ headerShown: false }} />
+        <Stack.Screen name="info-modal" options={{ presentation: 'modal' }} />
       </Stack>
     </ThemeProvider>
   );

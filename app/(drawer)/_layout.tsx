@@ -37,24 +37,33 @@ export default function DrawerLayout() {
           }}
         />
         <Drawer.Screen
-          name="login"
+          name="profile"
           options={{
-            drawerItemStyle: { display: 'none' },
-            headerShown: false,
+            drawerLabel: 'Meu Perfil',
+            title: 'Meu Perfil',
+            drawerIcon: ({ color, size }) => (
+              <Ionicons name="person-outline" size={size} color={color} />
+            ),
           }}
         />
         <Drawer.Screen
-          name="register"
+          name="my-events"
           options={{
-            drawerItemStyle: { display: 'none' },
-            headerShown: false,
+            drawerLabel: 'Meus Eventos',
+            title: 'Meus Eventos',
+            drawerIcon: ({ color, size }) => (
+              <Ionicons name="calendar-outline" size={size} color={color} />
+            ),
           }}
         />
         <Drawer.Screen
-          name="complete-profile"
+          name="map"
           options={{
-            drawerItemStyle: { display: 'none' },
-            headerShown: false,
+            drawerLabel: 'Mapa de Eventos',
+            title: 'Mapa',
+            drawerIcon: ({ color, size }) => (
+              <Ionicons name="map-outline" size={size} color={color} />
+            ),
           }}
         />
       </Drawer>

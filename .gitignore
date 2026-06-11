@@ -38,7 +38,8 @@ yarn-error.*
 
 # generated native folders
 /ios/
-/android/
+
+
 
 # environment variables
 .env
@@ -58,3 +59,7 @@ GoogleService-Info.plist
 # ignore firebase config if it contains keys (optional, but safer to use .env)
 # firebaseConfig.js
 
+
+# project configs with keys
+app.json
+eas.json

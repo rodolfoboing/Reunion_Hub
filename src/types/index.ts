@@ -7,6 +7,7 @@ export interface User {
     eventsAttended?: number;
     foundedPlacesCount?: number;
     interests?: string[];
+    blockedUsers?: string[];
 }
 
 export interface Meeting {
@@ -42,6 +43,7 @@ export interface Place {
     founderName?: string;
     frequenters?: string[];
     habits?: Record<string, string[]>;
+    isCommunity?: boolean;
 }
 
 export interface Message {

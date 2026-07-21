@@ -1,13 +1,15 @@
-import { View, Text, StyleSheet, ScrollView, Alert, TouchableOpacity, Image, TextInput } from 'react-native';
+import { View, Text, StyleSheet, ScrollView, Alert, TouchableOpacity, Image, TextInput, Linking } from 'react-native';
 import { useState, useEffect } from 'react';
 import { auth, db } from '../../src/services/firebaseConfig';
-import { doc, getDoc, setDoc, collection, query, where, getDocs } from 'firebase/firestore';
-import { updateProfile } from 'firebase/auth';
+import { doc, getDoc, setDoc, collection, query, where, getDocs, deleteDoc } from 'firebase/firestore';
+import { updateProfile, deleteUser } from 'firebase/auth';
 import { storage } from '../../src/services/firebaseConfig';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import * as ImagePicker from 'expo-image-picker';
 import { FontAwesome } from '@expo/vector-icons';
 import { StyledButton } from '@/src/components/StyledButton';
+import { TermsModal } from '@/src/components/TermsModal';
+import { ManualModal } from '@/src/components/ManualModal';
 import { router } from 'expo-router';
 
 import { INTERESTS_OPTIONS } from '../../src/constants/Interests';
@@ -20,6 +22,8 @@ export default function ProfileScreen() {
     const [editInterests, setEditInterests] = useState<string[]>([]);
     const [editPhotoURL, setEditPhotoURL] = useState<string | null>(null);
     const [loading, setLoading] = useState(false);
+    const [showTermsModal, setShowTermsModal] = useState(false);
+    const [showManualModal, setShowManualModal] = useState(false);
 
     useEffect(() => {
         if (auth.currentUser) {
@@ -114,6 +118,27 @@ export default function ProfileScreen() {
                     return;
                 }
             }
+            if (editNick.trim().length < 3) {
+                Alert.alert('Atenção', 'O Nickname deve ter pelo menos 3 caracteres.');
+                setLoading(false);
+                return;
+            }
+
+            const searchName = editNick.trim().toLowerCase();
+
+            // Validate nick uniqueness
+            if (searchName !== userProfile?.searchName) {
+                const usersRef = collection(db, 'users');
+                const q = query(usersRef, where('searchName', '==', searchName));
+                const querySnapshot = await getDocs(q);
+
+                const isTaken = querySnapshot.docs.some(d => d.id !== auth.currentUser?.uid);
+                if (isTaken) {
+                    Alert.alert('Erro', 'Este Nickname já está em uso. Por favor, escolha outro.');
+                    setLoading(false);
+                    return;
+                }
+            }
 
             let finalPhotoURL = userProfile?.photoURL || auth.currentUser.photoURL || null;
             if (editPhotoURL && editPhotoURL !== finalPhotoURL && !editPhotoURL.startsWith('http')) {
@@ -126,7 +151,8 @@ export default function ProfileScreen() {
                 nick: editNick.trim(),
                 bio: editBio,
                 interests: editInterests,
-                photoURL: finalPhotoURL
+                photoURL: finalPhotoURL,
+                searchName: searchName
             });
 
             // Update Auth Profile Display Name & Photo
@@ -141,7 +167,7 @@ export default function ProfileScreen() {
                 nick: editNick.trim(),
                 bio: editBio,
                 interests: editInterests,
-                searchName: editNick.trim().toLowerCase(),
+                searchName: searchName,
                 displayName: editNick.trim(),
                 photoURL: finalPhotoURL
             }, { merge: true });
@@ -163,6 +189,38 @@ export default function ProfileScreen() {
         } catch (error) {
             Alert.alert('Erro', 'Falha ao sair.');
         }
+    };
+
+    const handleDeleteAccount = () => {
+        Alert.alert(
+            "Excluir Conta Permanentemente",
+            "Sua conta, perfil, histórico de eventos e interesses serão excluídos de forma irreversível.\n\nDeseja realmente excluir sua conta?",
+            [
+                { text: "Cancelar", style: "cancel" },
+                {
+                    text: "Excluir Conta",
+                    style: "destructive",
+                    onPress: async () => {
+                        try {
+                            const user = auth.currentUser;
+                            if (user) {
+                                setLoading(true);
+                                await deleteDoc(doc(db, 'users', user.uid));
+                                await deleteUser(user);
+                                // auth listener will handle redirection
+                            }
+                        } catch (error: any) {
+                            setLoading(false);
+                            if (error.code === 'auth/requires-recent-login') {
+                                Alert.alert("Atenção", "Por motivos de segurança, você precisa sair e fazer login novamente antes de excluir sua conta.");
+                            } else {
+                                Alert.alert("Erro", "Ocorreu um erro ao tentar excluir a conta. Tente novamente mais tarde.");
+                            }
+                        }
+                    }
+                }
+            ]
+        );
     };
 
     if (!auth.currentUser) {
@@ -277,6 +335,65 @@ export default function ProfileScreen() {
                 </View>
             </View>
 
+            <View style={styles.section}>
+                <Text style={styles.sectionTitle}>Suporte e Legal</Text>
+                <View style={styles.menuContainer}>
+                    <TouchableOpacity style={styles.menuItem} onPress={() => setShowTermsModal(true)}>
+                        <View style={styles.menuItemLeft}>
+                            <View style={[styles.menuIconContainer, { backgroundColor: '#eff6ff' }]}>
+                                <FontAwesome name="file-text-o" size={16} color="#3b82f6" />
+                            </View>
+                            <Text style={styles.menuText}>Regras e Termos de Uso</Text>
+                        </View>
+                        <FontAwesome name="angle-right" size={20} color="#9ca3af" />
+                    </TouchableOpacity>
+
+                    <TouchableOpacity style={styles.menuItem} onPress={() => setShowManualModal(true)}>
+                        <View style={styles.menuItemLeft}>
+                            <View style={[styles.menuIconContainer, { backgroundColor: '#fef3c7' }]}>
+                                <FontAwesome name="book" size={16} color="#d97706" />
+                            </View>
+                            <Text style={styles.menuText}>Manual de Uso do App</Text>
+                        </View>
+                        <FontAwesome name="angle-right" size={20} color="#9ca3af" />
+                    </TouchableOpacity>
+
+                    <TouchableOpacity style={styles.menuItem} onPress={() => {
+                        Linking.openURL('https://sites.google.com/view/sosfiber-softwares/politica-de-privacidade');
+                    }}>
+                        <View style={styles.menuItemLeft}>
+                            <View style={[styles.menuIconContainer, { backgroundColor: '#f0fdf4' }]}>
+                                <FontAwesome name="lock" size={16} color="#16a34a" />
+                            </View>
+                            <Text style={styles.menuText}>Política de Privacidade</Text>
+                        </View>
+                        <FontAwesome name="angle-right" size={20} color="#9ca3af" />
+                    </TouchableOpacity>
+                    
+                    <TouchableOpacity style={styles.menuItem} onPress={() => {
+                        Linking.openURL('mailto:rodolfo.bm.reserva@gmail.com?subject=Contato%20e%20Feedback%20-%20Reunion%20Hub');
+                    }}>
+                        <View style={styles.menuItemLeft}>
+                            <View style={[styles.menuIconContainer, { backgroundColor: '#fdf4ff' }]}>
+                                <FontAwesome name="envelope-o" size={16} color="#d946ef" />
+                            </View>
+                            <Text style={styles.menuText}>Contato e Feedback</Text>
+                        </View>
+                        <FontAwesome name="angle-right" size={20} color="#9ca3af" />
+                    </TouchableOpacity>
+
+                    <TouchableOpacity style={[styles.menuItem, { borderBottomWidth: 0 }]} onPress={handleDeleteAccount}>
+                        <View style={styles.menuItemLeft}>
+                            <View style={[styles.menuIconContainer, { backgroundColor: '#fef2f2' }]}>
+                                <FontAwesome name="trash-o" size={16} color="#ef4444" />
+                            </View>
+                            <Text style={[styles.menuText, { color: '#ef4444' }]}>Solicitar Exclusão da Conta</Text>
+                        </View>
+                        <FontAwesome name="angle-right" size={20} color="#9ca3af" />
+                    </TouchableOpacity>
+                </View>
+            </View>
+
             <View style={styles.logoutContainer}>
                 {isEditing ? (
                     <View style={styles.actionButtons}>
@@ -291,6 +408,10 @@ export default function ProfileScreen() {
                     <StyledButton title="Sair" onPress={handleLogout} colors={['#ef4444', '#f87171']} />
                 )}
             </View>
+
+            {/* Modal de Termos de Uso */}
+            <TermsModal visible={showTermsModal} onClose={() => setShowTermsModal(false)} />
+            <ManualModal visible={showManualModal} onClose={() => setShowManualModal(false)} />
         </ScrollView>
     );
 }
@@ -363,6 +484,12 @@ const styles = StyleSheet.create({
     },
     actionButtons: {
         flexDirection: 'row', justifyContent: 'space-between'
-    }
+    },
+    // Menu Legal/Suporte
+    menuContainer: { backgroundColor: '#f9fafb', borderRadius: 16, overflow: 'hidden', borderWidth: 1, borderColor: '#f3f4f6' },
+    menuItem: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 16, borderBottomWidth: 1, borderBottomColor: '#e5e7eb' },
+    menuItemLeft: { flexDirection: 'row', alignItems: 'center' },
+    menuIconContainer: { width: 32, height: 32, borderRadius: 16, justifyContent: 'center', alignItems: 'center', marginRight: 12 },
+    menuText: { fontSize: 15, fontWeight: '600', color: '#374151' },
 });
 

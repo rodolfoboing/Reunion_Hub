@@ -1,5 +1,6 @@
 import * as Notifications from 'expo-notifications';
 import { Platform } from 'react-native';
+import Constants from 'expo-constants';
 
 export async function setupNotifications() {
   // Configura o handler para decidir o que fazer quando uma notificação é recebida app aberto
@@ -33,10 +34,22 @@ export async function setupNotifications() {
   
   if (finalStatus !== 'granted') {
     console.log('Permissão para notificações negada!');
-    return false;
+    return { granted: false, token: null };
   }
   
-  return true;
+  let token = null;
+  try {
+    const projectId =
+        Constants?.expoConfig?.extra?.eas?.projectId ?? Constants?.easConfig?.projectId;
+    const tokenResponse = await Notifications.getExpoPushTokenAsync({
+        projectId,
+    });
+    token = tokenResponse.data;
+  } catch (error) {
+    console.log('Erro ao obter Push Token:', error);
+  }
+
+  return { granted: true, token };
 }
 
 export async function sendLocalNotification(title: string, body: string, seconds = 0) {

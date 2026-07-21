@@ -1,4 +1,4 @@
-import { useLocalSearchParams, router } from 'expo-router';
+import { useLocalSearchParams, router, Stack } from 'expo-router';
 import {
     View,
     Text,
@@ -9,7 +9,7 @@ import {
     Image,
 } from 'react-native';
 import { useEffect, useState } from 'react';
-import { doc, getDoc, collection, query, where, getDocs } from 'firebase/firestore';
+import { doc, getDoc, collection, query, where, getDocs, addDoc, serverTimestamp } from 'firebase/firestore';
 import { db, auth } from '../../src/services/firebaseConfig';
 import { FontAwesome } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -63,6 +63,67 @@ export default function UserProfileScreen() {
         }
     };
 
+    const handleSendMessage = async () => {
+        if (!auth.currentUser || !profile) return;
+        setLoading(true);
+
+        try {
+            const conversationsRef = collection(db, 'conversations');
+            
+            // Check if conversation already exists where both users are participants
+            // Firestore doesn't support 'contains-all' on arrays easily without ordering trick or double query.
+            // A common pattern: query where array-contains currentUid, then filter locally for targetUid.
+            const q = query(conversationsRef, where('participants', 'array-contains', auth.currentUser.uid));
+            const querySnapshot = await getDocs(q);
+            
+            let existingConversationId = null;
+            querySnapshot.forEach((docSnap) => {
+                const data = docSnap.data();
+                if (data.participants && data.participants.includes(id as string)) {
+                    existingConversationId = docSnap.id;
+                }
+            });
+
+            if (existingConversationId) {
+                router.push({
+                    pathname: '/conversation/[id]',
+                    params: {
+                        id: existingConversationId,
+                        name: profile.displayName
+                    }
+                });
+            } else {
+                // Create new conversation
+                const newConvRef = await addDoc(conversationsRef, {
+                    participants: [auth.currentUser.uid, id],
+                    participantNames: {
+                        [auth.currentUser.uid]: auth.currentUser.displayName || 'Usuário',
+                        [id as string]: profile.displayName || 'Usuário'
+                    },
+                    lastMessage: '',
+                    updatedAt: serverTimestamp(),
+                    createdAt: serverTimestamp(),
+                    unreadCounts: {
+                        [auth.currentUser.uid]: 0,
+                        [id as string]: 0
+                    }
+                });
+
+                router.push({
+                    pathname: '/conversation/[id]',
+                    params: {
+                        id: newConvRef.id,
+                        name: profile.displayName
+                    }
+                });
+            }
+        } catch (error) {
+            console.error('Error starting conversation:', error);
+        } finally {
+            setLoading(false);
+        }
+    };
+
     if (loading) {
         return (
             <View style={styles.center}>
@@ -88,6 +149,7 @@ export default function UserProfileScreen() {
 
     return (
         <View style={styles.container}>
+            <Stack.Screen options={{ headerShown: false }} />
             {/* Header com ação de voltar */}
             <View style={styles.header}>
                 <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}>
@@ -213,16 +275,7 @@ export default function UserProfileScreen() {
                     <View style={styles.actionsContainer}>
                         <StyledButton
                             title="Enviar Mensagem"
-                            onPress={() => {
-                                // TODO: Implementar chat direto
-                                router.push({
-                                    pathname: '/conversation/[id]',
-                                    params: {
-                                        id: id as string,
-                                        name: profile.displayName
-                                    }
-                                });
-                            }}
+                            onPress={handleSendMessage}
                             colors={['#6366f1', '#8b5cf6']}
                         />
                     </View>

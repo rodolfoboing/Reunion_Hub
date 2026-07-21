@@ -1,43 +1,33 @@
-import { useLocalSearchParams, router } from 'expo-router';
+import { useLocalSearchParams, router, Stack } from 'expo-router';
 import { View, Text, StyleSheet, ScrollView, Alert, ActivityIndicator, TouchableOpacity, Linking } from 'react-native';
-import { useEffect, useState } from 'react';
-import { doc, getDoc, updateDoc, arrayUnion, increment, addDoc, collection, writeBatch } from 'firebase/firestore';
+import { useEffect, useState, useRef } from 'react';
+import { doc, getDoc, updateDoc, arrayUnion, increment, addDoc, collection, writeBatch, serverTimestamp } from 'firebase/firestore';
 import { db, auth } from '../../src/services/firebaseConfig';
 import { Meeting } from '../../src/types';
 import { StyledButton } from '@/src/components/StyledButton';
+import { ErrorState } from '@/src/components/ErrorState';
 import { FontAwesome } from '@expo/vector-icons';
+import { normalizeDate, getTodayStr } from '../../src/utils/dateUtils';
 
 // Helper para verificar se hoje é o dia do evento
 const isEventDay = (eventDate: string | undefined): boolean => {
-    if (!eventDate) return false;
-
-    try {
-        // Normaliza a data do evento (YYYY-MM-DD ou YYYY/MM/DD)
-        const normalized = eventDate.trim().replace(/\//g, '-');
-
-        // Pega a data de hoje no formato YYYY-MM-DD
-        const today = new Date();
-        const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
-
-        return normalized === todayStr;
-    } catch (e) {
-        console.warn('Error comparing dates:', e);
-        return false;
-    }
+    const normalized = normalizeDate(eventDate);
+    if (!normalized) return false;
+    return normalized === getTodayStr();
 };
 
 // Formata a data para exibição amigável
 const formatDateDisplay = (dateString: string | undefined): string => {
-    if (!dateString) return 'Data a definir';
+    const normalized = normalizeDate(dateString);
+    if (!normalized) return 'Data a definir';
 
     try {
-        const normalized = dateString.trim().replace(/\//g, '-');
         const [year, month, day] = normalized.split('-');
         const months = ['Jan', 'Fev', 'Mar', 'Abr', 'Mai', 'Jun', 'Jul', 'Ago', 'Set', 'Out', 'Nov', 'Dez'];
         const monthName = months[parseInt(month, 10) - 1] || month;
         return `${day} de ${monthName} de ${year}`;
     } catch (e) {
-        return dateString;
+        return dateString || 'Data a definir';
     }
 };
 
@@ -45,27 +35,43 @@ export default function MeetingDetailsScreen() {
     const { id } = useLocalSearchParams();
     const [meeting, setMeeting] = useState<Meeting | null>(null);
     const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(false);
     const [rsvpLoading, setRsvpLoading] = useState(false);
     const [checkInLoading, setCheckInLoading] = useState(false);
+    const isMounted = useRef(true);
 
     useEffect(() => {
+        isMounted.current = true;
         fetchMeeting();
+        return () => {
+            isMounted.current = false;
+        };
     }, [id]);
 
     const fetchMeeting = async () => {
+        if (!isMounted.current) return;
+        setLoading(true);
+        setError(false);
         try {
             const docRef = doc(db, 'meetings', id as string);
             const docSnap = await getDoc(docRef);
+            
+            if (!isMounted.current) return;
+
             if (docSnap.exists()) {
                 setMeeting({ id: docSnap.id, ...docSnap.data() } as Meeting);
             } else {
-                Alert.alert('Erro', 'Evento não encontrado.');
-                router.back();
+                setError(true);
             }
         } catch (error) {
             console.error(error);
+            if (isMounted.current) {
+                setError(true);
+            }
         } finally {
-            setLoading(false);
+            if (isMounted.current) {
+                setLoading(false);
+            }
         }
     };
 
@@ -74,51 +80,63 @@ export default function MeetingDetailsScreen() {
             Alert.alert('Erro', 'Faça login para confirmar presença.');
             return;
         }
-        setRsvpLoading(true);
-        try {
-            // VERIFICAR REPUTAÇÃO DO USUÁRIO (Prevenção de Tóxicos)
-            const userRef = doc(db, 'users', auth.currentUser.uid);
-            const userSnap = await getDoc(userRef);
-            if (userSnap.exists()) {
-                const rep = userSnap.data().reputation || 0;
-                if (rep <= -50) {
-                    Alert.alert('Bloqueado', 'Você tem muitas faltas (No-Show). Sua reputação está muito baixa para confirmar presença em novos eventos.');
-                    setRsvpLoading(false);
-                    return;
+        Alert.alert(
+            'Dica de Segurança e Responsabilidade',
+            'Recomendamos que você sempre se comunique com os organizadores e verifique os detalhes do evento para garantir sua segurança e veracidade. Lembre-se que o Reunion Hub é apenas um facilitador tecnológico. No mais, divirta-se e faça ótimas conexões!',
+            [
+                { text: 'Cancelar', style: 'cancel' },
+                {
+                    text: 'Confirmar Presença',
+                    onPress: async () => {
+                        setRsvpLoading(true);
+                        try {
+                            // VERIFICAR REPUTAÇÃO DO USUÁRIO (Prevenção de Tóxicos)
+                            const userRef = doc(db, 'users', auth.currentUser!.uid);
+                            const userSnap = await getDoc(userRef);
+                            if (userSnap.exists()) {
+                                const rep = userSnap.data().reputation || 0;
+                                if (rep <= -50) {
+                                    Alert.alert('Bloqueado', 'Você tem muitas faltas (No-Show). Sua reputação está muito baixa para confirmar presença em novos eventos.');
+                                    setRsvpLoading(false);
+                                    return;
+                                }
+                            }
+
+                            const docRef = doc(db, 'meetings', id as string);
+                            await updateDoc(docRef, {
+                                attendees: arrayUnion(auth.currentUser!.uid)
+                            });
+
+                            // Notify Event Creator
+                            if (meeting.createdBy && meeting.createdBy !== auth.currentUser!.uid) {
+                                try {
+                                    await addDoc(collection(db, 'notifications'), {
+                                        userId: meeting.createdBy,
+                                        type: 'new_attendee',
+                                        title: 'Novo Participante!',
+                                        body: `${auth.currentUser!.displayName || 'Alguém'} confirmou presença no evento "${meeting.title}"`,
+                                        meetingId: id,
+                                        createdAt: new Date(),
+                                        read: false,
+                                        fromUserId: auth.currentUser!.uid
+                                    });
+                                } catch (notifError) {
+                                    console.error('Error sending notification:', notifError);
+                                }
+                            }
+
+                            Alert.alert('Sucesso', 'Presença confirmada! Lembre-se das dicas de segurança e não esqueça de fazer check-in no dia do evento.');
+                            fetchMeeting(); // Refresh UI
+                        } catch (error) {
+                            console.error(error);
+                            Alert.alert('Erro', 'Falha ao confirmar presença.');
+                        } finally {
+                            setRsvpLoading(false);
+                        }
+                    }
                 }
-            }
-
-            const docRef = doc(db, 'meetings', id as string);
-            await updateDoc(docRef, {
-                attendees: arrayUnion(auth.currentUser.uid)
-            });
-
-            // Notify Event Creator
-            if (meeting.createdBy && meeting.createdBy !== auth.currentUser.uid) {
-                try {
-                    await addDoc(collection(db, 'notifications'), {
-                        userId: meeting.createdBy,
-                        type: 'new_attendee',
-                        title: 'Novo Participante!',
-                        body: `${auth.currentUser.displayName || 'Alguém'} confirmou presença no evento "${meeting.title}"`,
-                        meetingId: id,
-                        createdAt: new Date(),
-                        read: false,
-                        fromUserId: auth.currentUser.uid
-                    });
-                } catch (notifError) {
-                    console.error('Error sending notification:', notifError);
-                }
-            }
-
-            Alert.alert('Sucesso', 'Presença confirmada! Não esqueça de fazer check-in no dia do evento.');
-            fetchMeeting(); // Refresh UI
-        } catch (error) {
-            console.error(error);
-            Alert.alert('Erro', 'Falha ao confirmar presença.');
-        } finally {
-            setRsvpLoading(false);
-        }
+            ]
+        );
     };
 
     const handleCheckIn = async () => {
@@ -240,6 +258,80 @@ export default function MeetingDetailsScreen() {
         );
     };
 
+    const handleCancelEvent = async () => {
+        if (!meeting) return;
+        Alert.alert(
+            'Cancelar Evento',
+            'Atenção: Cancelar este evento descontará -15 pontos da sua reputação por frustrar os participantes. Deseja realmente cancelar?',
+            [
+                { text: 'Voltar', style: 'cancel' },
+                {
+                    text: 'Sim, Cancelar',
+                    style: 'destructive',
+                    onPress: async () => {
+                        setLoading(true);
+                        try {
+                            const batch = writeBatch(db);
+                            
+                            const meetingRef = doc(db, 'meetings', id as string);
+                            batch.update(meetingRef, { status: 'cancelled' });
+                            
+                            const userRef = doc(db, 'users', currentUid!);
+                            batch.update(userRef, { reputation: increment(-15) });
+                            
+                            // Adicionar aviso de notificação (simulado no banco)
+                            meeting.attendees?.forEach((attendeeUid: string) => {
+                                const notifRef = doc(collection(db, 'users', attendeeUid, 'notifications'));
+                                batch.set(notifRef, {
+                                    title: 'Evento Cancelado',
+                                    body: `O evento "${meeting.title}" foi cancelado pelo organizador.`,
+                                    createdAt: serverTimestamp(),
+                                    read: false
+                                });
+                            });
+
+                            await batch.commit();
+                            
+                            Alert.alert('Cancelado', 'O evento foi cancelado e sua reputação foi atualizada.');
+                            fetchMeeting();
+                        } catch (e) {
+                            Alert.alert('Erro', 'Falha ao cancelar evento.');
+                        } finally {
+                            setLoading(false);
+                        }
+                    }
+                }
+            ]
+        );
+    };
+
+    const handleReportEvent = () => {
+        Alert.alert(
+            'Denunciar Evento',
+            'Deseja denunciar este evento por conteúdo impróprio ou suspeito?',
+            [
+                { text: 'Cancelar', style: 'cancel' },
+                {
+                    text: 'Denunciar',
+                    style: 'destructive',
+                    onPress: async () => {
+                        try {
+                            await addDoc(collection(db, 'reports'), {
+                                type: 'event',
+                                targetId: id,
+                                reportedBy: currentUid,
+                                createdAt: serverTimestamp()
+                            });
+                            Alert.alert('Denúncia Recebida', 'Nossa equipe analisará este evento em breve. Obrigado.');
+                        } catch (e) {
+                            Alert.alert('Erro', 'Não foi possível enviar a denúncia.');
+                        }
+                    }
+                }
+            ]
+        );
+    };
+
     if (loading) return <View style={styles.center}><ActivityIndicator size="large" /></View>;
     if (!meeting) return null;
 
@@ -251,9 +343,28 @@ export default function MeetingDetailsScreen() {
     const isCompleted = meeting.status === 'completed';
 
     return (
-        <ScrollView style={styles.container} contentContainerStyle={styles.content}>
-            <Text style={styles.theme}>{meeting.theme}</Text>
-            <Text style={styles.title}>{meeting.title}</Text>
+        <>
+            <Stack.Screen options={{ title: 'Detalhes do Evento', headerBackTitle: 'Voltar' }} />
+            <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+                <Text style={styles.theme}>{meeting.theme}</Text>
+                <Text style={styles.title}>{meeting.title}</Text>
+
+                {/* Criador do Evento */}
+                {meeting.createdBy && (
+                    <TouchableOpacity 
+                        style={styles.creatorCard} 
+                        onPress={() => router.push(`/public-profile/${meeting.createdBy}` as never)}
+                    >
+                        <View style={styles.creatorAvatar}>
+                            <Text style={{color: '#fff', fontWeight: 'bold'}}>{(meeting as any).creatorName?.charAt(0) || 'U'}</Text>
+                        </View>
+                        <View>
+                            <Text style={styles.creatorLabel}>Organizado por</Text>
+                            <Text style={styles.creatorName}>{(meeting as any).creatorName || 'Usuário'}</Text>
+                        </View>
+                        <FontAwesome name="chevron-right" size={16} color="#9ca3af" style={{ marginLeft: 'auto' }} />
+                    </TouchableOpacity>
+                )}
 
             <View style={styles.infoRow}>
                 <FontAwesome name="map-marker" size={18} color="#6b7280" />
@@ -318,7 +429,13 @@ export default function MeetingDetailsScreen() {
 
             <View style={styles.footer}>
                 {/* Lógica de Exibição do Rodapé */}
-                {isCompleted ? (
+                {meeting.status === 'cancelled' ? (
+                    <View style={[styles.waitingCheckIn, { backgroundColor: '#fef2f2' }]}>
+                        <FontAwesome name="ban" size={24} color="#ef4444" />
+                        <Text style={[styles.waitingText, { color: '#ef4444' }]}>Evento Cancelado</Text>
+                        <Text style={styles.waitingSubtext}>Este evento foi cancelado pelo organizador e não ocorrerá mais.</Text>
+                    </View>
+                ) : isCompleted ? (
                     <View style={styles.waitingCheckIn}>
                         <FontAwesome name="flag-checkered" size={24} color="#6b7280" />
                         <Text style={styles.waitingText}>Evento Encerrado</Text>
@@ -379,15 +496,26 @@ export default function MeetingDetailsScreen() {
                                     onPress={handleEndEvent}
                                     colors={['#ef4444', '#f87171']}
                                 />
-                                <Text style={{ textAlign: 'center', fontSize: 12, color: '#9ca3af', marginTop: 8 }}>
-                                    Apenas você, como criador, pode ver este botão.
-                                </Text>
+                                <View style={{ height: 12 }} />
+                                <TouchableOpacity
+                                    style={{ padding: 16, alignItems: 'center', borderWidth: 1, borderColor: '#ef4444', borderRadius: 12 }}
+                                    onPress={handleCancelEvent}
+                                >
+                                    <Text style={{ color: '#ef4444', fontWeight: 'bold' }}>Cancelar Evento</Text>
+                                </TouchableOpacity>
                             </View>
+                        )}
+                        {!isCreator && currentUid && (
+                            <TouchableOpacity style={styles.reportButton} onPress={handleReportEvent}>
+                                <FontAwesome name="flag" size={16} color="#ef4444" />
+                                <Text style={styles.reportText}>Denunciar Evento</Text>
+                            </TouchableOpacity>
                         )}
                     </>
                 )}
             </View>
-        </ScrollView>
+            </ScrollView>
+        </>
     );
 }
 
@@ -436,6 +564,39 @@ const styles = StyleSheet.create({
         fontSize: 13,
         color: '#9ca3af',
         marginTop: 8,
+    },
+    creatorCard: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        backgroundColor: '#f9fafb',
+        padding: 12,
+        borderRadius: 12,
+        marginBottom: 16,
+        borderWidth: 1,
+        borderColor: '#e5e7eb'
+    },
+    creatorAvatar: {
+        width: 40,
+        height: 40,
+        borderRadius: 20,
+        backgroundColor: '#6366f1',
+        justifyContent: 'center',
+        alignItems: 'center',
+        marginRight: 12,
+    },
+    creatorLabel: { fontSize: 12, color: '#6b7280' },
+    creatorName: { fontSize: 16, fontWeight: 'bold', color: '#1f2937' },
+    reportButton: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'center',
+        marginTop: 32,
+        padding: 16,
+    },
+    reportText: {
+        color: '#ef4444',
+        fontWeight: 'bold',
+        marginLeft: 8,
     },
     todayBadge: {
         backgroundColor: '#10b981',

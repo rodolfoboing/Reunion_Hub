@@ -1,16 +1,33 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { View, Text, StyleSheet, FlatList, TouchableOpacity, ScrollView, Image, ActivityIndicator, Modal, Alert, LayoutAnimation, UIManager, Platform, Animated } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
-import { auth, db } from '../../../src/services/firebaseConfig';
-import { collection, query, getDocs, orderBy, where, doc, getDoc, onSnapshot, updateDoc, arrayUnion, arrayRemove, deleteDoc } from 'firebase/firestore';
-import { FontAwesome, Ionicons } from '@expo/vector-icons';
-import { router } from 'expo-router';
+import { ErrorState } from '@/src/components/ErrorState';
+import { Ionicons } from '@expo/vector-icons';
+import { LinearGradient } from 'expo-linear-gradient';
+import * as Location from 'expo-location';
+import { router, useFocusEffect } from 'expo-router';
+import { arrayRemove, arrayUnion, collection, deleteDoc, doc, getDocs, onSnapshot, query, updateDoc, where, limit } from 'firebase/firestore';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { Alert, Animated, FlatList, LayoutAnimation, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, TouchableOpacity, UIManager, View } from 'react-native';
 import { Calendar, LocaleConfig } from 'react-native-calendars';
-import { useFocusEffect } from 'expo-router';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { Meeting } from '../../../src/types';
+import { STRINGS } from '../../../src/constants/strings';
+import { normalizeDate, getTodayStr } from '../../../src/utils/dateUtils';
+import { auth, db } from '../../../src/services/firebaseConfig';
 
 if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
     UIManager.setLayoutAnimationEnabledExperimental(true);
 }
+
+const getDistanceFromLatLonInKm = (lat1: number, lon1: number, lat2: number, lon2: number) => {
+    const R = 6371; // Radius of the earth in km
+    const dLat = (lat2 - lat1) * (Math.PI / 180);
+    const dLon = (lon2 - lon1) * (Math.PI / 180);
+    const a =
+        Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos(lat1 * (Math.PI / 180)) * Math.cos(lat2 * (Math.PI / 180)) *
+        Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c; // Distance in km
+};
 
 // Configure Locale for Calendar
 LocaleConfig.locales['pt-br'] = {
@@ -25,6 +42,80 @@ LocaleConfig.locales['pt-br'] = {
 };
 LocaleConfig.defaultLocale = 'pt-br';
 
+// Célula customizada do calendário: em vez de pontinhos minúsculos (multi-dot),
+// usa sinalizações maiores e distintas para cada tipo de evento:
+// - Criado por você -> preenchimento roxo suave atrás do número
+// - Recorrente -> selo azul com ícone de repetição no canto superior esquerdo
+// - Popular (+3 pessoas) -> selo laranja com 🔥 no canto superior direito
+// - Passado / Próximo -> barrinha colorida abaixo do número (cinza / verde)
+const CalendarDayCell = ({ date, state, marking, onPress }: any) => {
+    if (!date) return <View style={styles.dayCell} />;
+
+    const isSelected = !!marking?.selected;
+    const isToday = state === 'today';
+    const isDisabled = state === 'disabled';
+    const isMine = !!marking?.mine;
+    const isRecurring = !!marking?.recurring;
+    const isPopular = !!marking?.popular;
+    const isPast = !!marking?.past;
+    const hasEvent = !!marking?.hasEvent;
+    const isRecommended = !!marking?.recommended;
+
+    return (
+        <Pressable
+            onPress={() => onPress(date)}
+            disabled={isDisabled}
+            style={styles.dayCell}
+            hitSlop={{ top: 2, bottom: 2, left: 2, right: 2 }}
+        >
+            <View
+                style={[
+                    styles.dayCircle,
+                    isMine && !isSelected && styles.dayCircleMine,
+                    isToday && !isSelected && styles.dayCircleToday,
+                    isSelected && styles.dayCircleSelected,
+                ]}
+            >
+                <Text
+                    style={[
+                        styles.dayText,
+                        isDisabled && styles.dayTextDisabled,
+                        isToday && !isSelected && styles.dayTextToday,
+                        isSelected && styles.dayTextSelected,
+                    ]}
+                >
+                    {date.day}
+                </Text>
+
+                {isRecurring && (
+                    <View style={styles.dayBadgeRecurring}>
+                        <Ionicons name="repeat" size={7} color="#fff" />
+                    </View>
+                )}
+                {isPopular && (
+                    <View style={styles.dayBadgePopular}>
+                        <Text style={styles.dayBadgePopularEmoji}>🔥</Text>
+                    </View>
+                )}
+                {isRecommended && !isPopular && (
+                    <View style={[styles.dayBadgePopular, { backgroundColor: '#8B5CF6' }]}>
+                        <Text style={styles.dayBadgePopularEmoji}>⭐</Text>
+                    </View>
+                )}
+            </View>
+
+            {hasEvent && (
+                <View
+                    style={[
+                        styles.dayBar,
+                        { backgroundColor: isPast ? '#CBD5E1' : '#10B981' },
+                    ]}
+                />
+            )}
+        </Pressable>
+    );
+};
+
 export default function AgendaScreen() {
     // Tab State: 'upcoming' | 'history' | 'favorites'
     const [activeTab, setActiveTab] = useState<'upcoming' | 'history' | 'favorites'>('upcoming');
@@ -33,28 +124,49 @@ export default function AgendaScreen() {
     const [allEvents, setAllEvents] = useState<any[]>([]);
     const [filteredEvents, setFilteredEvents] = useState<any[]>([]);
     const [favorites, setFavorites] = useState<string[]>([]);
+    const [userInterests, setUserInterests] = useState<string[]>([]);
+    const [userLocation, setUserLocation] = useState<Location.LocationObject | null>(null);
     const [markedDates, setMarkedDates] = useState<any>({});
     const [selectedDate, setSelectedDate] = useState('');
 
     const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(false);
     const [selectedEvent, setSelectedEvent] = useState<any>(null);
     const [recommendations, setRecommendations] = useState<any[]>([]);
+    const [allRecs, setAllRecs] = useState<any[]>([]);
+    const [historyTitles, setHistoryTitles] = useState<string[]>([]);
+
+    const isMounted = useRef(true);
 
     // Initial Fetch (User Favorites & Profile)
     useFocusEffect(
         useCallback(() => {
+            isMounted.current = true;
             let unsubProfile: any;
             const unsubscribeAuth = auth.onAuthStateChanged((user) => {
-                if (user) {
+                if (user && isMounted.current) {
                     unsubProfile = onSnapshot(doc(db, 'users', user.uid), (snap) => {
-                        if (snap.exists()) {
+                        if (snap.exists() && isMounted.current) {
                             setFavorites(snap.data().favorites || []);
+                            setUserInterests(snap.data().interests || []);
                         }
                     });
                 }
             });
 
+            (async () => {
+                let { status } = await Location.requestForegroundPermissionsAsync();
+                if (status === 'granted') {
+                    let lastLoc = await Location.getLastKnownPositionAsync();
+                    if (lastLoc && isMounted.current) setUserLocation(lastLoc);
+                    
+                    let loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+                    if (isMounted.current) setUserLocation(loc);
+                }
+            })();
+
             return () => {
+                isMounted.current = false;
                 unsubscribeAuth();
                 if (unsubProfile) unsubProfile();
             };
@@ -65,11 +177,46 @@ export default function AgendaScreen() {
         fetchEvents();
     }, [activeTab, favorites.length, selectedDate]);
 
+    useEffect(() => {
+        if (allRecs.length === 0) return;
+
+        const todayStr = getTodayStr();
+        const currentMonth = todayStr.substring(0, 7); // e.g. "2026-07"
+        
+        let finalRecs = allRecs.filter((e: any) => {
+            if (!e.date) return false;
+            // Futuros e até o mês vigente somente
+            if (e.date < todayStr || !e.date.startsWith(currentMonth)) return false;
+            return true;
+        });
+
+        // Mesma categoria de interesse
+        if (userInterests.length > 0) {
+            finalRecs = finalRecs.filter((e: any) => e.interests?.some((i: string) => userInterests.includes(i)));
+        }
+
+        // Próximos (<= 25km)
+        if (userLocation && finalRecs.length > 0) {
+            const withDistance = finalRecs
+                .filter((m: any) => m.lat && m.lng && m.type !== 'online')
+                .map((m: any) => {
+                    const dist = getDistanceFromLatLonInKm(userLocation.coords.latitude, userLocation.coords.longitude, m.lat, m.lng);
+                    return { ...m, distance: dist };
+                })
+                .filter((m: any) => m.distance <= 25);
+            withDistance.sort((a: any, b: any) => a.distance - b.distance);
+            finalRecs = withDistance;
+        }
+
+        setRecommendations(finalRecs.slice(0, 10));
+    }, [allRecs, userInterests, userLocation]);
+
     const fetchEvents = async () => {
         const currentUid = auth.currentUser?.uid;
-        if (!currentUid) return;
+        if (!currentUid || !isMounted.current) return;
 
         setLoading(true);
+        setError(false);
         try {
             const now = new Date();
             const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
@@ -81,28 +228,28 @@ export default function AgendaScreen() {
                     setLoading(false);
                     return;
                 }
-                
+
                 // Firestore 'in' query supports max 10 items.
                 const chunks = [];
                 for (let i = 0; i < favorites.length; i += 10) {
                     chunks.push(favorites.slice(i, i + 10));
                 }
-                
-                const promises = chunks.map(chunk => 
+
+                const promises = chunks.map(chunk =>
                     getDocs(query(collection(db, 'meetings'), where('__name__', 'in', chunk)))
                 );
-                
+
                 const snaps = await Promise.all(promises);
                 let events: any[] = [];
                 snaps.forEach(snap => {
-                    const mapped = snap.docs.map(d => ({ 
-                        id: d.id, 
-                        ...d.data(), 
-                        date: d.data().date?.trim().replace(/\//g, '-') 
+                    const mapped = snap.docs.map(d => ({
+                        id: d.id,
+                        ...d.data(),
+                        date: normalizeDate(d.data().date)
                     }));
                     events = [...events, ...mapped];
                 });
-                
+
                 events.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
                 setFilteredEvents(events);
                 setMarkedDates({});
@@ -119,16 +266,16 @@ export default function AgendaScreen() {
                 collection(db, 'meetings'),
                 where('attendees', 'array-contains', currentUid)
             );
-            
+
             const snap = await getDocs(q);
             let events = snap.docs.map(d => {
                 const data = d.data();
                 return {
                     id: d.id,
                     ...data,
-                    date: data.date?.trim().replace(/\//g, '-')
+                    date: normalizeDate(data.date)
                 };
-            });
+            }).filter(e => e.date !== null);
 
             // Local filter for Upcoming vs History
             let results: any[] = [];
@@ -137,33 +284,57 @@ export default function AgendaScreen() {
             if (activeTab === 'upcoming') {
                 results = events.filter((ev: any) => ev.date >= todayStr);
                 historyEvents = events.filter((ev: any) => ev.date < todayStr);
-                
-                // Set marks for calendar with contextual colors
-                const marks: any = {};
-                results.forEach((ev: any) => {
-                    const isPopular = ev.attendees && ev.attendees.length >= 3;
-                    let dColor = ev.type === 'online' ? '#10B981' : '#4F46E5';
-                    if (isPopular) dColor = '#F59E0B'; // Laranja para eventos cheios
 
-                    if (ev.date) marks[ev.date] = { marked: true, dotColor: dColor };
+                // Marcações do calendário: cada dia recebe um objeto com as flags de
+                // sinalização (criado por você, recorrente, popular, passado/próximo).
+                // Usamos TODOS os eventos (passados e futuros) para que o calendário
+                // mostre o histórico completo, não só os próximos.
+                const marks: any = {};
+                events.forEach((ev: any) => {
+                    if (!ev.date) return;
+                    const isMine = ev.createdBy === currentUid;
+                    const isPopular = ev.attendees && ev.attendees.length >= 3;
+                    const isPast = ev.date.localeCompare(todayStr) < 0;
+
+                    if (!marks[ev.date]) {
+                        marks[ev.date] = { mine: false, recurring: false, popular: false, past: isPast, hasEvent: true };
+                    }
+                    if (isMine) marks[ev.date].mine = true;
+                    if (ev.isRepeated) marks[ev.date].recurring = true;
+                    if (isPopular) marks[ev.date].popular = true;
                 });
                 setMarkedDates(marks);
-                
+
                 // Sort nearest first
                 results.sort((a: any, b: any) => (a.date || '').localeCompare(b.date || ''));
 
-                // Calculando Recomendações Baseadas em Títulos do Histórico
-                const historyTitles = [...new Set(historyEvents.map((e: any) => e.title))];
-                if (historyTitles.length > 0) {
-                    const qRec = query(collection(db, 'meetings'), where('date', '>=', todayStr));
-                    const snapRec = await getDocs(qRec);
-                    const recs = snapRec.docs
-                        .map(d => ({ id: d.id, ...d.data() }))
-                        .filter((e: any) => historyTitles.includes(e.title) && !e.attendees?.includes(currentUid));
-                    setRecommendations(recs);
-                } else {
-                    setRecommendations([]);
-                }
+                // Calculando Recomendações Baseadas em Histórico, Interesses ou Proximidade (Cold Start)
+                const hTitles = [...new Set(historyEvents.map((e: any) => e.title))];
+                setHistoryTitles(hTitles);
+
+                const qRec = query(
+                    collection(db, 'meetings'),
+                    where('date', '>=', todayStr),
+                    limit(30)
+                );
+                const snapRec = await getDocs(qRec);
+                let fetchedRecs = snapRec.docs
+                    .map(d => ({ id: d.id, ...d.data() }))
+                    .filter((e: any) => {
+                        const normalizedDate = normalizeDate(e.date);
+                        if (!normalizedDate) return false;
+                        if (normalizedDate < todayStr) return false;
+                        if (e.attendees?.includes(currentUid)) return false;
+                        return true;
+                    });
+                
+                setAllRecs(fetchedRecs);
+
+                // Combina passados e futuros para permitir tocar em qualquer dia
+                // marcado no calendário (inclusive datas passadas) e ver os eventos dele.
+                setFilteredEvents([...results, ...historyEvents]);
+                setLoading(false);
+                return;
 
             } else if (activeTab === 'history') {
                 results = events.filter((ev: any) => ev.date < todayStr);
@@ -174,10 +345,11 @@ export default function AgendaScreen() {
 
             setFilteredEvents(results);
 
-        } catch (error) {
-            console.error("Error fetching agenda events:", error);
+        } catch (error: any) {
+            console.error(`${STRINGS.LOG_DB_READ} [Agenda] Erro ao buscar eventos da agenda:`, error.code, error.message);
+            if (isMounted.current) setError(true);
         } finally {
-            setLoading(false);
+            if (isMounted.current) setLoading(false);
         }
     };
 
@@ -192,7 +364,7 @@ export default function AgendaScreen() {
                 await updateDoc(userRef, { favorites: arrayUnion(eventId) });
             }
         } catch (err) {
-            console.error("Fav error", err);
+            console.error("[Agenda] Erro ao adicionar aos favoritos", err);
         }
     };
 
@@ -204,45 +376,49 @@ export default function AgendaScreen() {
         if (!auth.currentUser) return;
         Alert.alert('Cancelar Presença', `Tem certeza que deseja cancelar sua presença em "${event.title}"?`, [
             { text: 'Não', style: 'cancel' },
-            { text: 'Sim, Cancelar', style: 'destructive', onPress: async () => {
-                try {
-                    const docRef = doc(db, 'meetings', event.id);
-                    await updateDoc(docRef, { attendees: arrayRemove(auth.currentUser?.uid) });
-                    LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
-                    setFilteredEvents(prev => prev.filter(e => e.id !== event.id));
-                    setSelectedEvent(null);
-                } catch (e) {
-                    Alert.alert('Erro', 'Falha ao cancelar presença.');
+            {
+                text: 'Sim, Cancelar', style: 'destructive', onPress: async () => {
+                    try {
+                        const docRef = doc(db, 'meetings', event.id);
+                        await updateDoc(docRef, { attendees: arrayRemove(auth.currentUser?.uid) });
+                        LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+                        setFilteredEvents(prev => prev.filter(e => e.id !== event.id));
+                        setSelectedEvent(null);
+                    } catch (e) {
+                        Alert.alert('Erro', 'Falha ao cancelar presença.');
+                    }
                 }
-            }}
+            }
         ]);
     };
 
     const handleDeleteEvent = async (event: any) => {
         Alert.alert('Excluir Evento', `Atenção: Isso excluirá o evento "${event.title}" permanentemente para todos. Deseja continuar?`, [
             { text: 'Cancelar', style: 'cancel' },
-            { text: 'Excluir Definitivamente', style: 'destructive', onPress: async () => {
-                try {
-                    const docRef = doc(db, 'meetings', event.id);
-                    await deleteDoc(docRef);
-                    LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
-                    setFilteredEvents(prev => prev.filter(e => e.id !== event.id));
-                    setSelectedEvent(null);
-                } catch (e) {
-                    Alert.alert('Erro', 'Falha ao excluir evento.');
+            {
+                text: 'Excluir Definitivamente', style: 'destructive', onPress: async () => {
+                    try {
+                        const docRef = doc(db, 'meetings', event.id);
+                        await deleteDoc(docRef);
+                        LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+                        setFilteredEvents(prev => prev.filter(e => e.id !== event.id));
+                        setSelectedEvent(null);
+                    } catch (e) {
+                        Alert.alert('Erro', 'Falha ao excluir evento.');
+                    }
                 }
-            }}
+            }
         ]);
     };
 
     const AnimatedEventCard = ({ item, onPress }: { item: any, onPress: () => void }) => {
         const pulseAnim = useRef(new Animated.Value(1)).current;
 
+        const todayStr = getTodayStr();
         const now = new Date();
-        const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
         now.setDate(now.getDate() + 1);
         const tomorrowStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-        
+
         const isVerySoon = item.date === todayStr || item.date === tomorrowStr;
         const isPopular = item.attendees && item.attendees.length >= 3; // +3 pessoas = Popular
 
@@ -257,13 +433,20 @@ export default function AgendaScreen() {
             }
         }, [isVerySoon]);
 
-        let indicatorColor = item.type === 'online' ? '#10B981' : '#4F46E5';
+        let indicatorColor = item.type === 'online' ? '#10B981' : '#6366F1';
         if (isPopular) indicatorColor = '#F59E0B'; // Fogo / Laranja
 
         return (
-            <TouchableOpacity style={[styles.eventCard, isVerySoon && { borderColor: '#E0E7FF', borderWidth: 1 }]} onPress={onPress}>
+            <Pressable
+                style={({ pressed }) => [
+                    styles.eventCard,
+                    isVerySoon && styles.eventCardSoon,
+                    pressed && styles.cardPressed,
+                ]}
+                onPress={onPress}
+            >
                 <Animated.View style={[
-                    styles.eventTypeIndicator, 
+                    styles.eventTypeIndicator,
                     { backgroundColor: indicatorColor, opacity: isVerySoon ? pulseAnim : 1 }
                 ]} />
                 <View style={styles.eventInfo}>
@@ -279,27 +462,33 @@ export default function AgendaScreen() {
                                     <Ionicons name="heart" size={20} color="#EF4444" />
                                 </TouchableOpacity>
                             )}
-                            <Ionicons name="ellipsis-vertical" size={20} color="#CBD5E1" />
+                            <Ionicons name="ellipsis-vertical" size={18} color="#CBD5E1" />
                         </View>
                     </View>
                     <View style={styles.eventMeta}>
-                        <Ionicons name="calendar-outline" size={14} color="#64748B" />
+                        <View style={[styles.metaIconChip, { backgroundColor: '#EEF2FF' }]}>
+                            <Ionicons name="calendar-outline" size={11} color="#6366F1" />
+                        </View>
                         <Text style={styles.eventMetaText}>
                             {item.date ? item.date.split('-').reverse().join('/') : 'Data a definir'}
                         </Text>
-                        <View style={styles.metaSeparator} />
-                        <Ionicons name="time-outline" size={14} color="#64748B" />
+                        <View style={[styles.metaIconChip, { backgroundColor: '#F5F3FF' }]}>
+                            <Ionicons name="time-outline" size={11} color="#8B5CF6" />
+                        </View>
                         <Text style={styles.eventMetaText}>{item.time || '--:--'}</Text>
-                        <View style={styles.metaSeparator} />
-                        <Ionicons name="people-outline" size={14} color="#64748B" />
+                        <View style={[styles.metaIconChip, { backgroundColor: '#ECFDF5' }]}>
+                            <Ionicons name="people-outline" size={11} color="#10B981" />
+                        </View>
                         <Text style={styles.eventMetaText}>{item.attendees?.length || 1}</Text>
                     </View>
-                    <View style={[styles.eventMeta, { marginTop: 4 }]}>
-                        <Ionicons name="location-outline" size={14} color="#64748B" />
+                    <View style={[styles.eventMeta, { marginTop: 8 }]}>
+                        <View style={[styles.metaIconChip, { backgroundColor: '#FDF2F8' }]}>
+                            <Ionicons name="location-outline" size={11} color="#EC4899" />
+                        </View>
                         <Text style={styles.eventMetaText} numberOfLines={1}>{item.locationName || 'Local não definido'}</Text>
                     </View>
                 </View>
-            </TouchableOpacity>
+            </Pressable>
         );
     };
 
@@ -308,85 +497,121 @@ export default function AgendaScreen() {
     );
 
     const renderRecommendationCard = ({ item }: { item: any }) => (
-        <TouchableOpacity style={styles.recCard} onPress={() => router.push(`/event/${item.id}` as any)}>
+        <Pressable
+            style={({ pressed }) => [styles.recCard, pressed && styles.cardPressed]}
+            onPress={() => router.push(`/event/${item.id}` as any)}
+        >
+            <View style={styles.recAccentBar} />
             <View style={styles.recHeader}>
                 <Text style={styles.recDate}>{item.date?.split('-').reverse().join('/')}</Text>
                 <TouchableOpacity onPress={() => {
                     LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
                     setRecommendations(prev => prev.filter(e => e.id !== item.id));
-                }}>
-                    <Ionicons name="close" size={18} color="#94A3B8" />
+                }} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                    <Ionicons name="close" size={16} color="#94A3B8" />
                 </TouchableOpacity>
             </View>
             <Text style={styles.recTitle} numberOfLines={2}>{item.title}</Text>
             <View style={styles.recFooter}>
-                <Text style={styles.recType}>{item.type === 'online' ? 'Online' : 'Presencial'}</Text>
-                <Ionicons name="chevron-forward" size={16} color="#4F46E5" />
+                <View style={[styles.recTypeChip, { backgroundColor: item.type === 'online' ? '#ECFDF5' : '#EEF2FF' }]}>
+                    <Ionicons name={item.type === 'online' ? 'videocam-outline' : 'location-outline'} size={11} color={item.type === 'online' ? '#10B981' : '#6366F1'} />
+                    <Text style={[styles.recTypeText, { color: item.type === 'online' ? '#10B981' : '#6366F1' }]}>{item.type === 'online' ? 'Online' : 'Presencial'}</Text>
+                </View>
+                <Ionicons name="chevron-forward" size={16} color="#6366F1" />
             </View>
-        </TouchableOpacity>
+        </Pressable>
     );
 
     return (
         <SafeAreaView style={styles.container} edges={['top']}>
-            <View style={styles.header}>
-                <Text style={styles.headerTitle}>Agenda de Eventos</Text>
+            <LinearGradient
+                colors={['#6366F1', '#8B5CF6']}
+                start={{ x: 0, y: 0 }}
+                end={{ x: 1, y: 1 }}
+                style={styles.header}
+            >
+                <View style={styles.blobOne} />
+                <View style={styles.blobTwo} />
+
+                <View style={styles.headerTopRow}>
+                    <View>
+                        <Text style={styles.headerTitle}>Agenda de Eventos</Text>
+                    </View>
+                    <View style={styles.headerIconChip}>
+                        <Ionicons name="calendar" size={20} color="#fff" />
+                    </View>
+                </View>
 
                 {/* Tabs */}
                 <View style={styles.tabContainer}>
-                    <TouchableOpacity
-                        style={[styles.tabBtn, activeTab === 'upcoming' && styles.tabBtnActive]}
+                    <Pressable
+                        style={({ pressed }) => [styles.tabBtn, activeTab === 'upcoming' && styles.tabBtnActive, pressed && { opacity: 0.85 }]}
                         onPress={() => { setActiveTab('upcoming'); setSelectedDate(''); }}
                     >
                         <Text style={[styles.tabText, activeTab === 'upcoming' && styles.tabTextActive]}>Próximos</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity
-                        style={[styles.tabBtn, activeTab === 'history' && styles.tabBtnActive]}
+                    </Pressable>
+                    <Pressable
+                        style={({ pressed }) => [styles.tabBtn, activeTab === 'history' && styles.tabBtnActive, pressed && { opacity: 0.85 }]}
                         onPress={() => setActiveTab('history')}
                     >
                         <Text style={[styles.tabText, activeTab === 'history' && styles.tabTextActive]}>Histórico</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity
-                        style={[styles.tabBtn, activeTab === 'favorites' && styles.tabBtnActive]}
+                    </Pressable>
+                    <Pressable
+                        style={({ pressed }) => [styles.tabBtn, activeTab === 'favorites' && styles.tabBtnActive, pressed && { opacity: 0.85 }]}
                         onPress={() => setActiveTab('favorites')}
                     >
                         <Text style={[styles.tabText, activeTab === 'favorites' && styles.tabTextActive]}>Favoritos</Text>
-                    </TouchableOpacity>
+                        {favorites.length > 0 && (
+                            <View style={styles.tabBadge}>
+                                <Text style={styles.tabBadgeText}>{favorites.length}</Text>
+                            </View>
+                        )}
+                    </Pressable>
                 </View>
-            </View>
+            </LinearGradient>
+
 
             <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent}>
 
-                {activeTab === 'upcoming' && (
-                    <View style={styles.calendarWrapper}>
+                {error ? (
+                    <View style={{ marginTop: 40 }}>
+                        <ErrorState
+                            title="Ops, erro ao carregar"
+                            message="Não conseguimos acessar sua agenda. Verifique sua internet."
+                            onRetry={fetchEvents}
+                        />
+                    </View>
+                ) : activeTab === 'upcoming' && (
+                    <View style={[styles.calendarWrapper, styles.calendarOverlap]}>
                         <Calendar
+                            markingType={'custom'}
+                            dayComponent={(props: any) => <CalendarDayCell {...props} />}
                             onDayPress={onDayPress}
                             markedDates={{
                                 ...markedDates,
+                                ...recommendations.reduce((acc, rec) => {
+                                    if (!rec.date) return acc;
+                                    const existing = markedDates[rec.date] || { past: rec.date < getTodayStr(), hasEvent: false };
+                                    if (!existing.mine) {
+                                        acc[rec.date] = { ...existing, recommended: true, hasEvent: true };
+                                    }
+                                    return acc;
+                                }, {}),
                                 [selectedDate]: {
                                     ...markedDates[selectedDate],
+                                    ...(recommendations.find(r => r.date === selectedDate) && !markedDates[selectedDate]?.mine ? { recommended: true, hasEvent: true } : {}),
                                     selected: true,
-                                    selectedColor: '#4F46E5',
-                                    selectedTextColor: '#ffffff'
                                 }
                             }}
                             theme={{
                                 backgroundColor: '#ffffff',
                                 calendarBackground: '#ffffff',
                                 textSectionTitleColor: '#94A3B8',
-                                selectedDayBackgroundColor: '#4F46E5',
-                                selectedDayTextColor: '#ffffff',
-                                todayTextColor: '#4F46E5',
-                                dayTextColor: '#1E293B',
-                                textDisabledColor: '#CBD5E1',
-                                dotColor: '#4F46E5',
-                                selectedDotColor: '#ffffff',
-                                arrowColor: '#4F46E5',
+                                arrowColor: '#6366F1',
                                 monthTextColor: '#0F172A',
-                                indicatorColor: '#4F46E5',
-                                textDayFontWeight: '500',
+                                indicatorColor: '#6366F1',
                                 textMonthFontWeight: 'bold',
                                 textDayHeaderFontWeight: '600',
-                                textDayFontSize: 16,
                                 textMonthFontSize: 18,
                                 textDayHeaderFontSize: 13,
                                 // @ts-ignore
@@ -399,6 +624,43 @@ export default function AgendaScreen() {
                                 }
                             }}
                         />
+
+                        {/* Legenda do Calendário */}
+                        <View style={styles.legendCard}>
+                            <Text style={styles.legendTitle}>Legenda</Text>
+                            <View style={styles.legendGrid}>
+                                <View style={styles.legendItem}>
+                                    <View style={styles.legendSwatchCircle} />
+                                    <Text style={styles.legendText}>Seus Eventos</Text>
+                                </View>
+                                <View style={styles.legendItem}>
+                                    <View style={[styles.legendSwatchIcon, { backgroundColor: '#3B82F6' }]}>
+                                        <Ionicons name="repeat" size={9} color="#fff" />
+                                    </View>
+                                    <Text style={styles.legendText}>Recorrentes</Text>
+                                </View>
+                                <View style={styles.legendItem}>
+                                    <View style={[styles.legendSwatchIcon, { backgroundColor: '#FEF3C7' }]}>
+                                        <Text style={{ fontSize: 9 }}>🔥</Text>
+                                    </View>
+                                    <Text style={styles.legendText}>Populares (+3)</Text>
+                                </View>
+                                <View style={styles.legendItem}>
+                                    <View style={[styles.legendSwatchIcon, { backgroundColor: '#8B5CF6' }]}>
+                                        <Text style={{ fontSize: 9 }}>⭐</Text>
+                                    </View>
+                                    <Text style={styles.legendText}>Recomendados</Text>
+                                </View>
+                                <View style={styles.legendItem}>
+                                    <View style={[styles.legendBar, { backgroundColor: '#10B981' }]} />
+                                    <Text style={styles.legendText}>Próximos</Text>
+                                </View>
+                                <View style={styles.legendItem}>
+                                    <View style={[styles.legendBar, { backgroundColor: '#CBD5E1' }]} />
+                                    <Text style={styles.legendText}>Passados</Text>
+                                </View>
+                            </View>
+                        </View>
                     </View>
                 )}
 
@@ -406,7 +668,9 @@ export default function AgendaScreen() {
                     {activeTab === 'upcoming' && selectedDate ? (
                         <>
                             <View style={styles.detailsHeader}>
-                                <Ionicons name="calendar" size={20} color="#4F46E5" />
+                                <View style={styles.detailsIconChip}>
+                                    <Ionicons name="calendar" size={16} color="#6366F1" />
+                                </View>
                                 <Text style={styles.detailsDate}>
                                     {selectedDate.split('-').reverse().join('/')}
                                 </Text>
@@ -418,18 +682,36 @@ export default function AgendaScreen() {
                                     </View>
                                 ))
                             ) : (
-                                <Text style={styles.emptyText}>Nenhum evento neste dia.</Text>
+                                <View style={styles.emptyState}>
+                                    <View style={[styles.emptyIconChip, { backgroundColor: '#EEF2FF' }]}>
+                                        <Ionicons name="calendar-outline" size={24} color="#6366F1" />
+                                    </View>
+                                    <Text style={styles.emptyText}>Nenhum evento neste dia.</Text>
+                                </View>
                             )}
                         </>
                     ) : activeTab === 'upcoming' && !selectedDate ? (
                         <View style={styles.instructionState}>
+                            <View style={styles.instructionInner}>
+                                <View style={[styles.emptyIconChip, { backgroundColor: '#EEF2FF' }]}>
+                                    <Ionicons name="calendar-outline" size={26} color="#6366F1" />
+                                </View>
+                                <Text style={styles.instructionText}>
+                                    {filteredEvents.length === 0
+                                        ? "Você ainda não confirmou presença em eventos futuros. Abaixo estão algumas sugestões para começar:"
+                                        : "Selecione uma data no calendário para ver seus eventos."}
+                                </Text>
+                            </View>
+
                             {recommendations.length > 0 ? (
                                 <View style={styles.recommendationsContainer}>
                                     <View style={styles.recTitleRow}>
-                                        <Ionicons name="sparkles" size={18} color="#F59E0B" />
-                                        <Text style={styles.recMainTitle}>Recomendado: Mesmos Eventos</Text>
+                                        <View style={styles.recTitleIconChip}>
+                                            <Ionicons name="sparkles" size={14} color="#F59E0B" />
+                                        </View>
+                                        <Text style={styles.recMainTitle}>Recomendado para você</Text>
                                     </View>
-                                    <Text style={styles.recSubtitle}>Eventos futuros idênticos aos que você já foi</Text>
+                                    <Text style={styles.recSubtitle}>Baseado no seu histórico, interesses ou localização</Text>
                                     <FlatList
                                         horizontal
                                         showsHorizontalScrollIndicator={false}
@@ -440,9 +722,6 @@ export default function AgendaScreen() {
                                     />
                                 </View>
                             ) : null}
-
-                            <Ionicons name="calendar-outline" size={48} color="#E2E8F0" style={{ marginTop: recommendations.length > 0 ? 20 : 60 }} />
-                            <Text style={styles.instructionText}>Selecione uma data no calendário para ver seus eventos futuros.</Text>
                         </View>
                     ) : (
                         // List View for History & Favorites (No Calendar selection needed)
@@ -453,14 +732,14 @@ export default function AgendaScreen() {
                                         {renderEventCard({ item })}
                                     </View>
                                 ))
-                            ) : (
-                                <View style={styles.emptyState}>
-                                    <Ionicons name="folder-open-outline" size={48} color="#E2E8F0" />
-                                    <Text style={styles.emptyText}>
-                                        {activeTab === 'favorites' ? 'Nenhum favorito encontrado.' : 'Nenhum histórico encontrado.'}
-                                    </Text>
+                            ) : !error && !loading ? (
+                                <View style={{ marginTop: 40 }}>
+                                    <ErrorState
+                                        title={activeTab === 'favorites' ? 'Nenhum favorito' : 'Nenhum histórico'}
+                                        message={activeTab === 'favorites' ? 'Você ainda não curtiu nenhum evento.' : 'Você não possui histórico de eventos.'}
+                                    />
                                 </View>
-                            )}
+                            ) : null}
                         </View>
                     )}
                 </View>
@@ -471,27 +750,48 @@ export default function AgendaScreen() {
             <Modal visible={!!selectedEvent} animationType="slide" transparent={true} onRequestClose={() => setSelectedEvent(null)}>
                 <View style={styles.modalOverlay}>
                     <View style={styles.modalContent}>
-                        <Text style={styles.modalTitle}>{selectedEvent?.title}</Text>
-                        <TouchableOpacity style={styles.modalOption} onPress={() => { router.push(`/event/${selectedEvent.id}` as any); setSelectedEvent(null); }}>
-                            <Ionicons name="eye-outline" size={20} color="#4F46E5" />
+                        <View style={styles.modalHandle} />
+                        <Text style={styles.modalTitle} numberOfLines={2}>{selectedEvent?.title}</Text>
+
+                        <Pressable
+                            style={({ pressed }) => [styles.modalOption, pressed && styles.modalOptionPressed]}
+                            onPress={() => { router.push(`/event/${selectedEvent.id}` as any); setSelectedEvent(null); }}
+                        >
+                            <View style={[styles.modalIconChip, { backgroundColor: '#EEF2FF' }]}>
+                                <Ionicons name="eye-outline" size={18} color="#6366F1" />
+                            </View>
                             <Text style={styles.modalOptionText}>Ver Detalhes do Evento</Text>
-                        </TouchableOpacity>
+                            <Ionicons name="chevron-forward" size={16} color="#CBD5E1" style={{ marginLeft: 'auto' }} />
+                        </Pressable>
 
                         {selectedEvent?.createdBy === auth.currentUser?.uid ? (
-                            <TouchableOpacity style={[styles.modalOption, { borderTopWidth: 1, borderColor: '#F1F5F9' }]} onPress={() => handleDeleteEvent(selectedEvent)}>
-                                <Ionicons name="trash-outline" size={20} color="#EF4444" />
+                            <Pressable
+                                style={({ pressed }) => [styles.modalOption, styles.modalOptionDivider, pressed && styles.modalOptionPressed]}
+                                onPress={() => handleDeleteEvent(selectedEvent)}
+                            >
+                                <View style={[styles.modalIconChip, { backgroundColor: '#FEF2F2' }]}>
+                                    <Ionicons name="trash-outline" size={18} color="#EF4444" />
+                                </View>
                                 <Text style={[styles.modalOptionText, { color: '#EF4444' }]}>Excluir Evento Definitivamente</Text>
-                            </TouchableOpacity>
+                            </Pressable>
                         ) : (
-                            <TouchableOpacity style={[styles.modalOption, { borderTopWidth: 1, borderColor: '#F1F5F9' }]} onPress={() => handleCancelRSVP(selectedEvent)}>
-                                <Ionicons name="close-circle-outline" size={20} color="#EF4444" />
+                            <Pressable
+                                style={({ pressed }) => [styles.modalOption, styles.modalOptionDivider, pressed && styles.modalOptionPressed]}
+                                onPress={() => handleCancelRSVP(selectedEvent)}
+                            >
+                                <View style={[styles.modalIconChip, { backgroundColor: '#FEF2F2' }]}>
+                                    <Ionicons name="close-circle-outline" size={18} color="#EF4444" />
+                                </View>
                                 <Text style={[styles.modalOptionText, { color: '#EF4444' }]}>Cancelar Presença (Sair)</Text>
-                            </TouchableOpacity>
+                            </Pressable>
                         )}
-                        
-                        <TouchableOpacity style={styles.modalCancel} onPress={() => setSelectedEvent(null)}>
+
+                        <Pressable
+                            style={({ pressed }) => [styles.modalCancel, pressed && { backgroundColor: '#E2E8F0' }]}
+                            onPress={() => setSelectedEvent(null)}
+                        >
                             <Text style={styles.modalCancelText}>Fechar Menu</Text>
-                        </TouchableOpacity>
+                        </Pressable>
                     </View>
                 </View>
             </Modal>
@@ -501,82 +801,164 @@ export default function AgendaScreen() {
 
 const styles = StyleSheet.create({
     container: { flex: 1, backgroundColor: '#F8FAFC' },
-    header: { padding: 24, backgroundColor: '#fff', borderBottomWidth: 1, borderBottomColor: '#F1F5F9' },
-    headerTitle: { fontSize: 28, fontWeight: '800', color: '#0F172A', marginBottom: 16 },
 
-    tabContainer: { flexDirection: 'row', backgroundColor: '#F1F5F9', borderRadius: 12, padding: 4 },
-    tabBtn: { flex: 1, paddingVertical: 8, alignItems: 'center', borderRadius: 8 },
-    tabBtnActive: { backgroundColor: '#fff', shadowColor: '#000', shadowOpacity: 0.05, shadowRadius: 2, elevation: 1 },
-    tabText: { fontSize: 13, fontWeight: '600', color: '#64748B' },
-    tabTextActive: { color: '#0F172A' },
+    // Header
+    header: {
+        paddingTop: 16,
+        paddingHorizontal: 24,
+        paddingBottom: 30,
+        borderBottomLeftRadius: 32,
+        borderBottomRightRadius: 32,
+        overflow: 'hidden',
+        position: 'relative',
+        shadowColor: '#4f46e5',
+        shadowOpacity: 0.3,
+        shadowRadius: 16,
+        shadowOffset: { width: 0, height: 8 },
+        elevation: 8,
+    },
+    blobOne: { position: 'absolute', top: -60, right: -40, width: 180, height: 180, borderRadius: 90, backgroundColor: 'rgba(255,255,255,0.08)' },
+    blobTwo: { position: 'absolute', bottom: -70, left: -50, width: 160, height: 160, borderRadius: 80, backgroundColor: 'rgba(255,255,255,0.06)' },
+
+    headerTopRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 20 },
+    headerTitle: { fontSize: 24, fontWeight: '800', color: '#fff' },
+    headerSubtitle: { fontSize: 13, color: 'rgba(255,255,255,0.85)', marginTop: 4, maxWidth: 230 },
+    pulseRing: { position: 'absolute', width: 36, height: 36, borderRadius: 18, backgroundColor: 'rgba(239,68,68,0.2)', top: -10, left: -10 },
+
+    headerIconChip: { width: 42, height: 42, borderRadius: 15, backgroundColor: 'rgba(255,255,255,0.18)', justifyContent: 'center', alignItems: 'center' },
+
+    tabContainer: { flexDirection: 'row', backgroundColor: 'rgba(255,255,255,0.18)', borderRadius: 14, padding: 4, gap: 4, marginBottom: -10 },
+    tabBtn: { flex: 1, flexDirection: 'row', paddingVertical: 9, alignItems: 'center', justifyContent: 'center', borderRadius: 10, position: 'relative' },
+    tabBtnActive: { backgroundColor: '#fff', shadowColor: '#000', shadowOpacity: 0.1, shadowRadius: 4, elevation: 2 },
+    tabText: { fontSize: 13, fontWeight: '700', color: 'rgba(255,255,255,0.85)' },
+    tabTextActive: { color: '#6366F1' },
+    tabBadge: { position: 'absolute', top: -6, right: 6, minWidth: 16, height: 16, borderRadius: 8, backgroundColor: '#EF4444', borderWidth: 1.5, borderColor: '#fff', justifyContent: 'center', alignItems: 'center', paddingHorizontal: 2 },
+    tabBadgeText: { color: '#fff', fontSize: 9, fontWeight: 'bold' },
 
     scrollContent: { paddingBottom: 40 },
     calendarWrapper: {
         backgroundColor: '#fff',
-        borderRadius: 20,
-        margin: 16,
+        borderRadius: 22,
+        marginHorizontal: 16,
         padding: 10,
-        shadowColor: '#000',
-        shadowOffset: { width: 0, height: 4 },
-        shadowOpacity: 0.05,
-        shadowRadius: 12,
-        elevation: 3,
+        shadowColor: '#4b4b76',
+        shadowOffset: { width: 0, height: 6 },
+        shadowOpacity: 0.08,
+        shadowRadius: 16,
+        elevation: 4,
     },
+    calendarOverlap: { marginTop: -24 },
     detailsSection: { marginTop: 8, paddingHorizontal: 16 },
-    detailsHeader: { flexDirection: 'row', alignItems: 'center', marginBottom: 16, paddingLeft: 8 },
-    detailsDate: { fontSize: 18, fontWeight: '700', color: '#1E293B', marginLeft: 10 },
+    detailsHeader: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 16, paddingLeft: 4 },
+    detailsIconChip: { width: 30, height: 30, borderRadius: 11, backgroundColor: '#EEF2FF', justifyContent: 'center', alignItems: 'center' },
+    detailsDate: { fontSize: 17, fontWeight: '800', color: '#1E293B' },
+
+    // Calendar Day Cell (sinalizações customizadas)
+    dayCell: { alignItems: 'center', justifyContent: 'flex-start', paddingTop: 2, paddingBottom: 4 },
+    dayCircle: {
+        width: 30,
+        height: 30,
+        borderRadius: 15,
+        alignItems: 'center',
+        justifyContent: 'center',
+        position: 'relative',
+    },
+    dayCircleMine: { backgroundColor: 'rgba(139,92,246,0.16)' },
+    dayCircleToday: { borderWidth: 1.5, borderColor: '#6366F1' },
+    dayCircleSelected: { backgroundColor: '#6366F1' },
+    dayText: { fontSize: 14, fontWeight: '600', color: '#1E293B' },
+    dayTextDisabled: { color: '#CBD5E1' },
+    dayTextToday: { color: '#6366F1', fontWeight: '800' },
+    dayTextSelected: { color: '#fff', fontWeight: '800' },
+    dayBadgeRecurring: {
+        position: 'absolute', top: -3, left: -4, width: 13, height: 13, borderRadius: 6.5,
+        backgroundColor: '#3B82F6', alignItems: 'center', justifyContent: 'center',
+        borderWidth: 1.5, borderColor: '#fff',
+    },
+    dayBadgePopular: {
+        position: 'absolute', top: -3, right: -4, width: 13, height: 13, borderRadius: 6.5,
+        backgroundColor: '#FEF3C7', alignItems: 'center', justifyContent: 'center',
+        borderWidth: 1.5, borderColor: '#fff',
+    },
+    dayBadgePopularEmoji: { fontSize: 7 },
+    dayBar: { width: 14, height: 3, borderRadius: 2, marginTop: 3 },
+
+    // Legenda do Calendário
+    legendCard: { marginTop: 12, paddingTop: 12, paddingHorizontal: 6, borderTopWidth: 1, borderTopColor: '#F1F5F9' },
+    legendTitle: { fontSize: 11, fontWeight: '800', color: '#94A3B8', marginBottom: 10, textTransform: 'uppercase', letterSpacing: 0.6 },
+    legendGrid: { flexDirection: 'row', flexWrap: 'wrap', rowGap: 10, columnGap: 16 },
+    legendItem: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+    legendSwatchCircle: { width: 14, height: 14, borderRadius: 7, backgroundColor: 'rgba(139,92,246,0.16)', borderWidth: 1.5, borderColor: '#8B5CF6' },
+    legendSwatchIcon: { width: 14, height: 14, borderRadius: 7, alignItems: 'center', justifyContent: 'center' },
+    legendBar: { width: 14, height: 4, borderRadius: 2 },
+    legendText: { fontSize: 12, color: '#64748B', fontWeight: '500' },
 
     // Cards
     eventCard: {
         flexDirection: 'row',
         alignItems: 'center',
         backgroundColor: '#fff',
-        borderRadius: 16,
+        borderRadius: 18,
         padding: 16,
         marginBottom: 12,
-        shadowColor: '#000',
-        shadowOffset: { width: 0, height: 2 },
-        shadowOpacity: 0.03,
-        shadowRadius: 8,
+        shadowColor: '#4b4b76',
+        shadowOffset: { width: 0, height: 3 },
+        shadowOpacity: 0.05,
+        shadowRadius: 10,
         elevation: 2,
         borderWidth: 1,
-        borderColor: 'transparent'
+        borderColor: '#F1F3FA'
     },
+    eventCardSoon: { borderColor: '#E0E7FF', backgroundColor: '#FAFAFF' },
+    cardPressed: { transform: [{ scale: 0.98 }], opacity: 0.92 },
     eventTypeIndicator: { width: 4, height: 40, borderRadius: 2, marginRight: 16 },
     eventInfo: { flex: 1 },
     eventTitle: { fontSize: 16, fontWeight: '700', color: '#0F172A', marginBottom: 4 },
-    eventMeta: { flexDirection: 'row', alignItems: 'center', marginTop: 4 },
-    eventMetaText: { fontSize: 13, color: '#64748B', marginLeft: 4, marginRight: 12 },
-    metaSeparator: { width: 4, height: 4, borderRadius: 2, backgroundColor: '#E2E8F0', marginRight: 12 },
+    eventMeta: { flexDirection: 'row', alignItems: 'center', marginTop: 4, flexWrap: 'wrap', rowGap: 6 },
+    eventMetaText: { fontSize: 12, color: '#64748B', marginRight: 12, fontWeight: '500' },
+    metaIconChip: { width: 20, height: 20, borderRadius: 7, justifyContent: 'center', alignItems: 'center', marginRight: 5 },
 
-    badgePopular: { backgroundColor: '#FEF3C7', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6 },
+    badgePopular: { backgroundColor: '#FEF3C7', paddingHorizontal: 7, paddingVertical: 3, borderRadius: 8 },
     badgePopularText: { fontSize: 10, fontWeight: 'bold', color: '#D97706' },
-    badgeSoon: { backgroundColor: '#EEF2FF', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6 },
-    badgeSoonText: { fontSize: 10, fontWeight: 'bold', color: '#4F46E5' },
+    badgeSoon: { backgroundColor: '#EEF2FF', paddingHorizontal: 7, paddingVertical: 3, borderRadius: 8 },
+    badgeSoonText: { fontSize: 10, fontWeight: 'bold', color: '#6366F1' },
 
-    emptyState: { alignItems: 'center', justifyContent: 'center', paddingVertical: 40, backgroundColor: '#fff', borderRadius: 16, borderWidth: 1, borderStyle: 'dashed', borderColor: '#E2E8F0' },
-    emptyText: { marginTop: 12, color: '#94A3B8', fontSize: 14, fontStyle: 'italic' },
-    instructionState: { alignItems: 'center', justifyContent: 'center', paddingVertical: 20 },
-    instructionText: { marginTop: 16, color: '#94A3B8', fontSize: 14, textAlign: 'center', paddingHorizontal: 40 },
+    emptyState: { alignItems: 'center', justifyContent: 'center', paddingVertical: 40, backgroundColor: '#fff', borderRadius: 20, borderWidth: 1, borderColor: '#F0F1F8', gap: 12 },
+    emptyIconChip: { width: 56, height: 56, borderRadius: 20, justifyContent: 'center', alignItems: 'center' },
+    emptyText: { color: '#94A3B8', fontSize: 14, fontWeight: '500' },
+    instructionState: { alignItems: 'center', justifyContent: 'center' },
+    instructionInner: { alignItems: 'center', justifyContent: 'center', paddingVertical: 30, gap: 14 },
+    instructionText: { color: '#94A3B8', fontSize: 14, textAlign: 'center', paddingHorizontal: 40, fontWeight: '500' },
 
     // Modal
-    modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'flex-end' },
-    modalContent: { backgroundColor: '#fff', borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 24 },
-    modalTitle: { fontSize: 18, fontWeight: 'bold', color: '#0F172A', marginBottom: 16 },
-    modalOption: { flexDirection: 'row', alignItems: 'center', paddingVertical: 16 },
-    modalOptionText: { fontSize: 16, fontWeight: '600', color: '#1E293B', marginLeft: 12 },
-    modalCancel: { marginTop: 16, backgroundColor: '#F1F5F9', padding: 14, borderRadius: 12, alignItems: 'center' },
-    modalCancelText: { fontSize: 16, fontWeight: 'bold', color: '#64748B' },
+    modalOverlay: { flex: 1, backgroundColor: 'rgba(15,23,42,0.5)', justifyContent: 'flex-end' },
+    modalContent: { backgroundColor: '#fff', borderTopLeftRadius: 28, borderTopRightRadius: 28, padding: 24, paddingBottom: 32 },
+    modalHandle: { width: 40, height: 5, borderRadius: 3, backgroundColor: '#E2E8F0', alignSelf: 'center', marginBottom: 18 },
+    modalTitle: { fontSize: 18, fontWeight: 'bold', color: '#0F172A', marginBottom: 12 },
+    modalOption: { flexDirection: 'row', alignItems: 'center', paddingVertical: 12, borderRadius: 14 },
+    modalOptionDivider: { borderTopWidth: 1, borderColor: '#F1F5F9', marginTop: 4, paddingTop: 16 },
+    modalOptionPressed: { backgroundColor: '#F8FAFC' },
+    modalIconChip: { width: 36, height: 36, borderRadius: 12, justifyContent: 'center', alignItems: 'center', marginRight: 12 },
+    modalOptionText: { fontSize: 15, fontWeight: '600', color: '#1E293B' },
+    modalCancel: { marginTop: 14, backgroundColor: '#F1F5F9', padding: 14, borderRadius: 14, alignItems: 'center' },
+    modalCancelText: { fontSize: 15, fontWeight: 'bold', color: '#64748B' },
 
     // Recommendations
-    recommendationsContainer: { width: '100%', marginBottom: 20 },
-    recTitleRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 4 },
-    recMainTitle: { fontSize: 16, fontWeight: 'bold', color: '#1E293B', marginLeft: 6 },
-    recSubtitle: { fontSize: 13, color: '#64748B', marginBottom: 12, marginLeft: 24 },
-    recCard: { backgroundColor: '#EEF2FF', width: 200, padding: 16, borderRadius: 16, marginRight: 12, borderWidth: 1, borderColor: '#E0E7FF' },
+    recommendationsContainer: { width: '100%', marginBottom: 8 },
+    recTitleRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 4 },
+    recTitleIconChip: { width: 26, height: 26, borderRadius: 9, backgroundColor: '#FFFBEB', justifyContent: 'center', alignItems: 'center' },
+    recMainTitle: { fontSize: 16, fontWeight: 'bold', color: '#1E293B' },
+    recSubtitle: { fontSize: 13, color: '#64748B', marginBottom: 14, marginLeft: 34 },
+    recCard: {
+        backgroundColor: '#fff', width: 200, padding: 16, paddingTop: 20, borderRadius: 18, marginRight: 12,
+        borderWidth: 1, borderColor: '#F1F3FA', overflow: 'hidden',
+        shadowColor: '#4b4b76', shadowOpacity: 0.06, shadowRadius: 10, shadowOffset: { width: 0, height: 4 }, elevation: 2,
+    },
+    recAccentBar: { position: 'absolute', top: 0, left: 0, right: 0, height: 4, backgroundColor: '#F59E0B' },
     recHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 },
-    recDate: { fontSize: 12, fontWeight: 'bold', color: '#4F46E5' },
-    recTitle: { fontSize: 14, fontWeight: 'bold', color: '#1E293B', marginBottom: 12 },
+    recDate: { fontSize: 12, fontWeight: 'bold', color: '#6366F1' },
+    recTitle: { fontSize: 14, fontWeight: 'bold', color: '#1E293B', marginBottom: 14 },
     recFooter: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-    recType: { fontSize: 12, color: '#64748B' },
+    recTypeChip: { flexDirection: 'row', alignItems: 'center', gap: 4, paddingHorizontal: 8, paddingVertical: 3, borderRadius: 8 },
+    recTypeText: { fontSize: 11, fontWeight: '700' },
 });

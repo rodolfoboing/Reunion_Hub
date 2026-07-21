@@ -2,7 +2,7 @@
 
 ## Ativação
 
-- **Mode:** Always On
+- **Mode:** Conditional
 - **Pattern:** app/**/*.tsx, src/**/*.tsx, src/**/*.ts, services/**/*.ts, firebaseConfig.ts, types/**/*.ts
 
 ## Descrição do Workspace
@@ -24,7 +24,7 @@ A arquitetura segue o padrão *Package by Feature* isolando a lógica da navega�
 ## Instruções de Contexto e Custo de Banco (Firestore)
 
 1. **Eficiência de Banco (Anti-Desperdício):** O Firebase Firestore cobra por leitura/escrita. NUNCA coloque chamadas de `getDocs` ou `onSnapshot` sem limites de paginação (`limit()`). Utilize estados locais (`useState`) para manipular dados temporários e faça operações em lote (Batch) quando necessário, reduzindo requisições avulsas.
-2. **Separação UI vs. Lógica:** Separe bem interface do usuario e logica em arquivos distintos.
+2. **Separação UI vs. Lógica:** Separe bem interface do usuario e logica em arquivos distintos, se focando principalmente em não violar o "Princípio da Responsabilidade Única" do SOLID.
 3. **Evolução e Limpeza Ativa:** O projeto está em fase inicial de estruturação. Se uma lógica de estado, hook ou tipagem se tornar obsoleta, sugira a DELEÇÃO imediata e completa do código morto. Não mantenha código comentado "para o futuro".
 
 ## Padrões de Engenharia (Visão Sênior)
@@ -46,4 +46,6 @@ A arquitetura segue o padrão *Package by Feature* isolando a lógica da navega�
 > 2. Esta consulta ao Firebase está otimizada para minimizar custos de leitura?
 > 3. Existe risco de 'memory leak' nesta implementação (ex: `useEffect` sem função de limpeza, ou listeners ativos)?
 > 4. O impacto na fluidez do mapa e na hierarquia de navegação aninhada (Drawer > Tabs) foi rigorosamente considerado?
-> Nunca seja reativo ou preguiçoso: reflita criticamente sobre a arquitetura e limitações do mobile antes de propor a solução final."
+> 5. Nunca seja reativo ou preguiçoso: reflita criticamente sobre a arquitetura e limitações do mobile antes de propor a solução final."
+> 6. Nunca use atualização, busca ou salvamento no Git, Github sem autorização do usuario.
+> 7. Pense sempre no ciclo de vida futuro do codigo, colocando Logs em partes importantes para manutenção futura.

@@ -1,0 +1,55 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Função auxiliar: Verifica se o usuário está logado
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Regras mais permissivas e SIMPLES para evitar erros no frontend,
+    // garantindo apenas que visitantes anônimos (deslogados) não alterem dados.
+    
+    // Usuários
+    match /users/{userId} {
+      allow read: if true; // Perfis públicos
+      allow write: if isAuthenticated(); // Permite criar e atualizar perfis (necessário para dar like/block)
+    }
+
+    // Eventos
+    match /meetings/{meetingId} {
+      allow read: if true; // O mapa é público
+      allow write: if isAuthenticated(); // Qualquer um logado pode criar ou entrar em eventos (modificar array attendees)
+    }
+
+    // Conversas e Mensagens
+    match /conversations/{document=**} {
+      // Aberto apenas para quem está autenticado
+      allow read, write: if isAuthenticated(); 
+    }
+
+    // Locais do Mapa (Places)
+    match /places/{placeId} {
+      // Aberto para o mapa puxar locais
+      allow read, write: if isAuthenticated(); 
+    }
+
+    // Notificações (In-App)
+    match /notifications/{notificationId} {
+      // Aberto apenas para quem está autenticado
+      allow read, write: if isAuthenticated(); 
+    }
+
+    // Denúncias
+    match /reports/{reportId} {
+      // Qualquer um logado cria denúncia, admins poderão ler/resolver.
+      allow read, write: if isAuthenticated(); 
+    }
+
+    // Outros documentos (bloqueia gravação fantasma fora das coleções principais)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

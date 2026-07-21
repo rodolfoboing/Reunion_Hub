@@ -38,6 +38,7 @@ yarn-error.*
 
 # generated native folders
 /ios/
+/android/
 
 
 
@@ -61,5 +62,5 @@ GoogleService-Info.plist
 
 
 # project configs with keys
-app.json
-eas.json
+# app.json MUST NEVER BE IGNORED for EAS Build to work
+# eas.json MUST NEVER BE IGNORED for EAS Build to work

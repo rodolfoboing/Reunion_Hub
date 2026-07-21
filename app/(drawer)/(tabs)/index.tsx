@@ -1,23 +1,29 @@
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, FlatList, Image } from 'react-native';
-import { useEffect, useState, useRef } from 'react';
-import { sendLocalNotification } from '../../../src/utils/Notifications';
-import { auth, db } from '../../../src/services/firebaseConfig';
-import { doc, getDoc, collection, getDocs, onSnapshot, query, where, limit, or } from 'firebase/firestore';
-import { onAuthStateChanged } from 'firebase/auth';
+import { ErrorState } from '@/src/components/ErrorState';
 import { FontAwesome } from '@expo/vector-icons';
-import { router } from 'expo-router';
+import { LinearGradient } from 'expo-linear-gradient';
 import * as Location from 'expo-location';
-import { User, Meeting, Notification } from '../../../src/types';
+import { router } from 'expo-router';
+import { onAuthStateChanged } from 'firebase/auth';
+import { collection, doc, getDoc, getDocs, limit, onSnapshot, query, where } from 'firebase/firestore';
+import { useEffect, useRef, useState } from 'react';
+import { FlatList, Image, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { auth, db } from '../../../src/services/firebaseConfig';
+import { Meeting, User } from '../../../src/types';
+import { sendLocalNotification } from '../../../src/utils/Notifications';
+import { STRINGS } from '../../../src/constants/strings';
+import { normalizeDate, getTodayStr } from '../../../src/utils/dateUtils';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { ManualModal } from '../../../src/components/ManualModal';
 
 const getDistanceFromLatLonInKm = (lat1: number, lon1: number, lat2: number, lon2: number) => {
   const R = 6371; // Radius of the earth in km
   const dLat = (lat2 - lat1) * (Math.PI / 180);
   const dLon = (lon2 - lon1) * (Math.PI / 180);
-  const a = 
+  const a =
     Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(lat1 * (Math.PI / 180)) * Math.cos(lat2 * (Math.PI / 180)) * 
-    Math.sin(dLon / 2) * Math.sin(dLon / 2); 
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)); 
+    Math.cos(lat1 * (Math.PI / 180)) * Math.cos(lat2 * (Math.PI / 180)) *
+    Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   return R * c; // Distance in km
 };
 
@@ -25,15 +31,12 @@ const getDistanceFromLatLonInKm = (lat1: number, lon1: number, lat2: number, lon
 const MONTH_NAMES = ['JAN', 'FEV', 'MAR', 'ABR', 'MAI', 'JUN', 'JUL', 'AGO', 'SET', 'OUT', 'NOV', 'DEZ'];
 
 const formatEventDate = (dateString: string | undefined) => {
-  if (!dateString) return { day: '--', month: '---' };
+  const normalized = normalizeDate(dateString);
+  if (!normalized) return { day: '--', month: '---' };
 
   try {
-    // Normaliza a data: substitui / por - e faz trim
-    const normalized = dateString.trim().replace(/\//g, '-');
     const parts = normalized.split('-');
-
     if (parts.length === 3) {
-      // Formato YYYY-MM-DD
       const monthIndex = parseInt(parts[1], 10) - 1;
       const day = parseInt(parts[2], 10);
 
@@ -43,7 +46,7 @@ const formatEventDate = (dateString: string | undefined) => {
       };
     }
   } catch (e) {
-    console.warn('Error parsing date:', dateString, e);
+    console.warn('[Index] Erro ao analisar data:', dateString, e);
   }
 
   return { day: '--', month: '---' };
@@ -58,22 +61,49 @@ export default function HomeScreen() {
   const [nearbyEvents, setNearbyEvents] = useState<Meeting[]>([]);
 
   const [unreadCount, setUnreadCount] = useState(0);
+  const [error, setError] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [showManualModal, setShowManualModal] = useState(false);
 
-  // Ref to track first load and prevent notification spam
   const isFirstNotificationLoad = useRef(true);
+  const isMounted = useRef(true);
 
-  // Solicitar localização
+  useEffect(() => {
+    const checkFirstTime = async () => {
+      try {
+        const hasSeen = await AsyncStorage.getItem('@reunionhub_has_seen_manual');
+        if (hasSeen !== 'true') {
+          setShowManualModal(true);
+        }
+      } catch (e) {
+        console.error('[Index] Erro ao ler flag do manual:', e);
+      }
+    };
+    checkFirstTime();
+  }, []);
+
+  const handleCloseManual = async () => {
+    try {
+      await AsyncStorage.setItem('@reunionhub_has_seen_manual', 'true');
+    } catch (e) {
+      console.error('[Index] Erro ao salvar flag do manual:', e);
+    }
+    setShowManualModal(false);
+  };
+
   useEffect(() => {
     (async () => {
       let { status } = await Location.requestForegroundPermissionsAsync();
       if (status === 'granted') {
-        let loc = await Location.getCurrentPositionAsync({});
-        setLocation(loc);
+        let lastLoc = await Location.getLastKnownPositionAsync();
+        if (lastLoc && isMounted.current) setLocation(lastLoc);
+        
+        let loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+        if (isMounted.current) setLocation(loc);
       }
     })();
   }, []);
 
-  // Calcular Eventos Próximos de forma independente dos destaques
   useEffect(() => {
     if (location && allUpcomingEvents.length > 0) {
       const withDistance = allUpcomingEvents
@@ -81,7 +111,8 @@ export default function HomeScreen() {
         .map(m => {
           const dist = getDistanceFromLatLonInKm(location.coords.latitude, location.coords.longitude, m.lat!, m.lng!);
           return { ...m, distance: dist };
-        });
+        })
+        .filter(m => m.distance <= 25);
       withDistance.sort((a, b) => a.distance - b.distance);
       setNearbyEvents(withDistance.slice(0, 5));
     }
@@ -97,7 +128,7 @@ export default function HomeScreen() {
         if (unsubNotifications) unsubNotifications();
         return;
       }
-      
+
       const currentUid = user.uid;
 
       getDoc(doc(db, 'users', currentUid)).then(snap => {
@@ -106,7 +137,6 @@ export default function HomeScreen() {
         }
       });
 
-      // Listen for Unread Messages & Notifications
       const qConversations = query(
         collection(db, 'conversations'),
         where('participants', 'array-contains', currentUid),
@@ -117,12 +147,12 @@ export default function HomeScreen() {
         collection(db, 'notifications'),
         where('userId', '==', currentUid),
         where('read', '==', false),
-        limit(50)
+        limit(20)
       );
 
       let msgCount = 0;
       let noteCount = 0;
-      const updateTotal = () => setUnreadCount(msgCount + noteCount);
+      const updateTotal = () => { if (isMounted.current) setUnreadCount(msgCount + noteCount) };
 
       unsubConversations = onSnapshot(qConversations, (snapshot) => {
         let count = 0;
@@ -135,14 +165,13 @@ export default function HomeScreen() {
         msgCount = count;
         updateTotal();
       }, (error) => {
-        console.warn('Error in conversations listener:', error);
+        console.warn('[Index] Erro no listener de conversas:', error);
       });
 
       unsubNotifications = onSnapshot(qNotifications, (snapshot) => {
         noteCount = snapshot.size;
         updateTotal();
 
-        // Handle local notifications for new items (skipping first load)
         if (isFirstNotificationLoad.current) {
           isFirstNotificationLoad.current = false;
           return;
@@ -157,63 +186,71 @@ export default function HomeScreen() {
           }
         });
       }, (error) => {
-        console.warn('Error in notifications listener:', error);
+        console.warn('[Index] Erro no listener de notificações:', error);
       });
 
-      // Fetch and Filter Meetings Scalably
-      const now = new Date();
-      const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+      const todayStr = getTodayStr();
 
-      // 1. Meus Eventos: Buscar de forma limitada onde sou participante
       const qMyEvents = query(
         collection(db, 'meetings'),
         where('attendees', 'array-contains', currentUid),
         limit(30)
       );
-      
-      getDocs(qMyEvents).then(snap => {
-         const myEventsData = snap.docs.map(d => ({ id: d.id, ...d.data() } as Meeting));
-         const futureMyEvents = myEventsData.filter((m) => {
-            if (!m.date) return false;
-            return m.date.replace(/\//g, '-') >= todayStr;
-         });
-         futureMyEvents.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
-         setMyEvents(futureMyEvents.slice(0, 5));
+
+      const p1 = getDocs(qMyEvents).then(snap => {
+        const myEventsData = snap.docs.map(d => ({ id: d.id, ...d.data() } as Meeting));
+        const futureMyEvents = myEventsData.filter((m) => {
+          const normalizedDate = normalizeDate(m.date);
+          if (!normalizedDate) return false;
+          return normalizedDate >= todayStr;
+        });
+        futureMyEvents.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+        if (isMounted.current) setMyEvents(futureMyEvents.slice(0, 5));
       });
 
-      // 2. Destaques: Buscar eventos futuros gerais (limite para não travar o banco)
       const qHighlights = query(
         collection(db, 'meetings'),
         where('date', '>=', todayStr),
-        limit(20) // Proteção anti-faturamento
+        limit(30)
       );
 
-      getDocs(qHighlights).then(snap => {
-         const highlightsData = snap.docs.map(d => ({ id: d.id, ...d.data() } as Meeting));
-         const userInterests = userProfile?.interests || [];
-         
-         const upcomingHighlights = highlightsData.filter((m) => {
-           const isOwn = m.createdBy === currentUid || (m.attendees && currentUid ? m.attendees.includes(currentUid) : false);
-           return !isOwn; // Não destaca meus próprios eventos
-         });
+      const p2 = getDocs(qHighlights).then(snap => {
+        const highlightsData = snap.docs.map(d => ({ id: d.id, ...d.data() } as Meeting));
+        const userInterests = userProfile?.interests || [];
 
-         // Guarda todos para calcular a distância depois
-         setAllUpcomingEvents(upcomingHighlights);
+        const upcomingHighlights = highlightsData.filter((m) => {
+          const normalizedDate = normalizeDate(m.date);
+          if (!normalizedDate) return false;
+          if (normalizedDate < todayStr) return false;
 
-         // Ordenar por relevância (match de interesses) para os destaques
-         const sortedHighlights = [...upcomingHighlights].sort((a, b) => {
-           const matchA = (a.interests || []).filter((i: string) => userInterests.includes(i)).length;
-           const matchB = (b.interests || []).filter((i: string) => userInterests.includes(i)).length;
-           if (matchA !== matchB) return matchB - matchA;
-           return (b.attendees?.length || 0) - (a.attendees?.length || 0);
-         });
+          const isOwn = m.createdBy === currentUid || (m.attendees && currentUid ? m.attendees.includes(currentUid) : false);
+          return !isOwn;
+        });
 
-         setHighlights(sortedHighlights.slice(0, 5));
+        if (isMounted.current) setAllUpcomingEvents(upcomingHighlights);
+
+        const sortedHighlights = [...upcomingHighlights].sort((a, b) => {
+          const matchA = (a.interests || []).filter((i: string) => userInterests.includes(i)).length;
+          const matchB = (b.interests || []).filter((i: string) => userInterests.includes(i)).length;
+          if (matchA !== matchB) return matchB - matchA;
+          return (b.attendees?.length || 0) - (a.attendees?.length || 0);
+        });
+
+        if (isMounted.current) setHighlights(sortedHighlights.slice(0, 5));
       });
 
+      Promise.all([p1, p2]).then(() => {
+        if (isMounted.current) setError(false);
+      }).catch(err => {
+        console.error(`${STRINGS.LOG_DB_READ} [Index] Error loading events:`, err.code, err.message);
+        if (isMounted.current) setError(true);
+      }).finally(() => {
+        if (isMounted.current) setLoading(false);
+      });
     });
 
     return () => {
+      isMounted.current = false;
       unsubscribeAuth();
       if (unsubConversations) unsubConversations();
       if (unsubNotifications) unsubNotifications();
@@ -232,13 +269,17 @@ export default function HomeScreen() {
   );
 
   return (
-    <ScrollView style={styles.container} showsVerticalScrollIndicator={false}>
-      {/* Header Otimizado */}
-      <View style={styles.headerWrapper}>
-
-        {/* Top Row: Logo e Ações */}
+    <>
+    <ScrollView style={styles.container} contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
+      <LinearGradient
+        colors={['#6366F1', '#8B5CF6']}
+        start={{ x: 0, y: 0 }}
+        end={{ x: 1, y: 1 }}
+        style={styles.headerWrapper}
+      >
+        <View style={styles.blobOne} />
+        <View style={styles.blobTwo} />
         <View style={styles.headerTop}>
-          {/* MOLDURA: Segura o espaço no layout */}
           <View style={styles.logoContainer}>
             <Image
               source={require('../../../assets/images/Whisk_Reunion_Hub_Logo.png')}
@@ -246,7 +287,6 @@ export default function HomeScreen() {
               resizeMode="cover"
             />
           </View>
-
           <View style={styles.headerActions}>
             <TouchableOpacity
               style={styles.iconBtn}
@@ -255,7 +295,7 @@ export default function HomeScreen() {
               <FontAwesome
                 name={unreadCount > 0 ? "bell" : "bell-o"}
                 size={22}
-                color={unreadCount > 0 ? "#ef4444" : "#6b7280"}
+                color={unreadCount > 0 ? "#ef4444" : "#fff"}
               />
               {unreadCount > 0 && (
                 <View style={styles.badge}>
@@ -263,7 +303,6 @@ export default function HomeScreen() {
                 </View>
               )}
             </TouchableOpacity>
-
             <TouchableOpacity style={styles.profileBtn} onPress={() => router.push('/profile')}>
               {auth.currentUser?.photoURL ? (
                 <Image source={{ uri: auth.currentUser.photoURL || '' }} style={styles.profileImg} />
@@ -274,115 +313,155 @@ export default function HomeScreen() {
           </View>
         </View>
 
-        {/* Bottom Row: Saudação */}
         <View style={styles.greetingContainer}>
           <Text style={styles.greetingText}>
             Olá, <Text style={styles.userName}>{auth.currentUser?.displayName?.split(' ')[0] || 'Visitante'}</Text>
           </Text>
           <Text style={styles.subGreeting}>O que vamos fazer hoje?</Text>
         </View>
-      </View>
+      </LinearGradient>
 
-      {/* Highlights Section */}
-      <View style={styles.section}>
-        <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>Destaques para você</Text>
+      {error ? (
+        <View style={{ marginTop: 40, marginBottom: 40 }}>
+          <ErrorState title="Sem conexão" message="Não foi possível buscar seus eventos recentes." />
         </View>
-
-        {userProfile?.interests && userProfile.interests.length > 0 ? (
-          <Text style={styles.interestTag}>Baseado em: {userProfile.interests.join(', ')}</Text>
-        ) : (
-          <TouchableOpacity style={styles.addInterestBtn} onPress={() => router.push('/profile')}>
-            <Text style={styles.addInterestText}>+ Adicionar Interesses</Text>
-          </TouchableOpacity>
-        )}
-
-        <FlatList
-          horizontal
-          data={highlights}
-          renderItem={renderEventCard}
-          keyExtractor={item => item.id}
-          showsHorizontalScrollIndicator={false}
-          contentContainerStyle={styles.horizontalList}
-        />
-      </View>
-
-      {/* My Meetings Section */}
-      <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Seus Próximos Eventos</Text>
-        {myEvents.length === 0 ? (
-          <Text style={styles.emptyText}>Você não tem eventos próximos.</Text>
-        ) : (
-          myEvents.map(event => {
-            const { day, month } = formatEventDate(event.date);
-            return (
-              <TouchableOpacity key={event.id} style={styles.listCard} onPress={() => router.push(`/event/${event.id}` as any)}>
-                <View style={styles.dateBox}>
-                  <Text style={styles.dateDay}>{day}</Text>
-                  <Text style={styles.dateMonth}>{month}</Text>
-                </View>
-                <View style={styles.listContent}>
-                  <Text style={styles.listTitle}>{event.title}</Text>
-                  <Text style={styles.listTime}>{event.time || 'Horário a definir'} • {event.locationName || 'Local a definir'}</Text>
-                </View>
-              </TouchableOpacity>
-            );
-          })
-        )}
-      </View>
-
-      {/* Nearby Events Section */}
-      <View style={styles.section}>
-        <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>Eventos Próximos a Você</Text>
-        </View>
-        {!location ? (
-          <Text style={styles.emptyText}>Permita o acesso à localização para ver eventos próximos.</Text>
-        ) : nearbyEvents.length === 0 ? (
-          <Text style={styles.emptyText}>Nenhum evento presencial próximo encontrado no momento.</Text>
-        ) : (
-          <FlatList
-            horizontal
-            data={nearbyEvents}
-            keyExtractor={item => item.id}
-            showsHorizontalScrollIndicator={false}
-            contentContainerStyle={styles.horizontalList}
-            renderItem={({ item }) => (
-              <TouchableOpacity style={styles.eventCard} onPress={() => router.push(`/event/${item.id}` as any)}>
-                <View style={styles.eventHeader}>
-                  <FontAwesome name="map-marker" size={14} color="#ec4899" />
-                  <Text style={[styles.eventDate, { color: '#ec4899' }]}>
-                    A {(item.distance ?? 0).toFixed(1)} km daqui
-                  </Text>
-                </View>
-                <Text style={styles.eventTitle} numberOfLines={1}>{item.title}</Text>
-                <Text style={styles.eventLoc} numberOfLines={1}>{item.locationName || 'Local a definir'}</Text>
+      ) : (
+        <>
+          <View style={styles.section}>
+            <View style={styles.sectionHeader}>
+              <Text style={styles.sectionTitle}>Destaques para você</Text>
+            </View>
+            {userProfile?.interests && userProfile.interests.length > 0 ? (
+              <Text style={styles.interestTag}>Baseado em: {userProfile.interests.join(', ')}</Text>
+            ) : (
+              <TouchableOpacity style={styles.addInterestBtn} onPress={() => router.push('/profile')}>
+                <Text style={styles.addInterestText}>+ Adicionar Interesses</Text>
               </TouchableOpacity>
             )}
-          />
-        )}
-      </View>
+            <FlatList
+              horizontal
+              data={highlights}
+              renderItem={renderEventCard}
+              keyExtractor={item => item.id}
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.horizontalList}
+            />
+          </View>
+
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>Seus Próximos Eventos</Text>
+            {myEvents.length === 0 ? (
+              <View style={styles.emptyStateContainer}>
+                <Text style={styles.emptyText}>Você ainda não confirmou presença em nenhum evento.</Text>
+                {highlights.length > 0 && (
+                  <View style={{ marginTop: 16 }}>
+                    <Text style={{ fontSize: 13, color: '#8B5CF6', fontWeight: 'bold', textTransform: 'uppercase', marginBottom: 12 }}>
+                      Sugestões para você começar:
+                    </Text>
+                    {highlights.slice(0, 2).map(event => {
+                      const { day, month } = formatEventDate(event.date);
+                      return (
+                        <TouchableOpacity key={`sug-${event.id}`} style={styles.listCard} onPress={() => router.push(`/event/${event.id}` as any)}>
+                          <View style={[styles.dateBox, { backgroundColor: '#F3F4F6' }]}>
+                            <Text style={[styles.dateDay, { color: '#6B7280' }]}>{day}</Text>
+                            <Text style={[styles.dateMonth, { color: '#9CA3AF' }]}>{month}</Text>
+                          </View>
+                          <View style={styles.listContent}>
+                            <Text style={styles.listTitle}>{event.title}</Text>
+                            <Text style={styles.listTime}>{event.time || 'Horário a definir'} • {event.locationName || 'Local a definir'}</Text>
+                          </View>
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </View>
+                )}
+              </View>
+            ) : (
+              myEvents.map(event => {
+                const { day, month } = formatEventDate(event.date);
+                return (
+                  <TouchableOpacity key={event.id} style={styles.listCard} onPress={() => router.push(`/event/${event.id}` as any)}>
+                    <View style={styles.dateBox}>
+                      <Text style={styles.dateDay}>{day}</Text>
+                      <Text style={styles.dateMonth}>{month}</Text>
+                    </View>
+                    <View style={styles.listContent}>
+                      <Text style={styles.listTitle}>{event.title}</Text>
+                      <Text style={styles.listTime}>{event.time || 'Horário a definir'} • {event.locationName || 'Local a definir'}</Text>
+                    </View>
+                  </TouchableOpacity>
+                );
+              })
+            )}
+          </View>
+
+          <View style={styles.section}>
+            <View style={styles.sectionHeader}>
+              <Text style={styles.sectionTitle}>Eventos Próximos a Você</Text>
+            </View>
+            {!location ? (
+              <Text style={styles.emptyText}>Permita o acesso à localização para ver eventos próximos.</Text>
+            ) : nearbyEvents.length === 0 ? (
+              <Text style={styles.emptyText}>Nenhum evento presencial próximo encontrado no momento.</Text>
+            ) : (
+              <FlatList
+                horizontal
+                data={nearbyEvents}
+                keyExtractor={item => item.id}
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.horizontalList}
+                renderItem={({ item }) => (
+                  <TouchableOpacity style={styles.eventCard} onPress={() => router.push(`/event/${item.id}` as any)}>
+                    <View style={styles.eventHeader}>
+                      <FontAwesome name="map-marker" size={14} color="#ec4899" />
+                      <Text style={[styles.eventDate, { color: '#ec4899' }]}>
+                        A {(item.distance ?? 0).toFixed(1)} km daqui
+                      </Text>
+                    </View>
+                    <Text style={styles.eventTitle} numberOfLines={1}>{item.title}</Text>
+                    <Text style={styles.eventLoc} numberOfLines={1}>{item.locationName || 'Local a definir'}</Text>
+                  </TouchableOpacity>
+                )}
+              />
+            )}
+          </View>
+        </>
+      )}
     </ScrollView>
+    <ManualModal
+        visible={showManualModal}
+        onClose={handleCloseManual}
+        isFirstTime={true}
+    />
+    </>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#f9fafb' },
-
+  scrollContent: { paddingBottom: 40 },
   // Header Styles
   headerWrapper: {
-    backgroundColor: '#fff',
     paddingTop: 50, // SafeArea padding
-    paddingBottom: 20,
+    paddingBottom: 30,
     paddingHorizontal: 24,
-    borderBottomWidth: 1,
-    borderBottomColor: '#f3f4f6',
+    borderBottomLeftRadius: 32,
+    borderBottomRightRadius: 32,
+    overflow: 'hidden',
+    position: 'relative',
+    shadowColor: '#4f46e5',
+    shadowOpacity: 0.3,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 8,
   },
+  blobOne: { position: 'absolute', top: -60, right: -40, width: 180, height: 180, borderRadius: 90, backgroundColor: 'rgba(255,255,255,0.08)' },
+  blobTwo: { position: 'absolute', bottom: -70, left: -50, width: 160, height: 160, borderRadius: 80, backgroundColor: 'rgba(255,255,255,0.06)' },
   headerTop: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 16,
+    marginBottom: -5,
   },
   // A imagem em si. Pode ser gigante agora.
   headerLogo: {
@@ -394,11 +473,12 @@ const styles = StyleSheet.create({
   },
   // Define o espaço "seguro" no header. Nada invade esse espaço.
   logoContainer: {
-    width: 140,
-    height: 70, // Aumentei um pouco a altura da área
+    width: 115,
+    height: 70,
+    borderRadius: 16,
     overflow: 'hidden', // O SEGREDO: Corta tudo que passar desse tamanho
     justifyContent: 'center', // Centraliza a imagem no corte
-    // backgroundColor: 'red', // Descomente essa linha para ver a área de corte se precisar debugar
+    alignItems: 'center',
   },
   headerActions: {
     flexDirection: 'row',
@@ -442,20 +522,22 @@ const styles = StyleSheet.create({
     fontSize: 18
   },
   greetingContainer: {
-    marginTop: 4,
+    marginTop: 10,
+    marginBottom: -10,
   },
   greetingText: {
-    fontSize: 22,
-    color: '#1f2937',
-    fontWeight: '400',
+    fontSize: 28,
+    fontWeight: '300',
+    color: '#ffffff',
+    marginBottom: 4,
   },
   userName: {
-    fontWeight: 'bold',
+    fontWeight: '800',
+    color: '#ffffff',
   },
   subGreeting: {
-    fontSize: 14,
-    color: '#6b7280',
-    marginTop: 4,
+    fontSize: 15,
+    color: 'rgba(255,255,255,0.85)',
   },
 
   // Body Styles (Destaques e Lista)
@@ -478,7 +560,19 @@ const styles = StyleSheet.create({
   eventTitle: { fontSize: 16, fontWeight: 'bold', color: '#1f2937', marginBottom: 4 },
   eventLoc: { fontSize: 12, color: '#6b7280' },
 
-  emptyText: { color: '#9ca3af', fontStyle: 'italic', marginTop: 8 },
+  emptyText: { color: '#6b7280', fontSize: 14, fontStyle: 'italic', textAlign: 'center', marginTop: 10 },
+  emptyStateContainer: {
+    backgroundColor: '#fff',
+    borderRadius: 18,
+    padding: 20,
+    borderWidth: 1,
+    borderColor: '#F1F5F9',
+    shadowColor: '#4b4b76',
+    shadowOpacity: 0.05,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 2,
+  },
 
   listCard: {
     flexDirection: 'row', backgroundColor: '#fff', borderRadius: 12, padding: 16, marginBottom: 12,

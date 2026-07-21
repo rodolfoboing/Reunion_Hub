@@ -7,9 +7,10 @@ import React, { useEffect, useState } from 'react';
 import { View, Text } from 'react-native';
 import 'react-native-reanimated';
 import { auth, db } from '../src/services/firebaseConfig'; // Import auth
-import { doc, getDoc } from 'firebase/firestore';
+import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { useColorScheme } from '@/src/components/useColorScheme';
 import { setupNotifications } from '../src/utils/Notifications';
+import { ErrorBoundary as CustomErrorBoundary } from '../src/components/ErrorBoundary';
 
 export {
   // Catch any errors thrown by the Layout component.
@@ -94,12 +95,20 @@ export default function RootLayout() {
     return () => clearTimeout(timer);
   }, []);
 
-  // Inicializa notificações
+  // Inicializa notificações e salva o push token
   useEffect(() => {
-    setupNotifications().then(granted => {
-      console.log('[ReunionHub Debug] Permissões de notificação:', granted ? 'Concedidas' : 'Negadas');
+    setupNotifications().then(async (result) => {
+      console.log('[ReunionHub Debug] Permissões de notificação:', result.granted ? 'Concedidas' : 'Negadas');
+      if (result.granted && result.token && user) {
+        try {
+          await setDoc(doc(db, 'users', user.uid), { expoPushToken: result.token }, { merge: true });
+          console.log('[ReunionHub Debug] Push Token salvo no Firestore para o usuário:', user.uid);
+        } catch (e) {
+          console.error('[ReunionHub Debug] Erro ao salvar push token', e);
+        }
+      }
     });
-  }, []);
+  }, [user]);
 
   if (!loaded || !authInitialized) {
     // Retornamos uma View temporária para garantir que o React renderize algo
@@ -120,13 +129,15 @@ function RootLayoutNav() {
   const colorScheme = useColorScheme();
 
   return (
-    <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
-      <Stack>
-        {/* Alteração 2: Stack com grupos (main) e (auth) */}
-        <Stack.Screen name="(drawer)" options={{ headerShown: false }} />
-        <Stack.Screen name="(auth)" options={{ headerShown: false }} />
-        <Stack.Screen name="info-modal" options={{ presentation: 'modal' }} />
-      </Stack>
-    </ThemeProvider>
+    <CustomErrorBoundary>
+      <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
+        <Stack>
+          {/* Alteração 2: Stack com grupos (main) e (auth) */}
+          <Stack.Screen name="(drawer)" options={{ headerShown: false }} />
+          <Stack.Screen name="(auth)" options={{ headerShown: false }} />
+          <Stack.Screen name="info-modal" options={{ presentation: 'modal' }} />
+        </Stack>
+      </ThemeProvider>
+    </CustomErrorBoundary>
   );
 }

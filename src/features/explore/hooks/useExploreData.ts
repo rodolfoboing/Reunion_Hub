@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import * as Location from 'expo-location';
-import { collection, onSnapshot, query, where, limit, getDocs } from 'firebase/firestore';
+import { collection, onSnapshot, query, where, limit, getDocs, orderBy } from 'firebase/firestore';
 import { db } from '@/src/services/firebaseConfig';
 import { fetchNearbyPlaces, mapOsmToPlace } from '@/src/services/osmService';
 import { Meeting, Place } from '@/src/types';
@@ -40,6 +40,7 @@ export function useExploreData() {
         const q = query(
             collection(db, 'meetings'),
             where('date', '>=', todayStr),
+            orderBy('date'),
             limit(30)
         );
         const unsubscribe = onSnapshot(
@@ -57,6 +58,7 @@ export function useExploreData() {
                     };
                 }).filter(m => {
                     if (!m.date) return false;
+                    if (m.status === 'cancelled' || m.status === 'completed') return false;
                     return m.date >= todayStr;
                 }) as Meeting[];
                 setMeetings(data);

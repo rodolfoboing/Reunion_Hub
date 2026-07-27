@@ -73,9 +73,17 @@ export default function RootLayout() {
           try {
             const docRef = doc(db, 'users', user.uid);
             const docSnap = await getDoc(docRef);
-            if (docSnap.exists() && docSnap.data().isProfileComplete === false) {
-              console.log("[ReunionHub Debug] Perfil incompleto, redirecionando para onboarding.");
-              router.replace('/onboarding' as any);
+            if (docSnap.exists()) {
+              const data = docSnap.data();
+              // Sync email verification status if it changed
+              if (user.emailVerified && !data.emailVerified) {
+                await setDoc(docRef, { emailVerified: true }, { merge: true });
+              }
+              
+              if (data.isProfileComplete === false) {
+                console.log("[ReunionHub Debug] Perfil incompleto, redirecionando para onboarding.");
+                router.replace('/onboarding' as any);
+              }
             }
           } catch (error) {
             console.error("Erro ao checar perfil completo", error);

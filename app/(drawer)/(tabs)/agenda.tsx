@@ -3,13 +3,14 @@ import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as Location from 'expo-location';
 import { router, useFocusEffect } from 'expo-router';
-import { arrayRemove, arrayUnion, collection, deleteDoc, doc, getDocs, onSnapshot, query, updateDoc, where, limit } from 'firebase/firestore';
+import { arrayRemove, arrayUnion, collection, deleteDoc, doc, getDocs, onSnapshot, query, updateDoc, where, limit, orderBy } from 'firebase/firestore';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Alert, Animated, FlatList, LayoutAnimation, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, TouchableOpacity, UIManager, View } from 'react-native';
 import { Calendar, LocaleConfig } from 'react-native-calendars';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Meeting } from '../../../src/types';
 import { STRINGS } from '../../../src/constants/strings';
+import { CONFIG } from '../../../src/constants/Config';
 import { normalizeDate, getTodayStr } from '../../../src/utils/dateUtils';
 import { auth, db } from '../../../src/services/firebaseConfig';
 
@@ -17,17 +18,7 @@ if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental
     UIManager.setLayoutAnimationEnabledExperimental(true);
 }
 
-const getDistanceFromLatLonInKm = (lat1: number, lon1: number, lat2: number, lon2: number) => {
-    const R = 6371; // Radius of the earth in km
-    const dLat = (lat2 - lat1) * (Math.PI / 180);
-    const dLon = (lon2 - lon1) * (Math.PI / 180);
-    const a =
-        Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-        Math.cos(lat1 * (Math.PI / 180)) * Math.cos(lat2 * (Math.PI / 180)) *
-        Math.sin(dLon / 2) * Math.sin(dLon / 2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return R * c; // Distance in km
-};
+import { getDistanceFromLatLonInKm } from '../../../src/utils/distance';
 
 // Configure Locale for Calendar
 LocaleConfig.locales['pt-br'] = {
@@ -181,35 +172,45 @@ export default function AgendaScreen() {
         if (allRecs.length === 0) return;
 
         const todayStr = getTodayStr();
-        const currentMonth = todayStr.substring(0, 7); // e.g. "2026-07"
+        const nextMonthDate = new Date();
+        nextMonthDate.setDate(nextMonthDate.getDate() + 30);
+        const year = nextMonthDate.getFullYear();
+        const month = String(nextMonthDate.getMonth() + 1).padStart(2, '0');
+        const day = String(nextMonthDate.getDate()).padStart(2, '0');
+        const maxDateStr = `${year}-${month}-${day}`;
         
         let finalRecs = allRecs.filter((e: any) => {
             if (!e.date) return false;
-            // Futuros e até o mês vigente somente
-            if (e.date < todayStr || !e.date.startsWith(currentMonth)) return false;
+            // Futuros em até 30 dias
+            if (e.date < todayStr || e.date > maxDateStr) return false;
             return true;
         });
 
-        // Mesma categoria de interesse
-        if (userInterests.length > 0) {
-            finalRecs = finalRecs.filter((e: any) => e.interests?.some((i: string) => userInterests.includes(i)));
+        // Baseado em histórico ou categoria de interesse
+        if (userInterests.length > 0 || historyTitles.length > 0) {
+            finalRecs = finalRecs.filter((e: any) => {
+                const matchesInterest = e.interests?.some((i: string) => userInterests.includes(i));
+                const matchesHistory = historyTitles.includes(e.title);
+                return matchesInterest || matchesHistory;
+            });
         }
 
-        // Próximos (<= 25km)
+        // Próximos (<= CONFIG.NEARBY_RADIUS_KM) ou Online
         if (userLocation && finalRecs.length > 0) {
             const withDistance = finalRecs
-                .filter((m: any) => m.lat && m.lng && m.type !== 'online')
                 .map((m: any) => {
+                    if (m.type === 'online') return { ...m, distance: 0 };
+                    if (!m.lat || !m.lng) return { ...m, distance: 9999 };
                     const dist = getDistanceFromLatLonInKm(userLocation.coords.latitude, userLocation.coords.longitude, m.lat, m.lng);
                     return { ...m, distance: dist };
                 })
-                .filter((m: any) => m.distance <= 25);
+                .filter((m: any) => m.type === 'online' || m.distance <= CONFIG.NEARBY_RADIUS_KM);
             withDistance.sort((a: any, b: any) => a.distance - b.distance);
             finalRecs = withDistance;
         }
 
         setRecommendations(finalRecs.slice(0, 10));
-    }, [allRecs, userInterests, userLocation]);
+    }, [allRecs, userInterests, historyTitles, userLocation]);
 
     const fetchEvents = async () => {
         const currentUid = auth.currentUser?.uid;
@@ -218,8 +219,7 @@ export default function AgendaScreen() {
         setLoading(true);
         setError(false);
         try {
-            const now = new Date();
-            const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+            const todayStr = getTodayStr();
 
             if (activeTab === 'favorites') {
                 if (favorites.length === 0) {
@@ -246,7 +246,7 @@ export default function AgendaScreen() {
                         id: d.id,
                         ...d.data(),
                         date: normalizeDate(d.data().date)
-                    }));
+                    })).filter((e: any) => e.status !== 'cancelled' && e.status !== 'completed');
                     events = [...events, ...mapped];
                 });
 
@@ -275,7 +275,7 @@ export default function AgendaScreen() {
                     ...data,
                     date: normalizeDate(data.date)
                 };
-            }).filter(e => e.date !== null);
+            }).filter((e: any) => e.date !== null && e.status !== 'cancelled' && e.status !== 'completed');
 
             // Local filter for Upcoming vs History
             let results: any[] = [];
@@ -293,7 +293,7 @@ export default function AgendaScreen() {
                 events.forEach((ev: any) => {
                     if (!ev.date) return;
                     const isMine = ev.createdBy === currentUid;
-                    const isPopular = ev.attendees && ev.attendees.length >= 3;
+                    const isPopular = ev.attendees && ev.attendees.length >= CONFIG.POPULAR_ATTENDEES_COUNT;
                     const isPast = ev.date.localeCompare(todayStr) < 0;
 
                     if (!marks[ev.date]) {
@@ -315,15 +315,20 @@ export default function AgendaScreen() {
                 const qRec = query(
                     collection(db, 'meetings'),
                     where('date', '>=', todayStr),
+                    orderBy('date'),
                     limit(30)
                 );
                 const snapRec = await getDocs(qRec);
                 let fetchedRecs = snapRec.docs
-                    .map(d => ({ id: d.id, ...d.data() }))
+                    .map(d => ({ 
+                        id: d.id, 
+                        ...d.data(),
+                        date: normalizeDate(d.data().date) || d.data().date
+                    }))
                     .filter((e: any) => {
-                        const normalizedDate = normalizeDate(e.date);
-                        if (!normalizedDate) return false;
-                        if (normalizedDate < todayStr) return false;
+                        if (!e.date) return false;
+                        if (e.status === 'cancelled' || e.status === 'completed') return false;
+                        if (e.date < todayStr) return false;
                         if (e.attendees?.includes(currentUid)) return false;
                         return true;
                     });
@@ -420,7 +425,7 @@ export default function AgendaScreen() {
         const tomorrowStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 
         const isVerySoon = item.date === todayStr || item.date === tomorrowStr;
-        const isPopular = item.attendees && item.attendees.length >= 3; // +3 pessoas = Popular
+        const isPopular = item.attendees && item.attendees.length >= CONFIG.POPULAR_ATTENDEES_COUNT; // +3 pessoas = Popular
 
         useEffect(() => {
             if (isVerySoon) {
@@ -711,7 +716,11 @@ export default function AgendaScreen() {
                                         </View>
                                         <Text style={styles.recMainTitle}>Recomendado para você</Text>
                                     </View>
-                                    <Text style={styles.recSubtitle}>Baseado no seu histórico, interesses ou localização</Text>
+                                    <Text style={styles.recSubtitle}>
+                                        {historyTitles.length > 0 
+                                            ? 'Baseado no seu histórico, interesses ou localização' 
+                                            : 'Baseado nos seus interesses e localização'}
+                                    </Text>
                                     <FlatList
                                         horizontal
                                         showsHorizontalScrollIndicator={false}

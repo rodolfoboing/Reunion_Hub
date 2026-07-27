@@ -23,6 +23,7 @@ interface UserProfile {
     bio?: string;
     interests?: string[];
     eventTypes?: string[];
+    emailVerified?: boolean;
     reputation?: number;
     eventsAttended?: number;
     foundedPlacesCount?: number;
@@ -184,9 +185,19 @@ export default function UserProfileScreen() {
                 </View>
 
                 {/* Nome e Nick */}
-                <Text style={styles.displayName}>{profile.displayName}</Text>
+                <View style={{flexDirection: 'row', alignItems: 'center', justifyContent: 'center'}}>
+                    <Text style={styles.displayName}>{profile.displayName}</Text>
+                    {profile.emailVerified && (
+                        <FontAwesome name="check-circle" size={18} color="#10B981" style={{marginLeft: 8}} />
+                    )}
+                </View>
                 {profile.nick && (
                     <Text style={styles.nick}>@{profile.nick}</Text>
+                )}
+                {profile.createdAt && (
+                    <Text style={{color: '#E0E7FF', fontSize: 12, marginTop: 4}}>
+                        No app desde {new Date(profile.createdAt).getFullYear()}
+                    </Text>
                 )}
             </LinearGradient>
 

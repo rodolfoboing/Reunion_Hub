@@ -2,9 +2,10 @@ import React, { useState } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, Modal, TextInput, ScrollView, KeyboardAvoidingView, Platform, ActivityIndicator, Alert } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import DateTimePicker from '@react-native-community/datetimepicker';
-import { collection, addDoc, doc, setDoc, updateDoc, arrayUnion } from 'firebase/firestore';
+import { collection, addDoc, doc, setDoc, updateDoc, arrayUnion, writeBatch } from 'firebase/firestore';
 import { db, auth } from '@/src/services/firebaseConfig';
 import { INTERESTS_OPTIONS } from '@/src/constants/Interests';
+import { CONFIG } from '@/src/constants/Config';
 
 interface CreateEventModalProps {
     visible: boolean;
@@ -12,8 +13,6 @@ interface CreateEventModalProps {
     eventType: 'in-person' | 'online';
     newMeeting: any;
     setNewMeeting: (meeting: any) => void;
-    habitDays: string[];
-    toggleHabitDay: (day: string) => void;
     onOpenLocationPicker: () => void;
     repeatCount: number;
     setRepeatCount: (count: number) => void;
@@ -27,8 +26,6 @@ export function CreateEventModal({
     eventType,
     newMeeting,
     setNewMeeting,
-    habitDays,
-    toggleHabitDay,
     onOpenLocationPicker,
     repeatCount,
     setRepeatCount,
@@ -48,24 +45,14 @@ export function CreateEventModal({
         });
     };
 
-    const handleSaveHabits = async (placeId: string, days: string[], pName: string, pLat: number, pLng: number, pVocations: string[]) => {
-        if (!placeId || days.length === 0) return;
-        try {
-            const placeRef = doc(db, 'places', placeId);
-            await setDoc(placeRef, { id: placeId, name: pName, latitude: pLat, longitude: pLng, vocations: pVocations || [] }, { merge: true });
-            const uid = auth.currentUser?.uid;
-            if (uid) {
-                await updateDoc(placeRef, {
-                    frequenters: arrayUnion(uid),
-                    [`habits.${uid}`]: days
-                });
-            }
-        } catch (error) {
-            console.error("Erro ao salvar hábito", error);
-        }
-    };
+
 
     const handleCreateEvent = async () => {
+        if (!auth.currentUser) {
+            Alert.alert('Sessão Expirada', 'Por favor, faça login novamente para criar um evento.');
+            return;
+        }
+
         const isFieldsMissing = !newMeeting.title.trim() || newMeeting.interests.length === 0 || !newMeeting.locationName.trim() || !newMeeting.description.trim() || !newMeeting.date || !newMeeting.time;
         if (isFieldsMissing) {
             Alert.alert('Atenção', 'Por favor, preencha todos os campos obrigatórios.');
@@ -73,6 +60,10 @@ export function CreateEventModal({
         }
         if (eventType === 'online' && !newMeeting.meetingLink.trim()) {
             Alert.alert('Atenção', 'Para eventos online, o Link da Reunião é obrigatório.');
+            return;
+        }
+        if (eventType === 'in-person' && (newMeeting.lat === 0 || newMeeting.lat == null)) {
+            Alert.alert('Atenção', 'Para eventos presenciais, é obrigatório selecionar uma localização no mapa.');
             return;
         }
 
@@ -87,8 +78,9 @@ export function CreateEventModal({
                         setSubmitting(true);
                         try {
                             const baseDate = new Date(`${newMeeting.date}T${newMeeting.time}:00`);
-                            const promises = [];
-
+                            const batch = writeBatch(db);
+                            const seriesId = doc(collection(db, 'meetings')).id; // Gerar um ID de série
+                            
                             for (let i = 0; i <= repeatCount; i++) {
                                 const currentEventDate = new Date(baseDate);
                                 currentEventDate.setDate(baseDate.getDate() + (i * 7));
@@ -97,31 +89,29 @@ export function CreateEventModal({
                                 const month = String(currentEventDate.getMonth() + 1).padStart(2, '0');
                                 const day = String(currentEventDate.getDate()).padStart(2, '0');
                                 const dateStr = `${year}-${month}-${day}`;
-
-                                promises.push(addDoc(collection(db, 'meetings'), {
+                                
+                                const newDocRef = doc(collection(db, 'meetings'));
+                                batch.set(newDocRef, {
                                     ...newMeeting,
                                     date: dateStr,
                                     theme: newMeeting.interests[0],
                                     type: eventType,
                                     meetingLink: eventType === 'online' ? newMeeting.meetingLink : '',
-                                    lat: eventType === 'in-person' ? newMeeting.lat : 0,
-                                    lng: eventType === 'in-person' ? newMeeting.lng : 0,
+                                    lat: eventType === 'in-person' ? newMeeting.lat : null,
+                                    lng: eventType === 'in-person' ? newMeeting.lng : null,
                                     placeId: eventType === 'in-person' ? newMeeting.placeId : '',
                                     createdBy: auth.currentUser?.uid || 'anonymous',
+                                    creatorName: auth.currentUser?.displayName || 'Usuário',
                                     createdAt: new Date().toISOString(),
-                                    isRepeated: i > 0,
+                                    isRepeated: repeatCount > 0,
+                                    seriesId: repeatCount > 0 ? seriesId : null,
                                     attendees: [auth.currentUser?.uid],
-                                }));
+                                });
                             }
 
-                            await Promise.all(promises);
+                            await batch.commit();
 
-                            if (eventType === 'in-person' && newMeeting.placeId && habitDays.length > 0) {
-                                const placeForHabit = selectedPlace || (places && places.find(p => p.id === newMeeting.placeId));
-                                if (placeForHabit) {
-                                    await handleSaveHabits(placeForHabit.id, habitDays, placeForHabit.name, placeForHabit.latitude, placeForHabit.longitude, placeForHabit.vocations);
-                                }
-                            }
+
 
                             Alert.alert('Sucesso', repeatCount > 0 ? `Evento criado com ${repeatCount} repetições semanais!` : 'Seu evento foi criado e já está disponível para a comunidade!');
                             
@@ -218,21 +208,7 @@ export function CreateEventModal({
                                 </TouchableOpacity>
                             </View>
                         )}
-                        {eventType === 'in-person' && newMeeting.placeId !== '' && (
-                            <View style={styles.inputGroup}>
-                                <View style={{ backgroundColor: '#F0FDF4', padding: 16, borderRadius: 12, borderWidth: 1, borderColor: '#BBF7D0' }}>
-                                    <Text style={{ fontSize: 16, fontWeight: 'bold', color: '#166534', marginBottom: 8 }}>Você costuma frequentar este local?</Text>
-                                    <Text style={{ color: '#15803D', fontSize: 14, marginBottom: 12 }}>Quais dias você costuma vir aqui? (Deixe em branco se for só desta vez)</Text>
-                                    <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
-                                        {['Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sab', 'Dom'].map(day => (
-                                            <TouchableOpacity key={day} onPress={() => toggleHabitDay(day)} style={{ paddingVertical: 6, paddingHorizontal: 12, borderRadius: 20, backgroundColor: habitDays.includes(day) ? '#16A34A' : '#DCFCE7', borderWidth: 1, borderColor: habitDays.includes(day) ? '#16A34A' : '#86EFAC' }}>
-                                                <Text style={{ color: habitDays.includes(day) ? '#fff' : '#166534', fontWeight: 'bold', fontSize: 12 }}>{day}</Text>
-                                            </TouchableOpacity>
-                                        ))}
-                                    </View>
-                                </View>
-                            </View>
-                        )}
+
                         <View style={styles.inputGroup}>
                             <Text style={styles.inputLabel}>Descrição Detalhada</Text>
                             <TextInput style={[styles.input, styles.textArea]} placeholder="Conte mais sobre o que vai acontecer no evento..." multiline numberOfLines={4} textAlignVertical="top" value={newMeeting.description} onChangeText={(text) => setNewMeeting({ ...newMeeting, description: text })} />
@@ -244,10 +220,10 @@ export function CreateEventModal({
                                 <View style={styles.repeatControls}>
                                     <TouchableOpacity onPress={() => setRepeatCount(Math.max(0, repeatCount - 1))} style={styles.repeatBtn}><Ionicons name="remove" size={20} color="#4F46E5" /></TouchableOpacity>
                                     <Text style={styles.repeatCount}>{repeatCount}</Text>
-                                    <TouchableOpacity onPress={() => setRepeatCount(Math.min(6, repeatCount + 1))} style={styles.repeatBtn}><Ionicons name="add" size={20} color="#4F46E5" /></TouchableOpacity>
+                                    <TouchableOpacity onPress={() => setRepeatCount(Math.min(CONFIG.MAX_REPEAT_WEEKS, repeatCount + 1))} style={styles.repeatBtn}><Ionicons name="add" size={20} color="#4F46E5" /></TouchableOpacity>
                                 </View>
                             </View>
-                            <Text style={styles.helperText}>Máximo de 6 repetições para garantir que o evento esteja ativo.</Text>
+                            <Text style={styles.helperText}>Máximo de {CONFIG.MAX_REPEAT_WEEKS} repetições (aprox. 30 dias) para garantir que o evento não fique obsoleto.</Text>
                         </View>
                         <View style={styles.modalFooter}>
                             <TouchableOpacity style={[styles.submitButton, submitting && styles.submitButtonDisabled]} onPress={handleCreateEvent} disabled={submitting}>

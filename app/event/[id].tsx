@@ -202,8 +202,8 @@ export default function MeetingDetailsScreen() {
                             const attendees = meeting.attendees || [];
                             const checkedIn = meeting.checkedIn || [];
                             
-                            // Encontrar Faltosos (No-Show)
-                            const noShows = attendees.filter((uid: string) => !checkedIn.includes(uid));
+                            // Encontrar Faltosos (No-Show) excluindo o organizador
+                            const noShows = attendees.filter((uid: string) => !checkedIn.includes(uid) && uid !== meeting.createdBy);
                             
                             // Punir Faltosos (-20 rep) em Batch
                             if (noShows.length > 0) {
@@ -279,15 +279,18 @@ export default function MeetingDetailsScreen() {
                             const userRef = doc(db, 'users', currentUid!);
                             batch.update(userRef, { reputation: increment(-15) });
                             
-                            // Adicionar aviso de notificação (simulado no banco)
+                            // Adicionar aviso de notificação para cada participante usando a coleção central
                             meeting.attendees?.forEach((attendeeUid: string) => {
-                                const notifRef = doc(collection(db, 'users', attendeeUid, 'notifications'));
-                                batch.set(notifRef, {
-                                    title: 'Evento Cancelado',
-                                    body: `O evento "${meeting.title}" foi cancelado pelo organizador.`,
-                                    createdAt: serverTimestamp(),
-                                    read: false
-                                });
+                                if (attendeeUid !== currentUid) {
+                                    const notifRef = doc(collection(db, 'notifications'));
+                                    batch.set(notifRef, {
+                                        userId: attendeeUid,
+                                        title: 'Evento Cancelado',
+                                        body: `O evento "${meeting.title}" foi cancelado pelo organizador.`,
+                                        createdAt: serverTimestamp(),
+                                        read: false
+                                    });
+                                }
                             });
 
                             await batch.commit();
@@ -443,8 +446,8 @@ export default function MeetingDetailsScreen() {
                     </View>
                 ) : (
                     <>
-                        {/* Botão de RSVP / Presença */}
-                        {!isAttending ? (
+                        {/* Botão de RSVP / Presença (escondido para o criador) */}
+                        {!isAttending && !isCreator ? (
                             <StyledButton
                                 title="Confirmar Presença"
                                 onPress={handleRSVP}

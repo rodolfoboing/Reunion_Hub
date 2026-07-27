@@ -2,7 +2,7 @@ import { View, Text, StyleSheet, ScrollView, Alert, TouchableOpacity, Image, Tex
 import { useState, useEffect } from 'react';
 import { auth, db } from '../../src/services/firebaseConfig';
 import { doc, getDoc, setDoc, collection, query, where, getDocs, deleteDoc } from 'firebase/firestore';
-import { updateProfile, deleteUser } from 'firebase/auth';
+import { updateProfile, deleteUser, sendEmailVerification } from 'firebase/auth';
 import { storage } from '../../src/services/firebaseConfig';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import * as ImagePicker from 'expo-image-picker';
@@ -182,6 +182,18 @@ export default function ProfileScreen() {
         }
     };
 
+    const handleVerifyEmail = async () => {
+        try {
+            if (auth.currentUser) {
+                await sendEmailVerification(auth.currentUser);
+                Alert.alert('Sucesso', 'E-mail de verificação enviado! Verifique sua caixa de entrada.');
+            }
+        } catch (error) {
+            console.error(error);
+            Alert.alert('Erro', 'Não foi possível enviar o e-mail. Aguarde um momento e tente novamente.');
+        }
+    };
+
     const handleLogout = async () => {
         try {
             await auth.signOut();
@@ -250,7 +262,19 @@ export default function ProfileScreen() {
                     )}
                 </View>
                 <Text style={styles.name}>{auth.currentUser.displayName}</Text>
-                <Text style={styles.email}>{auth.currentUser.email}</Text>
+                {auth.currentUser.emailVerified ? (
+                    <View style={{flexDirection: 'row', alignItems: 'center', marginTop: 4}}>
+                        <FontAwesome name="check-circle" size={14} color="#10B981" />
+                        <Text style={[styles.email, {marginLeft: 4, marginTop: 0}]}>{auth.currentUser.email}</Text>
+                    </View>
+                ) : (
+                    <View style={{flexDirection: 'row', alignItems: 'center', marginTop: 4}}>
+                        <Text style={[styles.email, {marginTop: 0}]}>{auth.currentUser.email}</Text>
+                        <TouchableOpacity onPress={handleVerifyEmail} style={{marginLeft: 8, backgroundColor: '#FEF2F2', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 12}}>
+                            <Text style={{fontSize: 10, color: '#EF4444', fontWeight: 'bold'}}>Verificar E-mail</Text>
+                        </TouchableOpacity>
+                    </View>
+                )}
 
                 {!isEditing && (
                     <TouchableOpacity onPress={startEditing} style={styles.editBtn}>

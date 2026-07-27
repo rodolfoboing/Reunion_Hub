@@ -2,7 +2,7 @@ import React from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, Modal, ActivityIndicator, Image } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import { Place, User } from '@/src/types';
+import { Place, User, Meeting } from '@/src/types';
 
 interface PlaceModalProps {
     visible: boolean;
@@ -11,6 +11,7 @@ interface PlaceModalProps {
     loadingProfiles: boolean;
     frequentersProfiles: User[];
     placeEvents?: Meeting[];
+    onSaveHabit?: (periods: string[]) => void;
     onCreateEventPress: () => void;
 }
 
@@ -21,8 +22,18 @@ export function PlaceModal({
     loadingProfiles,
     frequentersProfiles,
     placeEvents = [],
+    onSaveHabit,
     onCreateEventPress
 }: PlaceModalProps) {
+    const [isPickingHabit, setIsPickingHabit] = React.useState(false);
+    const [selectedPeriods, setSelectedPeriods] = React.useState<string[]>([]);
+    
+    // Reset state when modal opens/closes
+    React.useEffect(() => {
+        setIsPickingHabit(false);
+        setSelectedPeriods([]);
+    }, [visible, place]);
+
     if (!place) return null;
 
     return (
@@ -84,8 +95,55 @@ export function PlaceModal({
                         <View style={{ backgroundColor: '#F3F4F6', padding: 16, borderRadius: 12, marginBottom: 20, alignItems: 'center' }}>
                             <Ionicons name="planet" size={32} color="#9CA3AF" style={{ marginBottom: 8 }} />
                             <Text style={{ color: '#4B5563', textAlign: 'center', fontSize: 15 }}>
-                                Este lugar ainda não tem frequentadores regulares. Quer ser o primeiro?
+                                Este lugar ainda não tem frequentadores regulares.
                             </Text>
+                        </View>
+                    )}
+
+                    {/* Habit Picker Inline */}
+                    {!isPickingHabit ? (
+                        <TouchableOpacity 
+                            style={{ backgroundColor: '#DCFCE7', paddingVertical: 12, borderRadius: 12, alignItems: 'center', marginBottom: 20 }}
+                            onPress={() => setIsPickingHabit(true)}
+                        >
+                            <Text style={{ color: '#166534', fontWeight: 'bold' }}>Eu costumo frequentar este lugar</Text>
+                        </TouchableOpacity>
+                    ) : (
+                        <View style={{ backgroundColor: '#F0FDF4', padding: 16, borderRadius: 12, borderWidth: 1, borderColor: '#BBF7D0', marginBottom: 20 }}>
+                            <Text style={{ color: '#15803D', fontWeight: 'bold', marginBottom: 8 }}>Quando você costuma vir aqui?</Text>
+                            <View style={{ flexDirection: 'row', gap: 8, marginBottom: 12 }}>
+                                {['Manhã', 'Tarde', 'Noite'].map(period => (
+                                    <TouchableOpacity 
+                                        key={period} 
+                                        style={[styles.periodChip, selectedPeriods.includes(period) && styles.periodChipSelected]}
+                                        onPress={() => {
+                                            setSelectedPeriods(prev => 
+                                                prev.includes(period) ? prev.filter(p => p !== period) : [...prev, period]
+                                            );
+                                        }}
+                                    >
+                                        <Text style={[styles.periodText, selectedPeriods.includes(period) && styles.periodTextSelected]}>{period}</Text>
+                                    </TouchableOpacity>
+                                ))}
+                            </View>
+                            <View style={{ flexDirection: 'row', gap: 8 }}>
+                                <TouchableOpacity 
+                                    style={{ flex: 1, padding: 10, alignItems: 'center' }}
+                                    onPress={() => setIsPickingHabit(false)}
+                                >
+                                    <Text style={{ color: '#6B7280', fontWeight: 'bold' }}>Cancelar</Text>
+                                </TouchableOpacity>
+                                <TouchableOpacity 
+                                    style={{ flex: 1, backgroundColor: '#16A34A', padding: 10, borderRadius: 8, alignItems: 'center', opacity: selectedPeriods.length > 0 ? 1 : 0.5 }}
+                                    disabled={selectedPeriods.length === 0}
+                                    onPress={() => {
+                                        if (onSaveHabit) onSaveHabit(selectedPeriods);
+                                        setIsPickingHabit(false);
+                                    }}
+                                >
+                                    <Text style={{ color: '#fff', fontWeight: 'bold' }}>Salvar Rotina</Text>
+                                </TouchableOpacity>
+                            </View>
                         </View>
                     )}
 
@@ -137,4 +195,8 @@ const styles = StyleSheet.create({
     eventMonth: { fontSize: 10, color: '#4F46E5', textTransform: 'uppercase' },
     eventTitle: { fontSize: 15, fontWeight: '600', color: '#1F2937', marginBottom: 4 },
     eventTime: { fontSize: 13, color: '#6B7280' },
+    periodChip: { flex: 1, paddingVertical: 8, borderRadius: 8, backgroundColor: '#fff', borderWidth: 1, borderColor: '#86EFAC', alignItems: 'center' },
+    periodChipSelected: { backgroundColor: '#16A34A', borderColor: '#16A34A' },
+    periodText: { fontSize: 14, color: '#166534' },
+    periodTextSelected: { color: '#fff', fontWeight: 'bold' },
 });

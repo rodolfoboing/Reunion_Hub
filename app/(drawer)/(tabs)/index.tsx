@@ -4,28 +4,19 @@ import { LinearGradient } from 'expo-linear-gradient';
 import * as Location from 'expo-location';
 import { router } from 'expo-router';
 import { onAuthStateChanged } from 'firebase/auth';
-import { collection, doc, getDoc, getDocs, limit, onSnapshot, query, where } from 'firebase/firestore';
+import { collection, doc, getDoc, getDocs, limit, onSnapshot, query, where, orderBy } from 'firebase/firestore';
 import { useEffect, useRef, useState } from 'react';
 import { FlatList, Image, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { auth, db } from '../../../src/services/firebaseConfig';
 import { Meeting, User } from '../../../src/types';
 import { sendLocalNotification } from '../../../src/utils/Notifications';
 import { STRINGS } from '../../../src/constants/strings';
+import { CONFIG } from '../../../src/constants/Config';
 import { normalizeDate, getTodayStr } from '../../../src/utils/dateUtils';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { ManualModal } from '../../../src/components/ManualModal';
 
-const getDistanceFromLatLonInKm = (lat1: number, lon1: number, lat2: number, lon2: number) => {
-  const R = 6371; // Radius of the earth in km
-  const dLat = (lat2 - lat1) * (Math.PI / 180);
-  const dLon = (lon2 - lon1) * (Math.PI / 180);
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(lat1 * (Math.PI / 180)) * Math.cos(lat2 * (Math.PI / 180)) *
-    Math.sin(dLon / 2) * Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c; // Distance in km
-};
+import { getDistanceFromLatLonInKm } from '../../../src/utils/distance';
 
 // Helper function para formatar a data do evento
 const MONTH_NAMES = ['JAN', 'FEV', 'MAR', 'ABR', 'MAI', 'JUN', 'JUL', 'AGO', 'SET', 'OUT', 'NOV', 'DEZ'];
@@ -112,7 +103,7 @@ export default function HomeScreen() {
           const dist = getDistanceFromLatLonInKm(location.coords.latitude, location.coords.longitude, m.lat!, m.lng!);
           return { ...m, distance: dist };
         })
-        .filter(m => m.distance <= 25);
+        .filter(m => m.distance <= CONFIG.NEARBY_RADIUS_KM);
       withDistance.sort((a, b) => a.distance - b.distance);
       setNearbyEvents(withDistance.slice(0, 5));
     }
@@ -200,6 +191,7 @@ export default function HomeScreen() {
       const p1 = getDocs(qMyEvents).then(snap => {
         const myEventsData = snap.docs.map(d => ({ id: d.id, ...d.data() } as Meeting));
         const futureMyEvents = myEventsData.filter((m) => {
+          if (m.status === 'cancelled' || m.status === 'completed') return false;
           const normalizedDate = normalizeDate(m.date);
           if (!normalizedDate) return false;
           return normalizedDate >= todayStr;
@@ -211,6 +203,7 @@ export default function HomeScreen() {
       const qHighlights = query(
         collection(db, 'meetings'),
         where('date', '>=', todayStr),
+        orderBy('date'),
         limit(30)
       );
 
@@ -219,6 +212,7 @@ export default function HomeScreen() {
         const userInterests = userProfile?.interests || [];
 
         const upcomingHighlights = highlightsData.filter((m) => {
+          if (m.status === 'cancelled' || m.status === 'completed') return false;
           const normalizedDate = normalizeDate(m.date);
           if (!normalizedDate) return false;
           if (normalizedDate < todayStr) return false;
@@ -255,7 +249,7 @@ export default function HomeScreen() {
       if (unsubConversations) unsubConversations();
       if (unsubNotifications) unsubNotifications();
     };
-  }, [userProfile?.interests]);
+  }, [userProfile?.interests?.join(',')]);
 
   const renderEventCard = ({ item }: { item: Meeting }) => (
     <TouchableOpacity style={styles.eventCard} onPress={() => router.push(`/event/${item.id}` as never)}>

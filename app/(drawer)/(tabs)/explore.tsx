@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, Animated, Image, FlatList, Dimensions, ActivityIndicator, Platform, ScrollView, Switch, Pressable, Modal } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, Animated, Image, FlatList, Dimensions, ActivityIndicator, Platform, ScrollView, Switch, Pressable, Modal, Alert } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons, FontAwesome } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -11,17 +11,20 @@ import { CreateEventModal } from '@/src/features/explore/components/CreateEventM
 import { PlaceModal } from '@/src/features/explore/components/PlaceModal';
 import { LocationPickerModal } from '@/src/features/explore/components/LocationPickerModal';
 import { Place, User } from '../../../src/types';
-import { doc, getDoc, collection, query, where, getDocs } from 'firebase/firestore';
-import { db } from '../../../src/services/firebaseConfig';
+import { doc, getDoc, collection, query, where, getDocs, setDoc, updateDoc, arrayUnion } from 'firebase/firestore';
+import { db, auth } from '../../../src/services/firebaseConfig';
 import { INTERESTS_OPTIONS } from '@/src/constants/Interests';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const { width } = Dimensions.get('window');
 
+import { normalizeDate } from '@/src/utils/dateUtils';
+
 const isEventLive = (dateStr?: string, timeStr?: string) => {
     if (!dateStr || !timeStr) return false;
     try {
-        const eventDateTime = new Date(`${dateStr}T${timeStr}:00`);
+        const normalized = normalizeDate(dateStr) || dateStr;
+        const eventDateTime = new Date(`${normalized}T${timeStr}:00`);
         const now = new Date();
         const diffMs = now.getTime() - eventDateTime.getTime();
         const diffMinutes = diffMs / (1000 * 60);
@@ -117,7 +120,6 @@ export default function ExploreScreen() {
     const [modalVisible, setModalVisible] = useState(false);
     const [repeatCount, setRepeatCount] = useState(0);
     const [pickingLocation, setPickingLocation] = useState(false);
-    const [habitDays, setHabitDays] = useState<string[]>([]);
     const [newMeeting, setNewMeeting] = useState({
         title: '', interests: [] as string[], description: '', locationName: '', date: '', time: '',
         lat: 0, lng: 0, type: 'in-person', meetingLink: '', placeId: '',
@@ -193,8 +195,31 @@ export default function ExploreScreen() {
         }
     };
 
-    const toggleHabitDay = (day: string) => {
-        setHabitDays(prev => prev.includes(day) ? prev.filter(d => d !== day) : [...prev, day]);
+
+
+    const handleSavePlaceHabit = async (periods: string[]) => {
+        if (!selectedPlace || !auth.currentUser) return;
+        try {
+            const placeRef = doc(db, 'places', selectedPlace.id);
+            await setDoc(placeRef, { 
+                id: selectedPlace.id, 
+                name: selectedPlace.name, 
+                latitude: selectedPlace.latitude, 
+                longitude: selectedPlace.longitude, 
+                vocations: selectedPlace.vocations || [],
+                isCommunity: true
+            }, { merge: true });
+            
+            await updateDoc(placeRef, {
+                frequenters: arrayUnion(auth.currentUser.uid),
+                [`habits.${auth.currentUser.uid}`]: periods
+            });
+            Alert.alert("Sucesso", "Sua rotina foi salva neste local!");
+            setShowPlaceModal(false);
+        } catch (error) {
+            console.error(error);
+            Alert.alert("Erro", "Não foi possível salvar a rotina.");
+        }
     };
 
     const filteredMeetings = meetings.filter(m => {
@@ -491,8 +516,6 @@ export default function ExploreScreen() {
                 eventType={eventType}
                 newMeeting={newMeeting}
                 setNewMeeting={setNewMeeting}
-                habitDays={habitDays}
-                toggleHabitDay={toggleHabitDay}
                 onOpenLocationPicker={() => { setModalVisible(false); setPickingLocation(true); }}
                 repeatCount={repeatCount}
                 setRepeatCount={setRepeatCount}
@@ -510,6 +533,7 @@ export default function ExploreScreen() {
                     m.placeId === selectedPlace.id || 
                     (Math.abs(Number(m.lat) - selectedPlace.latitude) < 0.0001 && Math.abs(Number(m.lng) - selectedPlace.longitude) < 0.0001)
                 ) : []}
+                onSaveHabit={handleSavePlaceHabit}
                 onCreateEventPress={() => {
                     if(selectedPlace) {
                         setNewMeeting({

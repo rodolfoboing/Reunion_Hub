@@ -2,7 +2,8 @@ import { useLocalSearchParams, router, Stack } from 'expo-router';
 import { View, Text, StyleSheet, ScrollView, Alert, ActivityIndicator, TouchableOpacity, Linking } from 'react-native';
 import { useEffect, useState, useRef } from 'react';
 import { doc, getDoc, updateDoc, arrayUnion, increment, addDoc, collection, writeBatch, serverTimestamp } from 'firebase/firestore';
-import { db, auth } from '../../src/services/firebaseConfig';
+import { httpsCallable } from 'firebase/functions';
+import { db, auth, functions } from '../../src/services/firebaseConfig';
 import { Meeting } from '../../src/types';
 import { StyledButton } from '@/src/components/StyledButton';
 import { ErrorState } from '@/src/components/ErrorState';
@@ -102,28 +103,7 @@ export default function MeetingDetailsScreen() {
                                 }
                             }
 
-                            const docRef = doc(db, 'meetings', id as string);
-                            await updateDoc(docRef, {
-                                attendees: arrayUnion(auth.currentUser!.uid)
-                            });
-
-                            // Notify Event Creator
-                            if (meeting.createdBy && meeting.createdBy !== auth.currentUser!.uid) {
-                                try {
-                                    await addDoc(collection(db, 'notifications'), {
-                                        userId: meeting.createdBy,
-                                        type: 'new_attendee',
-                                        title: 'Novo Participante!',
-                                        body: `${auth.currentUser!.displayName || 'Alguém'} confirmou presença no evento "${meeting.title}"`,
-                                        meetingId: id,
-                                        createdAt: new Date(),
-                                        read: false,
-                                        fromUserId: auth.currentUser!.uid
-                                    });
-                                } catch (notifError) {
-                                    console.error('Error sending notification:', notifError);
-                                }
-                            }
+                            await httpsCallable(functions, 'rsvpToEvent')({ eventId: id });
 
                             Alert.alert('Sucesso', 'Presença confirmada! Lembre-se das dicas de segurança e não esqueça de fazer check-in no dia do evento.');
                             fetchMeeting(); // Refresh UI
@@ -156,20 +136,7 @@ export default function MeetingDetailsScreen() {
 
         setCheckInLoading(true);
         try {
-            const currentUid = auth.currentUser.uid;
-
-            // 1. Registrar check-in no evento
-            const meetingRef = doc(db, 'meetings', id as string);
-            await updateDoc(meetingRef, {
-                checkedIn: arrayUnion(currentUid)
-            });
-
-            // 2. Atualizar o perfil do usuário (reputação e contagem de eventos)
-            const userRef = doc(db, 'users', currentUid);
-            await updateDoc(userRef, {
-                reputation: increment(10), // +10 pontos por check-in
-                eventsAttended: increment(1), // +1 evento confirmado
-            });
+            await httpsCallable(functions, 'checkInToEvent')({ eventId: id });
 
             Alert.alert(
                 '✅ Check-in Confirmado!',
@@ -271,29 +238,7 @@ export default function MeetingDetailsScreen() {
                     onPress: async () => {
                         setLoading(true);
                         try {
-                            const batch = writeBatch(db);
-                            
-                            const meetingRef = doc(db, 'meetings', id as string);
-                            batch.update(meetingRef, { status: 'cancelled' });
-                            
-                            const userRef = doc(db, 'users', currentUid!);
-                            batch.update(userRef, { reputation: increment(-15) });
-                            
-                            // Adicionar aviso de notificação para cada participante usando a coleção central
-                            meeting.attendees?.forEach((attendeeUid: string) => {
-                                if (attendeeUid !== currentUid) {
-                                    const notifRef = doc(collection(db, 'notifications'));
-                                    batch.set(notifRef, {
-                                        userId: attendeeUid,
-                                        title: 'Evento Cancelado',
-                                        body: `O evento "${meeting.title}" foi cancelado pelo organizador.`,
-                                        createdAt: serverTimestamp(),
-                                        read: false
-                                    });
-                                }
-                            });
-
-                            await batch.commit();
+                            await httpsCallable(functions, 'cancelEvent')({ eventId: id });
                             
                             Alert.alert('Cancelado', 'O evento foi cancelado e sua reputação foi atualizada.');
                             fetchMeeting();

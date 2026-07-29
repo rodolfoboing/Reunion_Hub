@@ -6,12 +6,10 @@ import { fetchNearbyPlaces, mapOsmToPlace } from '@/src/services/osmService';
 import { Meeting, Place } from '@/src/types';
 import { normalizeDate, getTodayStr } from '@/src/utils/dateUtils';
 
-const FALLBACK_LOCATION = {
-    coords: {
-        latitude: -23.5505,
-        longitude: -46.6333,
-    },
-} as Location.LocationObject;
+const toFiniteCoordinate = (value: unknown): number | undefined => {
+    const coordinate = typeof value === 'number' ? value : Number(value);
+    return Number.isFinite(coordinate) ? coordinate : undefined;
+};
 
 export function useExploreData() {
     const [location, setLocation] = useState<Location.LocationObject | null>(null);
@@ -20,18 +18,17 @@ export function useExploreData() {
     const [loading, setLoading] = useState(true);
 
     useEffect(() => {
+        let isActive = true;
+
         (async () => {
             try {
                 const { status } = await Location.requestForegroundPermissionsAsync();
                 if (status === 'granted') {
                     const loc = await Location.getCurrentPositionAsync({});
-                    setLocation(loc);
-                } else {
-                    setLocation(FALLBACK_LOCATION);
+                    if (isActive) setLocation(loc);
                 }
             } catch (error) {
                 console.warn('Erro ao obter localizacao:', error);
-                setLocation(FALLBACK_LOCATION);
             }
         })();
 
@@ -47,31 +44,39 @@ export function useExploreData() {
             q,
             (snapshot) => {
                 const data = snapshot.docs.map(doc => {
-                    const normalizedDate = normalizeDate(doc.data().date);
+                    const meeting = doc.data() as Omit<Meeting, 'id'>;
+                    const normalizedDate = normalizeDate(meeting.date);
                     return {
                         id: doc.id,
-                        ...(doc.data() as Omit<Meeting, 'id'>),
-                        date: normalizedDate || doc.data().date,
-                        lat: Number(doc.data().lat) || -23.5505,
-                        lng: Number(doc.data().lng) || -46.6333,
-                        locationName: doc.data().locationName || 'Local a definir'
+                        ...meeting,
+                        date: normalizedDate || meeting.date,
+                        lat: toFiniteCoordinate(meeting.lat),
+                        lng: toFiniteCoordinate(meeting.lng),
+                        locationName: meeting.locationName || 'Local a definir'
                     };
                 }).filter(m => {
                     if (!m.date) return false;
                     if (m.status === 'cancelled' || m.status === 'completed') return false;
                     return m.date >= todayStr;
                 }) as Meeting[];
-                setMeetings(data);
-                setLoading(false);
+                if (isActive) {
+                    setMeetings(data);
+                    setLoading(false);
+                }
             },
             (error) => {
                 console.warn('Erro ao buscar eventos:', error);
-                setMeetings([]);
-                setLoading(false);
+                if (isActive) {
+                    setMeetings([]);
+                    setLoading(false);
+                }
             }
         );
 
-        return () => unsubscribe();
+        return () => {
+            isActive = false;
+            unsubscribe();
+        };
     }, []);
 
     useEffect(() => {

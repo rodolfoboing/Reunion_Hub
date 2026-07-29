@@ -1,6 +1,7 @@
-import { View, Text, StyleSheet, ScrollView, Alert, TouchableOpacity, Image, TextInput, Linking } from 'react-native';
+import { View, Text, StyleSheet, ScrollView, Alert, TouchableOpacity, Image, TextInput, Linking, Switch } from 'react-native';
 import { useState, useEffect } from 'react';
-import { auth, db } from '../../src/services/firebaseConfig';
+import { auth, db, functions } from '../../src/services/firebaseConfig';
+import { httpsCallable } from 'firebase/functions';
 import { doc, getDoc, setDoc, collection, query, where, getDocs, deleteDoc } from 'firebase/firestore';
 import { updateProfile, deleteUser, sendEmailVerification } from 'firebase/auth';
 import { storage } from '../../src/services/firebaseConfig';
@@ -20,6 +21,7 @@ export default function ProfileScreen() {
     const [editBio, setEditBio] = useState('');
     const [editNick, setEditNick] = useState('');
     const [editInterests, setEditInterests] = useState<string[]>([]);
+    const [shareFrequentedPlaces, setShareFrequentedPlaces] = useState(false);
     const [editPhotoURL, setEditPhotoURL] = useState<string | null>(null);
     const [loading, setLoading] = useState(false);
     const [showTermsModal, setShowTermsModal] = useState(false);
@@ -47,6 +49,7 @@ export default function ProfileScreen() {
         setEditBio(userProfile?.bio || '');
         setEditNick(userProfile?.nick || auth.currentUser?.displayName?.replace(/\s/g, '').toLowerCase() || '');
         setEditInterests(userProfile?.interests || []);
+        setShareFrequentedPlaces(userProfile?.shareFrequentedPlaces === true);
         setEditPhotoURL(userProfile?.photoURL || auth.currentUser?.photoURL || null);
         setIsEditing(true);
     };
@@ -151,6 +154,7 @@ export default function ProfileScreen() {
                 nick: editNick.trim(),
                 bio: editBio,
                 interests: editInterests,
+                shareFrequentedPlaces,
                 photoURL: finalPhotoURL,
                 searchName: searchName
             });
@@ -167,6 +171,7 @@ export default function ProfileScreen() {
                 nick: editNick.trim(),
                 bio: editBio,
                 interests: editInterests,
+                shareFrequentedPlaces,
                 searchName: searchName,
                 displayName: editNick.trim(),
                 photoURL: finalPhotoURL
@@ -217,9 +222,8 @@ export default function ProfileScreen() {
                             const user = auth.currentUser;
                             if (user) {
                                 setLoading(true);
-                                await deleteDoc(doc(db, 'users', user.uid));
-                                await deleteUser(user);
-                                // auth listener will handle redirection
+                                await httpsCallable(functions, 'deleteMyAccount')({});
+                                await auth.signOut();
                             }
                         } catch (error: any) {
                             setLoading(false);
@@ -360,6 +364,24 @@ export default function ProfileScreen() {
             </View>
 
             <View style={styles.section}>
+                <Text style={styles.sectionTitle}>Privacidade</Text>
+                <View style={styles.privacyRow}>
+                    <View style={styles.privacyTextContainer}>
+                        <Text style={styles.privacyTitle}>Mostrar lugares que frequento</Text>
+                        <Text style={styles.privacyDescription}>Permite que outras pessoas vejam os locais comunitários que você acompanha.</Text>
+                    </View>
+                    <Switch
+                        value={shareFrequentedPlaces}
+                        onValueChange={setShareFrequentedPlaces}
+                        disabled={!isEditing}
+                        trackColor={{ false: '#D1D5DB', true: '#A5B4FC' }}
+                        thumbColor={shareFrequentedPlaces ? '#4F46E5' : '#F9FAFB'}
+                    />
+                </View>
+                {!isEditing && <Text style={styles.privacyHint}>Toque em “Editar Perfil” para alterar esta preferência.</Text>}
+            </View>
+
+            <View style={styles.section}>
                 <Text style={styles.sectionTitle}>Suporte e Legal</Text>
                 <View style={styles.menuContainer}>
                     <TouchableOpacity style={styles.menuItem} onPress={() => setShowTermsModal(true)}>
@@ -464,6 +486,11 @@ const styles = StyleSheet.create({
     statLabel: { fontSize: 14, color: '#6b7280' },
     section: { width: '100%', marginBottom: 32 },
     sectionTitle: { fontSize: 18, fontWeight: 'bold', marginBottom: 16, color: '#1f2937' },
+    privacyRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 16 },
+    privacyTextContainer: { flex: 1 },
+    privacyTitle: { fontSize: 15, fontWeight: '600', color: '#374151', marginBottom: 4 },
+    privacyDescription: { fontSize: 13, color: '#6B7280', lineHeight: 18 },
+    privacyHint: { fontSize: 12, color: '#9CA3AF', marginTop: 10 },
     placeholder: { fontSize: 14, color: '#9ca3af', fontStyle: 'italic' },
     logoutContainer: { width: '100%' },
     tagsContainer: { flexDirection: 'row', flexWrap: 'wrap' },

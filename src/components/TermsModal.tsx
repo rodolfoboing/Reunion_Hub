@@ -1,131 +1,68 @@
-import React from 'react';
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Modal, Linking } from 'react-native';
-import { FontAwesome } from '@expo/vector-icons';
+import { Modal, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
 
-interface TermsModalProps {
-    visible: boolean;
-    onClose: () => void;
-}
+type TermsModalProps = { visible: boolean; onClose: () => void };
+
+const Section = ({ title, children }: { title: string; children: string }) => (
+  <View style={styles.section}>
+    <Text style={styles.sectionTitle}>{title}</Text>
+    <Text style={styles.sectionText}>{children}</Text>
+  </View>
+);
 
 export function TermsModal({ visible, onClose }: TermsModalProps) {
-    return (
-        <Modal
-            visible={visible}
-            animationType="slide"
-            presentationStyle="pageSheet"
-            onRequestClose={onClose}
-        >
-            <View style={styles.modalContainer}>
-                <View style={styles.modalHeader}>
-                    <Text style={styles.modalTitle}>Regras de Uso</Text>
-                    <TouchableOpacity onPress={onClose} style={styles.closeBtn}>
-                        <FontAwesome name="times" size={24} color="#6b7280" />
-                    </TouchableOpacity>
-                </View>
-                <ScrollView style={styles.modalContent} showsVerticalScrollIndicator={false}>
-                    <Text style={styles.termsTitle}>Termos de Uso e Regras da Comunidade</Text>
-                    <Text style={styles.termsText}>
-                        O Reunion Hub é uma plataforma tecnológica de facilitação social. Ao utilizar nosso aplicativo, você concorda com as seguintes regras e isenções legais:
-                    </Text>
-                    
-                    <Text style={styles.termsSubtitle}>1. Isenção de Responsabilidade (Assumption of Risk)</Text>
-                    <Text style={styles.termsText}>
-                        O Reunion Hub atua ÚNICA e EXCLUSIVAMENTE como uma ferramenta para conectar pessoas com interesses comuns. Não somos organizadores, anfitriões ou responsáveis por qualquer evento, encontro ou atividade criada pelos usuários. O aplicativo NÃO se responsabiliza civil ou criminalmente por acidentes, danos, prejuízos, assédios ou qualquer incidente ocorrido no mundo offline em decorrência do uso do app. Você assume integralmente o risco ao participar ou organizar eventos.
-                    </Text>
-
-                    <Text style={styles.termsSubtitle}>2. Maioridade Legal e Segurança</Text>
-                    <Text style={styles.termsText}>
-                        O uso deste aplicativo é restrito a maiores de 18 anos. Recomendamos fortemente que os encontros ocorram em locais públicos e seguros. Nunca compartilhe informações financeiras ou documentos pessoais no chat.
-                    </Text>
-
-                    <Text style={styles.termsSubtitle}>3. Conteúdo Ilegal e Imagens</Text>
-                    <Text style={styles.termsText}>
-                        É ESTRITAMENTE PROIBIDO o upload de imagens (perfil ou eventos) e o envio de mensagens contendo: pornografia, nudez, violência, apologia às drogas, prostituição, crimes, direitos autorais de terceiros ou qualquer conteúdo ilícito. Infratores serão banidos permanentemente sem aviso prévio.
-                    </Text>
-
-                    <Text style={styles.termsSubtitle}>4. Uso do Chat e Assédio</Text>
-                    <Text style={styles.termsText}>
-                        Temos tolerância ZERO para assédio, extorsão, bullying, ameaças ou discursos de ódio. O chat privado é para networking. Caso sofra qualquer tipo de abuso, utilize o recurso de "Denunciar".
-                    </Text>
-
-                    <Text style={styles.termsSubtitle}>5. Spam e Marketing</Text>
-                    <Text style={styles.termsText}>
-                        O Reunion Hub é para CONEXÕES REAIS. É proibido o uso da plataforma para panfletagem digital, pirâmides financeiras, envio massivo de spam, ou criação de eventos com intuito puramente comercial e agressivo sem valor de networking.
-                    </Text>
-
-                    <TouchableOpacity 
-                        style={styles.privacyButton}
-                        onPress={() => Linking.openURL('https://sites.google.com/view/sosfiber-softwares/politica-de-privacidade')}
-                    >
-                        <FontAwesome name="external-link" size={16} color="#4f46e5" />
-                        <Text style={styles.privacyButtonText}>Ler Política de Privacidade Externa</Text>
-                    </TouchableOpacity>
-                    
-                    <View style={{ height: 60 }} />
-                </ScrollView>
-            </View>
-        </Modal>
-    );
+  return (
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+      <View style={styles.overlay}>
+        <View style={styles.sheet}>
+          <View style={styles.header}>
+            <View style={styles.icon}><Ionicons name="document-text-outline" size={22} color="#4F46E5" /></View>
+            <Text style={styles.title}>Regras e Termos de Uso</Text>
+            <TouchableOpacity onPress={onClose} accessibilityLabel="Fechar termos"><Ionicons name="close" size={26} color="#6B7280" /></TouchableOpacity>
+          </View>
+          <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.content}>
+            <Text style={styles.updated}>Última atualização: julho de 2026</Text>
+            <Section title="1. Finalidade do Reunion Hub">
+              O Reunion Hub ajuda pessoas adultas a descobrir eventos, locais comunitários e interesses em comum. O aplicativo facilita conexões; não garante a identidade, conduta, segurança, qualidade ou comparecimento de qualquer usuário, evento ou estabelecimento.
+            </Section>
+            <Section title="2. Conta e informações verdadeiras">
+              Você deve ter 18 anos ou mais, manter seus dados corretos e proteger sua conta. Não crie contas falsas, não se passe por outra pessoa, não tente obter privilégios administrativos e não use o aplicativo para fins ilegais, comerciais não autorizados ou enganosos.
+            </Section>
+            <Section title="3. Eventos e encontros presenciais">
+              Antes de comparecer, confirme data, local e organizador. Prefira locais públicos, informe alguém de confiança sobre seu deslocamento e não se sinta obrigado a permanecer em situações desconfortáveis. Organizadores são responsáveis pela precisão do evento e por cancelá-lo quando necessário.
+            </Section>
+            <Section title="4. Conteúdo, respeito e moderação">
+              É proibido publicar ou enviar conteúdo ofensivo, discriminatório, sexualmente explícito, violento, fraudulento, ilegal, que incentive autolesão, assédio, perseguição ou divulgação de dados pessoais de terceiros. Denuncie usuários e eventos suspeitos; podemos limitar, remover conteúdo, suspender contas ou colaborar com autoridades quando exigido por lei.
+            </Section>
+            <Section title="5. Mensagens, bloqueio e links">
+              Use mensagens com respeito. Nunca envie senhas, dados de cartão, dinheiro ou códigos de autenticação. Você pode bloquear usuários; bloqueios impedem novas conversas entre as partes. Links de eventos online são fornecidos por usuários: confirme o domínio antes de abri-los.
+            </Section>
+            <Section title="6. Locais, hábitos e privacidade">
+              Ao marcar que frequenta um local, você compartilha essa informação com o app para formar comunidades e sugestões. A exibição no perfil público é opcional e fica desativada por padrão; você pode ativá-la ou ocultá-la em Perfil › Privacidade. Não publique endereço residencial, rotina detalhada ou dados de terceiros.
+            </Section>
+            <Section title="7. Reputação e presença">
+              Check-ins, cancelamentos e faltas podem afetar indicadores de reputação. Tentativas de manipular presença, reputação, eventos ou locais podem resultar em reversão, bloqueio de recursos ou suspensão de conta.
+            </Section>
+            <Section title="8. Dados e exclusão de conta">
+              Tratamos dados de conta, perfil, interesses, eventos, mensagens, localização quando autorizada e preferências necessárias ao funcionamento. Você pode solicitar exclusão no app; a exclusão remove sua conta e dados pessoais diretos, preservando apenas registros que precisem ser anonimizados para proteger outros participantes ou cumprir obrigações legais.
+            </Section>
+            <Section title="9. Alterações e contato">
+              Podemos atualizar estes termos conforme o aplicativo evoluir. O uso contínuo após a atualização representa concordância com a versão vigente. Em caso de dúvida, denúncia urgente ou solicitação sobre dados, use os canais de suporte exibidos no perfil.
+            </Section>
+          </ScrollView>
+          <TouchableOpacity style={styles.button} onPress={onClose}><Text style={styles.buttonText}>Li e entendi</Text></TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+  );
 }
 
 const styles = StyleSheet.create({
-    modalContainer: { 
-        flex: 1, 
-        backgroundColor: '#fff', 
-        paddingTop: 50 
-    },
-    modalHeader: { 
-        flexDirection: 'row', 
-        justifyContent: 'space-between', 
-        alignItems: 'center', 
-        paddingHorizontal: 24, 
-        paddingBottom: 16, 
-        borderBottomWidth: 1, 
-        borderBottomColor: '#f3f4f6' 
-    },
-    modalTitle: { 
-        fontSize: 20, 
-        fontWeight: 'bold', 
-        color: '#1f2937' 
-    },
-    closeBtn: {
-        padding: 4,
-    },
-    modalContent: { 
-        padding: 24 
-    },
-    termsTitle: { 
-        fontSize: 18, 
-        fontWeight: 'bold', 
-        color: '#4f46e5', 
-        marginBottom: 12 
-    },
-    termsSubtitle: { 
-        fontSize: 16, 
-        fontWeight: 'bold', 
-        color: '#1f2937', 
-        marginTop: 24, 
-        marginBottom: 8 
-    },
-    termsText: { 
-        fontSize: 15, 
-        color: '#4b5563', 
-        lineHeight: 22 
-    },
-    privacyButton: {
-        flexDirection: 'row',
-        alignItems: 'center',
-        justifyContent: 'center',
-        backgroundColor: '#e0e7ff',
-        padding: 16,
-        borderRadius: 12,
-        marginTop: 32,
-        marginBottom: 16
-    },
-    privacyButtonText: {
-        color: '#4f46e5',
-        fontWeight: 'bold',
-        marginLeft: 8,
-        fontSize: 15
-    }
+  overlay: { flex: 1, backgroundColor: 'rgba(17,24,39,0.55)', justifyContent: 'flex-end' },
+  sheet: { maxHeight: '90%', backgroundColor: '#FFF', borderTopLeftRadius: 28, borderTopRightRadius: 28, padding: 20 },
+  header: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 12 },
+  icon: { padding: 8, borderRadius: 12, backgroundColor: '#EEF2FF' }, title: { flex: 1, fontSize: 19, fontWeight: '800', color: '#111827' },
+  content: { paddingBottom: 12 }, updated: { color: '#6B7280', fontSize: 12, marginBottom: 8 }, section: { marginTop: 14 },
+  sectionTitle: { fontSize: 15, fontWeight: '800', color: '#312E81', marginBottom: 5 }, sectionText: { fontSize: 14, lineHeight: 20, color: '#374151' },
+  button: { backgroundColor: '#4F46E5', borderRadius: 14, padding: 15, alignItems: 'center', marginTop: 8 }, buttonText: { color: '#FFF', fontSize: 16, fontWeight: '800' }
 });

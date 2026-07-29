@@ -110,6 +110,7 @@ export default function HomeScreen() {
   }, [location, allUpcomingEvents]);
 
   useEffect(() => {
+    isMounted.current = true;
     let unsubConversations: any;
     let unsubNotifications: any;
 

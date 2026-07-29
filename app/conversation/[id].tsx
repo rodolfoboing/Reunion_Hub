@@ -4,7 +4,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { useLocalSearchParams, useRouter, Stack } from 'expo-router';
 import { FontAwesome, Ionicons } from '@expo/vector-icons';
 import { auth, db } from '../../src/services/firebaseConfig';
-import { collection, addDoc, query, orderBy, onSnapshot, serverTimestamp, doc, updateDoc, limit, increment, arrayUnion, deleteDoc } from 'firebase/firestore';
+import { collection, addDoc, query, orderBy, onSnapshot, serverTimestamp, doc, updateDoc, limit, increment, arrayUnion } from 'firebase/firestore';
 import { Message } from '../../src/types';
 
 export default function ChatScreen() {
@@ -114,18 +114,27 @@ export default function ChatScreen() {
     };
 
     const handleDeleteChat = () => {
-        Alert.alert('Apagar Conversa', 'Tem certeza que deseja apagar esta conversa para sempre?', [
+        Alert.alert('Apagar Conversa', 'A conversa será removida apenas da sua lista. O outro participante continuará com o histórico.', [
             { text: 'Cancelar', style: 'cancel' },
             { text: 'Apagar', style: 'destructive', onPress: async () => {
                 setShowOptionsModal(false);
                 try {
-                    await deleteDoc(doc(db, 'conversations', id as string));
+                    await updateDoc(doc(db, 'conversations', id as string), {
+                        deletedBy: arrayUnion(auth.currentUser!.uid)
+                    });
                     router.back();
                 } catch (e) {
                     Alert.alert('Erro', 'Não foi possível apagar a conversa.');
                 }
             }}
         ]);
+    };
+
+    const handleViewProfile = () => {
+        const otherUid = conversationData?.participants?.find((participant: string) => participant !== auth.currentUser?.uid);
+        if (!otherUid) return;
+        setShowOptionsModal(false);
+        router.push(`/public-profile/${otherUid}` as never);
     };
 
     const handleBlockUser = () => {
@@ -305,12 +314,19 @@ export default function ChatScreen() {
                 <TouchableOpacity style={styles.modalOverlay} activeOpacity={1} onPress={() => setShowOptionsModal(false)}>
                     <View style={styles.optionsContent}>
                         <Text style={styles.optionsTitle}>Opções do Chat</Text>
+
+                        <TouchableOpacity style={styles.optionItem} onPress={handleViewProfile}>
+                            <View style={[styles.optionIcon, { backgroundColor: '#eef2ff' }]}>
+                                <Ionicons name="person-outline" size={20} color="#4f46e5" />
+                            </View>
+                            <Text style={styles.optionText}>Ver Perfil</Text>
+                        </TouchableOpacity>
                         
                         <TouchableOpacity style={styles.optionItem} onPress={handleDeleteChat}>
                             <View style={[styles.optionIcon, { backgroundColor: '#fee2e2' }]}>
                                 <Ionicons name="trash-outline" size={20} color="#ef4444" />
                             </View>
-                            <Text style={styles.optionTextRed}>Apagar Conversa</Text>
+                            <Text style={styles.optionTextRed}>Apagar da Minha Lista</Text>
                         </TouchableOpacity>
 
                         <TouchableOpacity style={styles.optionItem} onPress={handleBlockUser}>

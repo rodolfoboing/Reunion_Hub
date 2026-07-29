@@ -27,6 +27,7 @@ interface UserProfile {
     reputation?: number;
     eventsAttended?: number;
     foundedPlacesCount?: number;
+    shareFrequentedPlaces?: boolean;
     createdAt?: any;
 }
 
@@ -48,7 +49,13 @@ export default function UserProfileScreen() {
             const userSnap = await getDoc(userRef);
 
             if (userSnap.exists()) {
-                setProfile(userSnap.data() as UserProfile);
+                const userData = userSnap.data() as UserProfile;
+                setProfile(userData);
+
+                if (!userData.shareFrequentedPlaces) {
+                    setFrequentedPlaces([]);
+                    return;
+                }
             }
 
             // Busca os lugares que o usuário frequenta

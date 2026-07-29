@@ -1,14 +1,14 @@
 import React from 'react';
 import FontAwesome from '@expo/vector-icons/FontAwesome';
-import { Link, Tabs } from 'expo-router';
-import { Pressable } from 'react-native';
+import { Tabs } from 'expo-router';
 
 import Colors from '@/src/constants/Colors';
 import { useColorScheme } from '@/src/components/useColorScheme';
 import { useClientOnlyValue } from '@/src/components/useClientOnlyValue';
 import { useEffect, useState } from 'react';
 import { auth, db } from '../../../src/services/firebaseConfig';
-import { doc, getDoc, setDoc } from 'firebase/firestore';
+import { onAuthStateChanged } from 'firebase/auth';
+import { doc, getDoc } from 'firebase/firestore';
 
 // You can explore the built-in icon families and icons on the web at https://icons.expo.fyi/
 function TabBarIcon(props: {
@@ -23,24 +23,31 @@ export default function TabLayout() {
   const [isAdmin, setIsAdmin] = useState(false);
 
   useEffect(() => {
-    const checkRole = async () => {
-      if (auth.currentUser) {
-        // --- AUTO ADMIN PROMOTION PARA TESTE ---
-        if (auth.currentUser.email === 'rodolfo-bm473@hotmail.com') {
-            await setDoc(doc(db, 'users', auth.currentUser.uid), { role: 'admin' }, { merge: true });
-        }
-        // ---------------------------------------
+    let isActive = true;
 
-        const userDoc = await getDoc(doc(db, 'users', auth.currentUser.uid));
-        if (userDoc.exists()) {
-          const role = userDoc.data().role;
-          if (role === 'admin' || role === 'moderator') {
-            setIsAdmin(true);
-          }
-        }
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (!user) {
+        if (isActive) setIsAdmin(false);
+        return;
       }
+
+      try {
+        const userDoc = await getDoc(doc(db, 'users', user.uid));
+        const role = userDoc.exists() ? userDoc.get('role') : null;
+
+        if (isActive) {
+          setIsAdmin(role === 'admin' || role === 'moderator');
+        }
+      } catch (error) {
+        console.error('[Tabs] Failed to load moderation role:', error);
+        if (isActive) setIsAdmin(false);
+      }
+    });
+
+    return () => {
+      isActive = false;
+      unsubscribe();
     };
-    checkRole();
   }, []);
 
   return (

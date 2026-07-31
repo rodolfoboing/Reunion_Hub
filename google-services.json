@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "814626560626",
+    "project_id": "reunionhub-f23cd",
+    "storage_bucket": "reunionhub-f23cd.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:814626560626:android:3564466d2bf25714d4c0eb",
+        "android_client_info": {
+          "package_name": "com.rodolfoboing.reunionhub"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCI2TSG8wPBFdmrAHITcy4_O2L1z3SNZFE"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

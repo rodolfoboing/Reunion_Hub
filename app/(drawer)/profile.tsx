@@ -1,4 +1,4 @@
-import { View, Text, StyleSheet, ScrollView, Alert, TouchableOpacity, Image, TextInput, Linking, Switch } from 'react-native';
+import { View, Text, StyleSheet, ScrollView, Alert, TouchableOpacity, Image, TextInput, Linking, Switch, AppState } from 'react-native';
 import { useState, useEffect } from 'react';
 import { auth, db, functions } from '../../src/services/firebaseConfig';
 import { httpsCallable } from 'firebase/functions';
@@ -12,6 +12,7 @@ import { StyledButton } from '@/src/components/StyledButton';
 import { TermsModal } from '@/src/components/TermsModal';
 import { ManualModal } from '@/src/components/ManualModal';
 import { router } from 'expo-router';
+import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { INTERESTS_OPTIONS } from '../../src/constants/Interests';
 
@@ -26,6 +27,9 @@ export default function ProfileScreen() {
     const [loading, setLoading] = useState(false);
     const [showTermsModal, setShowTermsModal] = useState(false);
     const [showManualModal, setShowManualModal] = useState(false);
+    const [isEmailVerified, setIsEmailVerified] = useState(auth.currentUser?.emailVerified ?? false);
+    const [emailVerificationSent, setEmailVerificationSent] = useState(false);
+    const [checkingEmailVerification, setCheckingEmailVerification] = useState(false);
 
     useEffect(() => {
         if (auth.currentUser) {
@@ -44,6 +48,36 @@ export default function ProfileScreen() {
             });
         }
     }, []);
+
+    const refreshEmailVerification = async () => {
+        const user = auth.currentUser;
+        if (!user) return;
+
+        setCheckingEmailVerification(true);
+        try {
+            await user.reload();
+            const verified = auth.currentUser?.emailVerified === true;
+            setIsEmailVerified(verified);
+            if (verified) {
+                setEmailVerificationSent(false);
+                await setDoc(doc(db, 'users', user.uid), { emailVerified: true }, { merge: true });
+                Alert.alert('E-mail verificado', 'Sua conta foi confirmada com sucesso.');
+            }
+        } catch (error) {
+            console.error('[Profile] Erro ao atualizar verificação de e-mail:', error);
+        } finally {
+            setCheckingEmailVerification(false);
+        }
+    };
+
+    useEffect(() => {
+        const subscription = AppState.addEventListener('change', (state) => {
+            if (state === 'active' && emailVerificationSent) {
+                refreshEmailVerification();
+            }
+        });
+        return () => subscription.remove();
+    }, [emailVerificationSent]);
 
     const startEditing = () => {
         setEditBio(userProfile?.bio || '');
@@ -188,11 +222,12 @@ export default function ProfileScreen() {
     };
 
     const handleVerifyEmail = async () => {
+        const user = auth.currentUser;
+        if (!user || emailVerificationSent || isEmailVerified) return;
         try {
-            if (auth.currentUser) {
-                await sendEmailVerification(auth.currentUser);
-                Alert.alert('Sucesso', 'E-mail de verificação enviado! Verifique sua caixa de entrada.');
-            }
+            await sendEmailVerification(user);
+            setEmailVerificationSent(true);
+            Alert.alert('E-mail enviado', 'Abra o link recebido. Ao voltar ao app, a confirmação será atualizada automaticamente.');
         } catch (error) {
             console.error(error);
             Alert.alert('Erro', 'Não foi possível enviar o e-mail. Aguarde um momento e tente novamente.');
@@ -249,7 +284,8 @@ export default function ProfileScreen() {
     }
 
     return (
-        <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+        <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
+            <ScrollView contentContainerStyle={styles.content}>
             <View style={styles.header}>
                 <View style={[styles.avatar, (isEditing ? editPhotoURL : userProfile?.photoURL) && { backgroundColor: 'transparent' }]}>
                     {(isEditing ? editPhotoURL : userProfile?.photoURL) ? (
@@ -266,7 +302,7 @@ export default function ProfileScreen() {
                     )}
                 </View>
                 <Text style={styles.name}>{auth.currentUser.displayName}</Text>
-                {auth.currentUser.emailVerified ? (
+                {isEmailVerified ? (
                     <View style={{flexDirection: 'row', alignItems: 'center', marginTop: 4}}>
                         <FontAwesome name="check-circle" size={14} color="#10B981" />
                         <Text style={[styles.email, {marginLeft: 4, marginTop: 0}]}>{auth.currentUser.email}</Text>
@@ -274,10 +310,21 @@ export default function ProfileScreen() {
                 ) : (
                     <View style={{flexDirection: 'row', alignItems: 'center', marginTop: 4}}>
                         <Text style={[styles.email, {marginTop: 0}]}>{auth.currentUser.email}</Text>
-                        <TouchableOpacity onPress={handleVerifyEmail} style={{marginLeft: 8, backgroundColor: '#FEF2F2', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 12}}>
-                            <Text style={{fontSize: 10, color: '#EF4444', fontWeight: 'bold'}}>Verificar E-mail</Text>
+                        <TouchableOpacity
+                            onPress={handleVerifyEmail}
+                            disabled={emailVerificationSent}
+                            style={{ marginLeft: 8, backgroundColor: emailVerificationSent ? '#F3F4F6' : '#FEF2F2', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 12 }}
+                        >
+                            <Text style={{fontSize: 10, color: emailVerificationSent ? '#6B7280' : '#EF4444', fontWeight: 'bold'}}>{emailVerificationSent ? 'E-mail enviado' : 'Verificar e-mail'}</Text>
                         </TouchableOpacity>
                     </View>
+                )}
+
+                {!isEmailVerified && emailVerificationSent && (
+                    <TouchableOpacity onPress={refreshEmailVerification} disabled={checkingEmailVerification} style={styles.refreshVerificationButton}>
+                        <FontAwesome name="refresh" size={12} color="#4F46E5" />
+                        <Text style={styles.refreshVerificationText}>{checkingEmailVerification ? 'Verificando...' : 'Já verifiquei'}</Text>
+                    </TouchableOpacity>
                 )}
 
                 {!isEditing && (
@@ -285,6 +332,17 @@ export default function ProfileScreen() {
                         <FontAwesome name="pencil" size={14} color="#6366f1" />
                         <Text style={styles.editBtnText}>Editar Perfil</Text>
                     </TouchableOpacity>
+                )}
+
+                {isEditing && (
+                    <View style={styles.topEditActions}>
+                        <View style={styles.topEditActionItem}>
+                            <StyledButton title="Cancelar" onPress={cancelEditing} colors={['#9ca3af', '#d1d5db']} />
+                        </View>
+                        <View style={styles.topEditActionItem}>
+                            <StyledButton title="Salvar" onPress={saveProfile} isLoading={loading} />
+                        </View>
+                    </View>
                 )}
 
                 {isEditing ? (
@@ -315,6 +373,7 @@ export default function ProfileScreen() {
                 )}
             </View>
 
+            {!isEditing && (
             <View style={styles.statsCard}>
                 <View style={styles.statItem}>
                     <FontAwesome name="star" size={24} color="#fbbf24" />
@@ -334,6 +393,8 @@ export default function ProfileScreen() {
                     <Text style={styles.statLabel}>Fundador</Text>
                 </View>
             </View>
+
+            )}
 
 
             <View style={styles.section}>
@@ -381,6 +442,7 @@ export default function ProfileScreen() {
                 {!isEditing && <Text style={styles.privacyHint}>Toque em “Editar Perfil” para alterar esta preferência.</Text>}
             </View>
 
+            {!isEditing && (
             <View style={styles.section}>
                 <Text style={styles.sectionTitle}>Suporte e Legal</Text>
                 <View style={styles.menuContainer}>
@@ -439,32 +501,25 @@ export default function ProfileScreen() {
                     </TouchableOpacity>
                 </View>
             </View>
+            )}
 
-            <View style={styles.logoutContainer}>
-                {isEditing ? (
-                    <View style={styles.actionButtons}>
-                        <View style={{ flex: 1, marginRight: 8 }}>
-                            <StyledButton title="Cancelar" onPress={cancelEditing} colors={['#9ca3af', '#d1d5db']} />
-                        </View>
-                        <View style={{ flex: 1 }}>
-                            <StyledButton title="Salvar" onPress={saveProfile} isLoading={loading} />
-                        </View>
-                    </View>
-                ) : (
+            {!isEditing && (
+                <View style={styles.logoutContainer}>
                     <StyledButton title="Sair" onPress={handleLogout} colors={['#ef4444', '#f87171']} />
-                )}
-            </View>
+                </View>
+            )}
 
             {/* Modal de Termos de Uso */}
             <TermsModal visible={showTermsModal} onClose={() => setShowTermsModal(false)} />
             <ManualModal visible={showManualModal} onClose={() => setShowManualModal(false)} />
-        </ScrollView>
+            </ScrollView>
+        </SafeAreaView>
     );
 }
 
 const styles = StyleSheet.create({
     container: { flex: 1, backgroundColor: '#fff' },
-    content: { padding: 24, alignItems: 'center' },
+    content: { padding: 24, paddingBottom: 32, alignItems: 'center' },
     center: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24 },
     header: { alignItems: 'center', marginBottom: 32 },
     avatar: {
@@ -474,6 +529,10 @@ const styles = StyleSheet.create({
     avatarText: { fontSize: 40, fontWeight: 'bold', color: '#6b7280' },
     name: { fontSize: 24, fontWeight: 'bold', color: '#1f2937' },
     email: { fontSize: 16, color: '#6b7280' },
+    refreshVerificationButton: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 8, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 12, backgroundColor: '#EEF2FF' },
+    refreshVerificationText: { fontSize: 12, fontWeight: '700', color: '#4F46E5' },
+    topEditActions: { width: '100%', flexDirection: 'row', gap: 8, marginTop: 16 },
+    topEditActionItem: { flex: 1 },
     statsCard: {
         flexDirection: 'row', backgroundColor: '#f9fafb', borderRadius: 16,
         padding: 24, width: '100%', marginBottom: 32,

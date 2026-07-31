@@ -20,6 +20,18 @@ if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental
 
 import { getDistanceFromLatLonInKm } from '../../../src/utils/distance';
 
+const getDateAfterDays = (days: number) => {
+    const date = new Date();
+    date.setDate(date.getDate() + days);
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+};
+
+const matchesUserInterest = (event: Pick<Meeting, 'interests' | 'theme'>, interests: string[]) => {
+    if (interests.length === 0) return false;
+    return event.interests?.some((interest) => interests.includes(interest))
+        || (typeof event.theme === 'string' && interests.includes(event.theme));
+};
+
 // Configure Locale for Calendar
 LocaleConfig.locales['pt-br'] = {
     monthNames: [
@@ -126,6 +138,7 @@ export default function AgendaScreen() {
     const [recommendations, setRecommendations] = useState<any[]>([]);
     const [allRecs, setAllRecs] = useState<any[]>([]);
     const [historyTitles, setHistoryTitles] = useState<string[]>([]);
+    const [refreshKey, setRefreshKey] = useState(0);
 
     const isMounted = useRef(true);
 
@@ -133,6 +146,7 @@ export default function AgendaScreen() {
     useFocusEffect(
         useCallback(() => {
             isMounted.current = true;
+            setRefreshKey((current) => current + 1);
             let unsubProfile: any;
             const unsubscribeAuth = auth.onAuthStateChanged((user) => {
                 if (user && isMounted.current) {
@@ -166,18 +180,13 @@ export default function AgendaScreen() {
 
     useEffect(() => {
         fetchEvents();
-    }, [activeTab, favorites.length, selectedDate]);
+    }, [activeTab, favorites.length, selectedDate, userLocation, userInterests.join(','), refreshKey]);
 
     useEffect(() => {
         if (allRecs.length === 0) return;
 
         const todayStr = getTodayStr();
-        const nextMonthDate = new Date();
-        nextMonthDate.setDate(nextMonthDate.getDate() + 30);
-        const year = nextMonthDate.getFullYear();
-        const month = String(nextMonthDate.getMonth() + 1).padStart(2, '0');
-        const day = String(nextMonthDate.getDate()).padStart(2, '0');
-        const maxDateStr = `${year}-${month}-${day}`;
+        const maxDateStr = getDateAfterDays(CONFIG.AGENDA_DISCOVERY_DAYS);
         
         let finalRecs = allRecs.filter((e: any) => {
             if (!e.date) return false;
@@ -189,7 +198,7 @@ export default function AgendaScreen() {
         // Baseado em histórico ou categoria de interesse
         if (userInterests.length > 0 || historyTitles.length > 0) {
             finalRecs = finalRecs.filter((e: any) => {
-                const matchesInterest = e.interests?.some((i: string) => userInterests.includes(i));
+                const matchesInterest = matchesUserInterest(e, userInterests);
                 const matchesHistory = historyTitles.includes(e.title);
                 return matchesInterest || matchesHistory;
             });
@@ -231,8 +240,9 @@ export default function AgendaScreen() {
 
                 // Firestore 'in' query supports max 10 items.
                 const chunks = [];
-                for (let i = 0; i < favorites.length; i += 10) {
-                    chunks.push(favorites.slice(i, i + 10));
+                const favoriteIds = favorites.slice(0, CONFIG.AGENDA_FAVORITES_LIMIT);
+                for (let i = 0; i < favoriteIds.length; i += 10) {
+                    chunks.push(favoriteIds.slice(i, i + 10));
                 }
 
                 const promises = chunks.map(chunk =>
@@ -246,7 +256,7 @@ export default function AgendaScreen() {
                         id: d.id,
                         ...d.data(),
                         date: normalizeDate(d.data().date)
-                    })).filter((e: any) => e.status !== 'cancelled' && e.status !== 'completed');
+                    })).filter((e: any) => e.status !== 'cancelled');
                     events = [...events, ...mapped];
                 });
 
@@ -312,11 +322,13 @@ export default function AgendaScreen() {
                 const hTitles = [...new Set(historyEvents.map((e: any) => e.title))];
                 setHistoryTitles(hTitles);
 
+                const maxDiscoveryDate = getDateAfterDays(CONFIG.AGENDA_DISCOVERY_DAYS);
                 const qRec = query(
                     collection(db, 'meetings'),
                     where('date', '>=', todayStr),
+                    where('date', '<=', maxDiscoveryDate),
                     orderBy('date'),
-                    limit(30)
+                    limit(CONFIG.AGENDA_DISCOVERY_LIMIT)
                 );
                 const snapRec = await getDocs(qRec);
                 let fetchedRecs = snapRec.docs
@@ -329,15 +341,29 @@ export default function AgendaScreen() {
                         if (!e.date) return false;
                         if (e.status === 'cancelled' || e.status === 'completed') return false;
                         if (e.date < todayStr) return false;
+                        if (e.date > maxDiscoveryDate) return false;
                         if (e.attendees?.includes(currentUid)) return false;
                         return true;
                     });
                 
                 setAllRecs(fetchedRecs);
+                fetchedRecs.forEach((event: any) => {
+                    const matchesInterest = matchesUserInterest(event, userInterests);
+                    const hasCoordinates = Number.isFinite(Number(event.lat)) && Number.isFinite(Number(event.lng));
+                    const isNearby = event.type === 'in-person' && !!userLocation && hasCoordinates
+                        && getDistanceFromLatLonInKm(userLocation.coords.latitude, userLocation.coords.longitude, Number(event.lat), Number(event.lng)) <= CONFIG.NEARBY_RADIUS_KM;
+                    const isPopular = isNearby && (event.attendees?.length || 0) >= CONFIG.POPULAR_ATTENDEES_COUNT;
+                    const isRecommended = !!matchesInterest;
+                    if (!isPopular && !isRecommended) return;
+                    if (!marks[event.date]) marks[event.date] = { mine: false, recurring: false, popular: false, recommended: false, past: false, hasEvent: true };
+                    if (isPopular) marks[event.date].popular = true;
+                    if (isRecommended) marks[event.date].recommended = true;
+                });
+                setMarkedDates(marks);
 
                 // Combina passados e futuros para permitir tocar em qualquer dia
                 // marcado no calendário (inclusive datas passadas) e ver os eventos dele.
-                setFilteredEvents([...results, ...historyEvents]);
+                setFilteredEvents([...results, ...historyEvents, ...fetchedRecs]);
                 setLoading(false);
                 return;
 

@@ -60,7 +60,19 @@ export interface Notification {
     title: string;
     body: string;
     meetingId?: string;
+    conversationId?: string;
     createdAt: any;
     read: boolean;
     fromUserId?: string;
+}
+
+export type ReportTargetType = 'user' | 'event';
+
+export interface Report {
+    id: string;
+    type: ReportTargetType;
+    targetId: string;
+    reportedBy: string;
+    reason?: string;
+    createdAt?: unknown;
 }

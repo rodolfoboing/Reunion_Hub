@@ -5,11 +5,13 @@ import { Stack, router } from 'expo-router';
 import * as SplashScreen from 'expo-splash-screen';
 import React, { useEffect, useState } from 'react';
 import { View, Text } from 'react-native';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
+import * as Notifications from 'expo-notifications';
 import 'react-native-reanimated';
 import { auth, db } from '../src/services/firebaseConfig'; // Import auth
 import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { useColorScheme } from '@/src/components/useColorScheme';
-import { setupNotifications } from '../src/utils/Notifications';
+import { getNotificationRoute, setupNotifications } from '../src/utils/Notifications';
 import { ErrorBoundary as CustomErrorBoundary } from '../src/components/ErrorBoundary';
 
 export {
@@ -105,18 +107,58 @@ export default function RootLayout() {
 
   // Inicializa notificações e salva o push token
   useEffect(() => {
+    const savePushToken = async (token: string) => {
+      if (!user) return;
+      try {
+        await setDoc(doc(db, 'users', user.uid), { expoPushToken: token }, { merge: true });
+        console.log('[ReunionHub Debug] Push Token salvo no Firestore para o usuário:', user.uid);
+      } catch (error) {
+        console.error('[ReunionHub Debug] Erro ao salvar push token', error);
+      }
+    };
+
     setupNotifications().then(async (result) => {
       console.log('[ReunionHub Debug] Permissões de notificação:', result.granted ? 'Concedidas' : 'Negadas');
       if (result.granted && result.token && user) {
-        try {
-          await setDoc(doc(db, 'users', user.uid), { expoPushToken: result.token }, { merge: true });
-          console.log('[ReunionHub Debug] Push Token salvo no Firestore para o usuário:', user.uid);
-        } catch (e) {
-          console.error('[ReunionHub Debug] Erro ao salvar push token', e);
-        }
+        await savePushToken(result.token);
       }
     });
+
+    const tokenSubscription = Notifications.addPushTokenListener(({ data: token }) => {
+      savePushToken(token).catch((error) => {
+        console.error('[ReunionHub Debug] Erro ao atualizar push token', error);
+      });
+    });
+
+    return () => tokenSubscription.remove();
   }, [user]);
+
+  useEffect(() => {
+    if (!loaded || !authInitialized) return;
+
+    const handleNotificationResponse = async (response: Notifications.NotificationResponse) => {
+      const route = getNotificationRoute(response.notification.request.content.data);
+      if (route) {
+        console.log('[ReunionHub Debug] Abrindo notificação para:', route);
+        router.push(route as never);
+      }
+      await Notifications.clearLastNotificationResponseAsync();
+    };
+
+    const responseSubscription = Notifications.addNotificationResponseReceivedListener((response) => {
+      handleNotificationResponse(response).catch((error) => {
+        console.error('[ReunionHub Debug] Erro ao abrir notificação:', error);
+      });
+    });
+
+    Notifications.getLastNotificationResponseAsync().then((response) => {
+      if (response) return handleNotificationResponse(response);
+    }).catch((error) => {
+      console.error('[ReunionHub Debug] Erro ao ler última notificação:', error);
+    });
+
+    return () => responseSubscription.remove();
+  }, [loaded, authInitialized]);
 
   if (!loaded || !authInitialized) {
     // Retornamos uma View temporária para garantir que o React renderize algo
@@ -137,6 +179,7 @@ function RootLayoutNav() {
   const colorScheme = useColorScheme();
 
   return (
+    <SafeAreaProvider>
     <CustomErrorBoundary>
       <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
         <Stack>
@@ -147,5 +190,6 @@ function RootLayoutNav() {
         </Stack>
       </ThemeProvider>
     </CustomErrorBoundary>
+    </SafeAreaProvider>
   );
 }

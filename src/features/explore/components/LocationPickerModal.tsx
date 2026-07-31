@@ -24,7 +24,7 @@ export function LocationPickerModal({
 }: LocationPickerModalProps) {
     return (
         <Modal visible={visible} animationType="fade">
-            <SafeAreaView style={{ flex: 1 }}>
+            <SafeAreaView style={{ flex: 1 }} edges={['top', 'bottom']}>
                 <View style={styles.mapPickerHeader}>
                     <TouchableOpacity onPress={onClose}>
                         <Ionicons name="arrow-back" size={24} color="#111827" />

@@ -4,15 +4,25 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons, MaterialIcons } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import { db } from '../../../src/services/firebaseConfig';
-import { collection, getDocs, query, orderBy, deleteDoc, doc, getDoc } from 'firebase/firestore';
+import { collection, getDocs, query, orderBy, deleteDoc, doc, getDoc, limit } from 'firebase/firestore';
+import { Report, ReportTargetType } from '../../../src/types';
+
+const REPORTS_FETCH_LIMIT = 100;
+const LEGACY_REPORT_REASON = 'Motivo não informado';
+
+type ReportReasonSummary = {
+    label: string;
+    count: number;
+};
 
 type AggregatedReport = {
     targetId: string;
     targetName: string;
-    type: 'user' | 'event';
+    type: ReportTargetType;
     reportIds: string[];
     count: number;
-    lastReportDate: any;
+    lastReportDate?: { seconds: number };
+    reasons: ReportReasonSummary[];
 };
 
 export default function ModerationScreen() {
@@ -24,7 +34,7 @@ export default function ModerationScreen() {
     const fetchReports = async () => {
         setLoading(true);
         try {
-            const q = query(collection(db, 'reports'), orderBy('createdAt', 'desc'));
+            const q = query(collection(db, 'reports'), orderBy('createdAt', 'desc'), limit(REPORTS_FETCH_LIMIT));
             const querySnapshot = await getDocs(q);
             
             const userGroups: Record<string, AggregatedReport> = {};
@@ -33,52 +43,60 @@ export default function ModerationScreen() {
             // Fetch target names dynamically
             // Note: In a production app, fetching names per ID inside a loop should be batched
             // but for MVP moderation panel this is fine.
-            const fetchTargetName = async (type: string, id: string) => {
+            const targetNameCache = new Map<string, string>();
+            const fetchTargetName = async (type: ReportTargetType, id: string): Promise<string> => {
+                const cacheKey = `${type}:${id}`;
+                const cachedName = targetNameCache.get(cacheKey);
+                if (cachedName) return cachedName;
+
                 try {
                     const col = type === 'user' ? 'users' : 'meetings';
                     const snap = await getDoc(doc(db, col, id));
                     if (snap.exists()) {
-                        return type === 'user' 
+                        const name = type === 'user'
                             ? (snap.data().nick || snap.data().displayName || 'Usuário Desconhecido')
                             : (snap.data().title || 'Evento Desconhecido');
+                        targetNameCache.set(cacheKey, name);
+                        return name;
                     }
-                } catch(e) {}
-                return type === 'user' ? 'Usuário Desconhecido' : 'Evento Desconhecido';
+                } catch (error) {
+                    console.warn('[Moderation] Não foi possível carregar alvo da denúncia:', error);
+                }
+                const fallbackName = type === 'user' ? 'Usuário Desconhecido' : 'Evento Desconhecido';
+                targetNameCache.set(cacheKey, fallbackName);
+                return fallbackName;
             };
 
             for (const document of querySnapshot.docs) {
-                const data = document.data();
+                const data = document.data() as Omit<Report, 'id'>;
                 const targetId = data.targetId;
-                const type = data.type; // 'user' or 'event'
+                const type = data.type;
                 
-                if (!targetId || !type) continue;
+                if (!targetId || (type !== 'user' && type !== 'event')) continue;
 
-                if (type === 'user') {
-                    if (!userGroups[targetId]) {
-                        userGroups[targetId] = {
+                const reportReason = data.reason?.trim() || LEGACY_REPORT_REASON;
+                const groups = type === 'user' ? userGroups : eventGroups;
+
+                if (!groups[targetId]) {
+                    groups[targetId] = {
                             targetId,
-                            targetName: await fetchTargetName('user', targetId),
-                            type: 'user',
+                            targetName: await fetchTargetName(type, targetId),
+                            type,
                             reportIds: [],
                             count: 0,
-                            lastReportDate: data.createdAt
+                            lastReportDate: data.createdAt as { seconds: number } | undefined,
+                            reasons: []
                         };
-                    }
-                    userGroups[targetId].reportIds.push(document.id);
-                    userGroups[targetId].count += 1;
-                } else if (type === 'event') {
-                    if (!eventGroups[targetId]) {
-                        eventGroups[targetId] = {
-                            targetId,
-                            targetName: await fetchTargetName('event', targetId),
-                            type: 'event',
-                            reportIds: [],
-                            count: 0,
-                            lastReportDate: data.createdAt
-                        };
-                    }
-                    eventGroups[targetId].reportIds.push(document.id);
-                    eventGroups[targetId].count += 1;
+                }
+
+                const group = groups[targetId];
+                group.reportIds.push(document.id);
+                group.count += 1;
+                const existingReason = group.reasons.find(({ label }) => label === reportReason);
+                if (existingReason) {
+                    existingReason.count += 1;
+                } else {
+                    group.reasons.push({ label: reportReason, count: 1 });
                 }
             }
             
@@ -125,7 +143,7 @@ export default function ModerationScreen() {
         );
     };
 
-    const handleViewTarget = (type: string, targetId: string) => {
+    const handleViewTarget = (type: ReportTargetType, targetId: string) => {
         if (type === 'user') {
             router.push(`/public-profile/${targetId}`);
         } else if (type === 'event') {
@@ -161,6 +179,14 @@ export default function ModerationScreen() {
                     <Text style={styles.countText}>
                         {item.count} {item.count === 1 ? 'denúncia' : 'denúncias'}
                     </Text>
+                </View>
+                <View style={styles.reasonsContainer}>
+                    <Text style={styles.reasonsTitle}>Motivos informados</Text>
+                    {item.reasons.map((reason) => (
+                        <Text key={reason.label} style={styles.reasonText}>
+                            {reason.count}× {reason.label}
+                        </Text>
+                    ))}
                 </View>
                 
                 <View style={styles.actionsContainer}>
@@ -361,6 +387,24 @@ const styles = StyleSheet.create({
         fontWeight: 'bold',
         marginLeft: 6,
         fontSize: 13,
+    },
+    reasonsContainer: {
+        marginBottom: 16,
+        padding: 12,
+        borderRadius: 10,
+        backgroundColor: '#F9FAFB',
+    },
+    reasonsTitle: {
+        marginBottom: 6,
+        fontSize: 12,
+        fontWeight: '700',
+        color: '#4B5563',
+        textTransform: 'uppercase',
+    },
+    reasonText: {
+        fontSize: 13,
+        lineHeight: 19,
+        color: '#374151',
     },
     actionsContainer: {
         flexDirection: 'row',

@@ -1,5 +1,6 @@
 import React from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, Modal, ActivityIndicator, Image } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, Modal, ActivityIndicator, Image, ScrollView } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import { Place, User, Meeting } from '@/src/types';
@@ -43,8 +44,8 @@ export function PlaceModal({
             visible={visible}
             onRequestClose={onClose}
         >
-            <View style={styles.modalOverlay}>
-                <View style={styles.modalContent}>
+            <SafeAreaView style={styles.modalOverlay} edges={['bottom']}>
+                <ScrollView style={styles.modalContent} contentContainerStyle={styles.modalContentInner} showsVerticalScrollIndicator={false}>
                     <View style={styles.modalHeader}>
                         <View style={{ flex: 1 }}>
                             <Text style={styles.modalTitle}>{place.name}</Text>
@@ -178,15 +179,16 @@ export function PlaceModal({
                     >
                         <Text style={{ color: '#4F46E5', fontWeight: 'bold', fontSize: 16 }}>Criar Evento Neste Local</Text>
                     </TouchableOpacity>
-                </View>
-            </View>
+                </ScrollView>
+            </SafeAreaView>
         </Modal>
     );
 }
 
 const styles = StyleSheet.create({
     modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'flex-end' },
-    modalContent: { backgroundColor: '#fff', borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 24, maxHeight: '90%' },
+    modalContent: { width: '100%', maxHeight: '88%', backgroundColor: '#fff', borderTopLeftRadius: 24, borderTopRightRadius: 24 },
+    modalContentInner: { padding: 24, paddingBottom: 28 },
     modalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 },
     modalTitle: { fontSize: 20, fontWeight: 'bold', color: '#111827' },
     eventItem: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#F9FAFB', padding: 12, borderRadius: 12, marginBottom: 8 },

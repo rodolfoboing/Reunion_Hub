@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, Modal, TextInput, ScrollView, KeyboardAvoidingView, Platform, ActivityIndicator, Alert } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import { collection, addDoc, doc, setDoc, updateDoc, arrayUnion, writeBatch } from 'firebase/firestore';
 import { db, auth } from '@/src/services/firebaseConfig';
@@ -134,7 +135,7 @@ export function CreateEventModal({
 
     return (
         <Modal animationType="slide" transparent={true} visible={visible} onRequestClose={onClose}>
-            <View style={styles.modalOverlay}>
+            <SafeAreaView style={styles.modalOverlay} edges={['bottom']}>
                 <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={styles.modalContent}>
                     <View style={styles.modalHeader}>
                         <Text style={styles.modalTitle}>Criar Novo Evento</Text>
@@ -142,7 +143,7 @@ export function CreateEventModal({
                             <Ionicons name="close" size={24} color="#6B7280" />
                         </TouchableOpacity>
                     </View>
-                    <ScrollView showsVerticalScrollIndicator={false}>
+                    <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.formContent}>
                         <View style={styles.inputGroup}>
                             <Text style={styles.inputLabel}>Nome do Evento</Text>
                             <TextInput style={styles.input} placeholder="Ex: Café com Tecnologia" value={newMeeting.title} onChangeText={(text) => setNewMeeting({ ...newMeeting, title: text })} />
@@ -232,7 +233,7 @@ export function CreateEventModal({
                         </View>
                     </ScrollView>
                 </KeyboardAvoidingView>
-            </View>
+            </SafeAreaView>
         </Modal>
     );
 }
@@ -240,6 +241,7 @@ export function CreateEventModal({
 const styles = StyleSheet.create({
     modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'flex-end' },
     modalContent: { backgroundColor: '#fff', borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 24, maxHeight: '90%' },
+    formContent: { paddingBottom: 12 },
     modalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 },
     modalTitle: { fontSize: 20, fontWeight: 'bold', color: '#111827' },
     inputGroup: { marginBottom: 20 },

@@ -9,6 +9,8 @@ import { StyledButton } from '@/src/components/StyledButton';
 import { ErrorState } from '@/src/components/ErrorState';
 import { FontAwesome } from '@expo/vector-icons';
 import { normalizeDate, getTodayStr } from '../../src/utils/dateUtils';
+import { scheduleEventReminder, cancelEventReminder } from '../../src/utils/Notifications';
+import { ReportReasonModal } from '@/src/components/ReportReasonModal';
 
 // Helper para verificar se hoje é o dia do evento
 const isEventDay = (eventDate: string | undefined): boolean => {
@@ -39,6 +41,7 @@ export default function MeetingDetailsScreen() {
     const [error, setError] = useState(false);
     const [rsvpLoading, setRsvpLoading] = useState(false);
     const [checkInLoading, setCheckInLoading] = useState(false);
+    const [showReportReasonModal, setShowReportReasonModal] = useState(false);
     const isMounted = useRef(true);
 
     useEffect(() => {
@@ -104,6 +107,7 @@ export default function MeetingDetailsScreen() {
                             }
 
                             await httpsCallable(functions, 'rsvpToEvent')({ eventId: id });
+                            await scheduleEventReminder({ id: id as string, title: meeting.title, date: meeting.date, time: meeting.time });
 
                             Alert.alert('Sucesso', 'Presença confirmada! Lembre-se das dicas de segurança e não esqueça de fazer check-in no dia do evento.');
                             fetchMeeting(); // Refresh UI
@@ -239,6 +243,7 @@ export default function MeetingDetailsScreen() {
                         setLoading(true);
                         try {
                             await httpsCallable(functions, 'cancelEvent')({ eventId: id });
+                            await cancelEventReminder(id as string);
                             
                             Alert.alert('Cancelado', 'O evento foi cancelado e sua reputação foi atualizada.');
                             fetchMeeting();
@@ -254,25 +259,54 @@ export default function MeetingDetailsScreen() {
     };
 
     const handleReportEvent = () => {
+        setShowReportReasonModal(true);
+    };
+
+    const submitEventReport = async (reason: string) => {
+        const reporterId = auth.currentUser?.uid;
+        if (!reporterId || !id) return;
+        setShowReportReasonModal(false);
+        try {
+            await addDoc(collection(db, 'reports'), {
+                type: 'event',
+                targetId: id,
+                reportedBy: reporterId,
+                reason,
+                createdAt: serverTimestamp()
+            });
+            Alert.alert('Denúncia recebida', 'Nossa equipe analisará este evento em breve. Obrigado.');
+        } catch (error) {
+            console.error('[Event] Erro ao enviar denúncia:', error);
+            Alert.alert('Erro', 'Não foi possível enviar a denúncia.');
+        }
+    };
+
+    const handleReportOnlineAccessIssue = () => {
         Alert.alert(
-            'Denunciar Evento',
-            'Deseja denunciar este evento por conteúdo impróprio ou suspeito?',
+            'Informar problema de acesso',
+            'Alguns links só liberam perto do horário do evento. Deseja avisar o criador mesmo assim?',
             [
                 { text: 'Cancelar', style: 'cancel' },
                 {
-                    text: 'Denunciar',
-                    style: 'destructive',
+                    text: 'Avisar criador',
                     onPress: async () => {
                         try {
-                            await addDoc(collection(db, 'reports'), {
-                                type: 'event',
-                                targetId: id,
-                                reportedBy: currentUid,
-                                createdAt: serverTimestamp()
+                            const reporterId = auth.currentUser?.uid;
+                            if (!reporterId || !meeting?.createdBy) return;
+                            await addDoc(collection(db, 'notifications'), {
+                                userId: meeting.createdBy,
+                                type: 'online_access_issue',
+                                title: 'Possível problema no link do evento',
+                                body: `Um participante informou dificuldade para acessar "${meeting.title}". Alguns links só ficam disponíveis perto do horário; confira quando possível.`,
+                                meetingId: id,
+                                fromUserId: reporterId,
+                                createdAt: serverTimestamp(),
+                                read: false
                             });
-                            Alert.alert('Denúncia Recebida', 'Nossa equipe analisará este evento em breve. Obrigado.');
-                        } catch (e) {
-                            Alert.alert('Erro', 'Não foi possível enviar a denúncia.');
+                            Alert.alert('Aviso enviado', 'O criador foi avisado para conferir o acesso ao evento.');
+                        } catch (error) {
+                            console.error('[Event] Erro ao avisar criador sobre link:', error);
+                            Alert.alert('Erro', 'Não foi possível enviar o aviso agora.');
                         }
                     }
                 }
@@ -424,17 +458,25 @@ export default function MeetingDetailsScreen() {
                         <View style={{ height: 16 }} />
 
                         {meeting.type === 'online' && meeting.meetingLink ? (
-                            <StyledButton
-                                title="Acessar Reunião Online"
-                                onPress={() => {
-                                    if (meeting.meetingLink) {
-                                        Linking.openURL(meeting.meetingLink).catch(() =>
-                                            Alert.alert('Erro', 'Não foi possível abrir o link: ' + meeting.meetingLink)
-                                        );
-                                    }
-                                }}
-                                colors={['#3b82f6', '#60a5fa']}
-                            />
+                            <>
+                                <StyledButton
+                                    title="Acessar Reunião Online"
+                                    onPress={() => {
+                                        if (meeting.meetingLink) {
+                                            Linking.openURL(meeting.meetingLink).catch(() =>
+                                                Alert.alert('Erro', 'Não foi possível abrir o link: ' + meeting.meetingLink)
+                                            );
+                                        }
+                                    }}
+                                    colors={['#3b82f6', '#60a5fa']}
+                                />
+                                {!isCreator && (
+                                    <TouchableOpacity style={styles.reportButton} onPress={handleReportOnlineAccessIssue}>
+                                        <FontAwesome name="life-ring" size={16} color="#2563eb" />
+                                        <Text style={[styles.reportText, { color: '#2563eb' }]}>Informar problema de acesso</Text>
+                                    </TouchableOpacity>
+                                )}
+                            </>
                         ) : null}
 
                         {isCreator && (
@@ -463,6 +505,12 @@ export default function MeetingDetailsScreen() {
                 )}
             </View>
             </ScrollView>
+            <ReportReasonModal
+                visible={showReportReasonModal}
+                targetType="event"
+                onClose={() => setShowReportReasonModal(false)}
+                onSelectReason={submitEventReport}
+            />
         </>
     );
 }

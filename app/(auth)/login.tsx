@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { View, Text, StyleSheet, Image, KeyboardAvoidingView, Platform, Alert, ScrollView, TouchableOpacity, Linking } from 'react-native';
 import { Link, router } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { signInWithEmailAndPassword, onAuthStateChanged } from 'firebase/auth';
 import { auth } from '../../src/services/firebaseConfig';
 import { StyledInput } from '../../src/components/StyledInput';
@@ -49,11 +50,12 @@ export default function LoginScreen() {
     };
 
     return (
-        <KeyboardAvoidingView
-            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-            style={styles.container}
-        >
-            <ScrollView contentContainerStyle={styles.scrollContent}>
+        <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
+            <KeyboardAvoidingView
+                behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+                style={styles.container}
+            >
+                <ScrollView contentContainerStyle={styles.scrollContent}>
                 <View style={styles.header}>
                     <Image
                         source={require('../../assets/images/Whisk_Reunion_Hub_Logo.png')}
@@ -112,10 +114,11 @@ export default function LoginScreen() {
                         </Link>
                     </View>
                 </View>
-            </ScrollView>
+                </ScrollView>
             
-            <TermsModal visible={showTermsModal} onClose={() => setShowTermsModal(false)} />
-        </KeyboardAvoidingView>
+                <TermsModal visible={showTermsModal} onClose={() => setShowTermsModal(false)} />
+            </KeyboardAvoidingView>
+        </SafeAreaView>
     );
 }
 
@@ -128,6 +131,7 @@ const styles = StyleSheet.create({
         flexGrow: 1,
         justifyContent: 'center',
         padding: 24,
+        paddingBottom: 32,
     },
     header: {
         alignItems: 'center',

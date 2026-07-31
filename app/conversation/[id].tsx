@@ -6,6 +6,7 @@ import { FontAwesome, Ionicons } from '@expo/vector-icons';
 import { auth, db } from '../../src/services/firebaseConfig';
 import { collection, addDoc, query, orderBy, onSnapshot, serverTimestamp, doc, updateDoc, limit, increment, arrayUnion } from 'firebase/firestore';
 import { Message } from '../../src/types';
+import { ReportReasonModal } from '@/src/components/ReportReasonModal';
 
 export default function ChatScreen() {
     const { id, name } = useLocalSearchParams();
@@ -18,6 +19,7 @@ export default function ChatScreen() {
     // Novas dependências para opções e lidas/não-lidas
     const [conversationData, setConversationData] = useState<any>(null);
     const [showOptionsModal, setShowOptionsModal] = useState(false);
+    const [showReportReasonModal, setShowReportReasonModal] = useState(false);
     const [otherUserExists, setOtherUserExists] = useState(true);
 
     useEffect(() => {
@@ -160,33 +162,29 @@ export default function ChatScreen() {
 
     const handleReportUser = () => {
         if (!conversationData || !auth.currentUser) return;
-        const otherUid = conversationData.participants.find((p: string) => p !== auth.currentUser?.uid);
         setShowOptionsModal(false);
+        setShowReportReasonModal(true);
+    };
 
-        Alert.alert(
-            'Denunciar Usuário',
-            'Deseja denunciar este usuário por comportamento impróprio?',
-            [
-                { text: 'Cancelar', style: 'cancel' },
-                {
-                    text: 'Denunciar',
-                    style: 'destructive',
-                    onPress: async () => {
-                        try {
-                            await addDoc(collection(db, 'reports'), {
-                                type: 'user',
-                                targetId: otherUid,
-                                reportedBy: auth.currentUser?.uid,
-                                createdAt: serverTimestamp()
-                            });
-                            Alert.alert('Denúncia Recebida', 'Nossa equipe de moderação analisará este usuário em breve.');
-                        } catch (error) {
-                            Alert.alert('Erro', 'Não foi possível enviar a denúncia. Tente novamente.');
-                        }
-                    }
-                }
-            ]
-        );
+    const submitUserReport = async (reason: string) => {
+        const reporterId = auth.currentUser?.uid;
+        const otherUid = conversationData?.participants?.find((participant: string) => participant !== reporterId);
+        if (!reporterId || !otherUid) return;
+        setShowReportReasonModal(false);
+        try {
+            await addDoc(collection(db, 'reports'), {
+                type: 'user',
+                targetId: otherUid,
+                reportedBy: reporterId,
+                reason,
+                conversationId: id,
+                createdAt: serverTimestamp()
+            });
+            Alert.alert('Denúncia recebida', 'Nossa equipe de moderação analisará este usuário em breve.');
+        } catch (error) {
+            console.error('[Conversation] Erro ao enviar denúncia:', error);
+            Alert.alert('Erro', 'Não foi possível enviar a denúncia. Tente novamente.');
+        }
     };
 
     const renderMessage = ({ item, index }: { item: Message, index: number }) => {
@@ -345,6 +343,12 @@ export default function ChatScreen() {
                     </View>
                 </TouchableOpacity>
             </Modal>
+            <ReportReasonModal
+                visible={showReportReasonModal}
+                targetType="user"
+                onClose={() => setShowReportReasonModal(false)}
+                onSelectReason={submitUserReport}
+            />
         </SafeAreaView>
     );
 }

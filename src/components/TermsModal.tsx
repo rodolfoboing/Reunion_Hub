@@ -1,5 +1,6 @@
 import { Modal, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { SafeAreaView } from 'react-native-safe-area-context';
 
 type TermsModalProps = { visible: boolean; onClose: () => void };
 
@@ -13,7 +14,7 @@ const Section = ({ title, children }: { title: string; children: string }) => (
 export function TermsModal({ visible, onClose }: TermsModalProps) {
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
-      <View style={styles.overlay}>
+      <SafeAreaView style={styles.overlay} edges={['bottom']}>
         <View style={styles.sheet}>
           <View style={styles.header}>
             <View style={styles.icon}><Ionicons name="document-text-outline" size={22} color="#4F46E5" /></View>
@@ -52,7 +53,7 @@ export function TermsModal({ visible, onClose }: TermsModalProps) {
           </ScrollView>
           <TouchableOpacity style={styles.button} onPress={onClose}><Text style={styles.buttonText}>Li e entendi</Text></TouchableOpacity>
         </View>
-      </View>
+      </SafeAreaView>
     </Modal>
   );
 }

@@ -4,9 +4,9 @@ import { LinearGradient } from 'expo-linear-gradient';
 import * as Location from 'expo-location';
 import { router } from 'expo-router';
 import { onAuthStateChanged } from 'firebase/auth';
-import { collection, doc, getDoc, getDocs, limit, onSnapshot, query, where, orderBy } from 'firebase/firestore';
+import { collection, doc, getDoc, limit, onSnapshot, query, where, orderBy } from 'firebase/firestore';
 import { useEffect, useRef, useState } from 'react';
-import { FlatList, Image, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { Alert, FlatList, Image, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { auth, db } from '../../../src/services/firebaseConfig';
 import { Meeting, User } from '../../../src/types';
 import { sendLocalNotification } from '../../../src/utils/Notifications';
@@ -50,6 +50,7 @@ export default function HomeScreen() {
   const [myEvents, setMyEvents] = useState<Meeting[]>([]);
   const [location, setLocation] = useState<Location.LocationObject | null>(null);
   const [nearbyEvents, setNearbyEvents] = useState<Meeting[]>([]);
+  const [refreshingNearby, setRefreshingNearby] = useState(false);
 
   const [unreadCount, setUnreadCount] = useState(0);
   const [error, setError] = useState(false);
@@ -98,7 +99,11 @@ export default function HomeScreen() {
   useEffect(() => {
     if (location && allUpcomingEvents.length > 0) {
       const withDistance = allUpcomingEvents
-        .filter(m => m.lat && m.lng && m.type !== 'online')
+        .filter((meeting) => {
+          const isOnlineEvent = meeting.type === 'online';
+          const hasValidCoordinates = Number.isFinite(meeting.lat) && Number.isFinite(meeting.lng);
+          return !isOnlineEvent && hasValidCoordinates;
+        })
         .map(m => {
           const dist = getDistanceFromLatLonInKm(location.coords.latitude, location.coords.longitude, m.lat!, m.lng!);
           return { ...m, distance: dist };
@@ -106,18 +111,43 @@ export default function HomeScreen() {
         .filter(m => m.distance <= CONFIG.NEARBY_RADIUS_KM);
       withDistance.sort((a, b) => a.distance - b.distance);
       setNearbyEvents(withDistance.slice(0, 5));
+      return;
     }
+    setNearbyEvents([]);
   }, [location, allUpcomingEvents]);
+
+  const handleRefreshNearby = async () => {
+    setRefreshingNearby(true);
+    try {
+      const permission = await Location.getForegroundPermissionsAsync();
+      const status = permission.status === 'granted' ? permission.status : (await Location.requestForegroundPermissionsAsync()).status;
+      if (status !== 'granted') {
+        Alert.alert('Localização necessária', 'Permita a localização para atualizar os eventos perto de você.');
+        return;
+      }
+      const currentLocation = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+      if (isMounted.current) setLocation(currentLocation);
+    } catch (error) {
+      console.warn('[Index] Não foi possível atualizar a localização:', error);
+      Alert.alert('Não foi possível atualizar', 'Tente novamente quando sua localização estiver disponível.');
+    } finally {
+      if (isMounted.current) setRefreshingNearby(false);
+    }
+  };
 
   useEffect(() => {
     isMounted.current = true;
     let unsubConversations: any;
     let unsubNotifications: any;
+    let unsubHighlights: (() => void) | undefined;
+    let unsubMyEvents: (() => void) | undefined;
 
     const unsubscribeAuth = onAuthStateChanged(auth, (user) => {
       if (!user) {
         if (unsubConversations) unsubConversations();
         if (unsubNotifications) unsubNotifications();
+        if (unsubHighlights) unsubHighlights();
+        if (unsubMyEvents) unsubMyEvents();
         return;
       }
 
@@ -189,7 +219,7 @@ export default function HomeScreen() {
         limit(30)
       );
 
-      const p1 = getDocs(qMyEvents).then(snap => {
+      unsubMyEvents = onSnapshot(qMyEvents, (snap) => {
         const myEventsData = snap.docs.map(d => ({ id: d.id, ...d.data() } as Meeting));
         const futureMyEvents = myEventsData.filter((m) => {
           if (m.status === 'cancelled' || m.status === 'completed') return false;
@@ -199,6 +229,8 @@ export default function HomeScreen() {
         });
         futureMyEvents.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
         if (isMounted.current) setMyEvents(futureMyEvents.slice(0, 5));
+      }, (err) => {
+        console.warn('[Index] Erro no listener de eventos do usuÃ¡rio:', err);
       });
 
       const qHighlights = query(
@@ -208,7 +240,7 @@ export default function HomeScreen() {
         limit(30)
       );
 
-      const p2 = getDocs(qHighlights).then(snap => {
+      unsubHighlights = onSnapshot(qHighlights, (snap) => {
         const highlightsData = snap.docs.map(d => ({ id: d.id, ...d.data() } as Meeting));
         const userInterests = userProfile?.interests || [];
 
@@ -232,16 +264,18 @@ export default function HomeScreen() {
         });
 
         if (isMounted.current) setHighlights(sortedHighlights.slice(0, 5));
+        if (isMounted.current) {
+          setError(false);
+          setLoading(false);
+        }
+      }, (err) => {
+        console.error(`${STRINGS.LOG_DB_READ} [Index] Error listening to events:`, err.code, err.message);
+        if (isMounted.current) {
+          setError(true);
+          setLoading(false);
+        }
       });
 
-      Promise.all([p1, p2]).then(() => {
-        if (isMounted.current) setError(false);
-      }).catch(err => {
-        console.error(`${STRINGS.LOG_DB_READ} [Index] Error loading events:`, err.code, err.message);
-        if (isMounted.current) setError(true);
-      }).finally(() => {
-        if (isMounted.current) setLoading(false);
-      });
     });
 
     return () => {
@@ -249,6 +283,8 @@ export default function HomeScreen() {
       unsubscribeAuth();
       if (unsubConversations) unsubConversations();
       if (unsubNotifications) unsubNotifications();
+      if (unsubHighlights) unsubHighlights();
+      if (unsubMyEvents) unsubMyEvents();
     };
   }, [userProfile?.interests?.join(',')]);
 
@@ -324,10 +360,10 @@ export default function HomeScreen() {
         <>
           <View style={styles.section}>
             <View style={styles.sectionHeader}>
-              <Text style={styles.sectionTitle}>Destaques para você</Text>
+              <Text style={styles.sectionTitle}>Eventos para seus interesses</Text>
             </View>
             {userProfile?.interests && userProfile.interests.length > 0 ? (
-              <Text style={styles.interestTag}>Baseado em: {userProfile.interests.join(', ')}</Text>
+              <Text style={styles.interestTag}>Selecionados pelas suas tags: {userProfile.interests.join(', ')}</Text>
             ) : (
               <TouchableOpacity style={styles.addInterestBtn} onPress={() => router.push('/profile')}>
                 <Text style={styles.addInterestText}>+ Adicionar Interesses</Text>
@@ -392,7 +428,11 @@ export default function HomeScreen() {
 
           <View style={styles.section}>
             <View style={styles.sectionHeader}>
-              <Text style={styles.sectionTitle}>Eventos Próximos a Você</Text>
+              <Text style={styles.sectionTitle}>Eventos perto de você</Text>
+              <TouchableOpacity style={styles.refreshNearbyButton} onPress={handleRefreshNearby} disabled={refreshingNearby}>
+                <FontAwesome name="refresh" size={13} color="#4F46E5" />
+                <Text style={styles.refreshNearbyText}>{refreshingNearby ? 'Atualizando...' : 'Atualizar'}</Text>
+              </TouchableOpacity>
             </View>
             {!location ? (
               <Text style={styles.emptyText}>Permita o acesso à localização para ver eventos próximos.</Text>
@@ -540,6 +580,8 @@ const styles = StyleSheet.create({
   sectionHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 },
   sectionTitle: { fontSize: 18, fontWeight: 'bold', color: '#1f2937' },
   seeAll: { color: '#4f46e5', fontSize: 14, fontWeight: '600' },
+  refreshNearbyButton: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 6, paddingHorizontal: 10, borderRadius: 12, backgroundColor: '#EEF2FF' },
+  refreshNearbyText: { color: '#4F46E5', fontSize: 12, fontWeight: '700' },
   interestTag: { fontSize: 12, color: '#6b7280', marginBottom: 12, fontStyle: 'italic' },
   addInterestBtn: { padding: 8, backgroundColor: '#eff6ff', borderRadius: 8, alignSelf: 'flex-start', marginBottom: 12 },
   addInterestText: { color: '#2563eb', fontSize: 12, fontWeight: 'bold' },

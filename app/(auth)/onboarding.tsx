@@ -10,6 +10,7 @@ import * as ImagePicker from 'expo-image-picker';
 import { StyledButton } from '../../src/components/StyledButton';
 import { StyledInput } from '../../src/components/StyledInput';
 import { FontAwesome } from '@expo/vector-icons';
+import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { INTERESTS_OPTIONS } from '../../src/constants/Interests';
 
@@ -87,7 +88,8 @@ export default function CompleteProfileScreen() {
     };
 
     return (
-        <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+        <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
+            <ScrollView contentContainerStyle={styles.content}>
             <View style={styles.header}>
                 <Text style={styles.title}>Complete seu Perfil</Text>
                 <Text style={styles.subtitle}>Conte-nos mais sobre você para personalizarmos sua experiência.</Text>
@@ -139,7 +141,8 @@ export default function CompleteProfileScreen() {
                 onPress={handleSave}
                 isLoading={loading}
             />
-        </ScrollView>
+            </ScrollView>
+        </SafeAreaView>
     );
 }
 

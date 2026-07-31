@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { View, Text, StyleSheet, KeyboardAvoidingView, Platform, Alert, ScrollView, TouchableOpacity, Linking } from 'react-native';
 import { router, Link } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { createUserWithEmailAndPassword, updateProfile, onAuthStateChanged } from 'firebase/auth';
 import { doc, setDoc, collection, query, where, getDocs } from 'firebase/firestore';
 import { auth, db } from '../../src/services/firebaseConfig';
@@ -88,11 +89,12 @@ export default function RegisterScreen() {
     };
 
     return (
-        <KeyboardAvoidingView
-            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-            style={styles.container}
-        >
-            <ScrollView contentContainerStyle={styles.scrollContent}>
+        <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
+            <KeyboardAvoidingView
+                behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+                style={styles.container}
+            >
+                <ScrollView contentContainerStyle={styles.scrollContent}>
                 <View style={styles.header}>
                     <Text style={styles.title}>Crie sua conta</Text>
                     <Text style={styles.subtitle}>Junte-se à comunidade Reunion Hub.</Text>
@@ -156,10 +158,11 @@ export default function RegisterScreen() {
                         </Link>
                     </View>
                 </View>
-            </ScrollView>
+                </ScrollView>
             
-            <TermsModal visible={showTermsModal} onClose={() => setShowTermsModal(false)} />
-        </KeyboardAvoidingView>
+                <TermsModal visible={showTermsModal} onClose={() => setShowTermsModal(false)} />
+            </KeyboardAvoidingView>
+        </SafeAreaView>
     );
 }
 
@@ -172,6 +175,7 @@ const styles = StyleSheet.create({
         flexGrow: 1,
         justifyContent: 'center',
         padding: 24,
+        paddingBottom: 32,
     },
     header: {
         alignItems: 'center',

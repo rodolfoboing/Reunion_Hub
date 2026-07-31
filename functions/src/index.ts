@@ -68,22 +68,37 @@ export const onNewChatMessage = functions.firestore
             senderName = senderSnap.data()?.nick || senderSnap.data()?.displayName || senderName;
         }
 
-        // Fetch recipient tokens
+        // Busca os tokens e registra uma notificação interna para cada destinatário.
+        // O ID determinístico evita duplicação se o gatilho for reexecutado.
         const tokens: string[] = [];
+        const notificationsBatch = db.batch();
         for (const uid of recipientIds) {
             const userSnap = await db.collection('users').doc(uid).get();
             if (userSnap.exists) {
                 const token = userSnap.data()?.expoPushToken;
                 if (token) tokens.push(token);
             }
+            notificationsBatch.set(db.collection('notifications').doc(`chat_${context.params.messageId}_${uid}`), {
+                userId: uid,
+                type: 'chat',
+                title: `Nova mensagem de ${senderName}`,
+                body: msgData.text,
+                conversationId: context.params.conversationId,
+                fromUserId: msgData.senderId,
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                read: false
+            });
         }
 
-        await sendExpoPushNotification(
-            tokens, 
-            `Nova mensagem de ${senderName}`, 
-            msgData.text,
-            { url: `/conversation/${context.params.conversationId}` }
-        );
+        await Promise.all([
+            notificationsBatch.commit(),
+            sendExpoPushNotification(
+                tokens,
+                `Nova mensagem de ${senderName}`,
+                msgData.text,
+                { path: `/conversation/${context.params.conversationId}`, conversationId: context.params.conversationId }
+            )
+        ]);
     });
 
 // 2. Notificação de Evento Cancelado
@@ -100,7 +115,7 @@ export const onEventCancelled = functions.firestore
 
             const tokens: string[] = [];
             for (const uid of attendees) {
-                if (uid === after.creatorId) continue; // Não notificar o próprio criador
+                if (uid === after.createdBy) continue; // Não notificar o próprio criador
                 
                 const userSnap = await db.collection('users').doc(uid).get();
                 if (userSnap.exists) {
@@ -130,7 +145,7 @@ export const onFirstRSVP = functions.firestore
 
         if (beforeCount === 1 && afterCount === 2) {
             console.log(`[onFirstRSVP] Evento ${context.params.meetingId} recebeu o primeiro convidado!`);
-            const creatorId = after.creatorId;
+            const creatorId = after.createdBy;
             if (!creatorId) return;
 
             const creatorSnap = await db.collection('users').doc(creatorId).get();
@@ -147,98 +162,6 @@ export const onFirstRSVP = functions.firestore
             }
         }
     });
-
-// 4. Novo Evento (Match de Interesses)
-export const onNewEventCreated = functions.firestore
-    .document('meetings/{meetingId}')
-    .onCreate(async (snap, context) => {
-        const eventData = snap.data();
-        if (!eventData || eventData.type === 'online') return;
-
-        const eventLat = eventData.lat;
-        const eventLng = eventData.lng;
-        if (!eventLat || !eventLng) return;
-
-        console.log(`[onNewEventCreated] Analisando match de interesses para o novo evento: ${eventData.title}`);
-
-        const usersSnap = await db.collection('users').limit(500).get();
-        const tokens: string[] = [];
-
-        usersSnap.forEach(doc => {
-            const userData = doc.data();
-            if (doc.id === eventData.creatorId) return;
-
-            let match = false;
-            if (userData.interests && eventData.interests) {
-                match = eventData.interests.some((i: string) => userData.interests.includes(i));
-            }
-
-            if (match && userData.expoPushToken) {
-                tokens.push(userData.expoPushToken);
-            }
-        });
-
-        const finalTokens = tokens.slice(0, 100);
-        
-        if (finalTokens.length > 0) {
-            await sendExpoPushNotification(
-                finalTokens,
-                'Novo evento do seu interesse! 🔥',
-                `O evento "${eventData.title}" acabou de ser criado e combina com você.`,
-                { url: `/event/${context.params.meetingId}` }
-            );
-        }
-    });
-
-// 5. Lembrete de Evento (Cron Job diário a cada hora)
-export const eventReminderCron = functions.pubsub.schedule('0 * * * *').onRun(async (context) => {
-    const now = new Date();
-    const todayStr = now.toISOString().split('T')[0];
-    
-    console.log(`[eventReminderCron] Rodando verificação para a data: ${todayStr}`);
-    
-    const meetingsSnap = await db.collection('meetings')
-        .where('date', '==', todayStr)
-        .where('status', '==', 'active')
-        .get();
-
-    if (meetingsSnap.empty) return;
-
-    for (const doc of meetingsSnap.docs) {
-        const meetingData = doc.data();
-        const attendees = meetingData.attendees || [];
-        if (attendees.length === 0) continue;
-
-        if (meetingData.time) {
-            const [hours, minutes] = meetingData.time.split(':').map(Number);
-            const eventDate = new Date();
-            eventDate.setHours(hours, minutes, 0, 0);
-
-            const diffMs = eventDate.getTime() - now.getTime();
-            const diffHours = diffMs / (1000 * 60 * 60);
-
-            // Avisa se faltam entre 1 e 2 horas
-            if (diffHours > 1 && diffHours <= 2) {
-                console.log(`[eventReminderCron] Evento "${meetingData.title}" começa em breve. Disparando lembretes para ${attendees.length} pessoas.`);
-                const tokens: string[] = [];
-                for (const uid of attendees) {
-                    const userSnap = await db.collection('users').doc(uid).get();
-                    if (userSnap.exists) {
-                        const token = userSnap.data()?.expoPushToken;
-                        if (token) tokens.push(token);
-                    }
-                }
-
-                await sendExpoPushNotification(
-                    tokens,
-                    'Seu evento é hoje! ⏰',
-                    `Lembre-se: "${meetingData.title}" começa em breve. Não esqueça de fazer Check-in para ganhar reputação!`,
-                    { url: `/event/${doc.id}` }
-                );
-            }
-        }
-    }
-});
 
 function requireAuthenticated(context: functions.https.CallableContext): string {
     if (!context.auth) {
@@ -325,97 +248,6 @@ export const cancelEvent = functions.https.onCall(async (data, context) => {
         transaction.update(userRef, { reputation: admin.firestore.FieldValue.increment(-15) });
     });
 
-    return { ok: true };
-});
-
-export const completeEvent = functions.https.onCall(async (data, context) => {
-    const uid = requireAuthenticated(context);
-    const eventId = requireEventId(data);
-    const eventRef = db.collection('meetings').doc(eventId);
-    const eventSnap = await eventRef.get();
-    if (!eventSnap.exists) throw new functions.https.HttpsError('not-found', 'Evento não encontrado.');
-
-    const event = eventSnap.data()!;
-    if (event.createdBy !== uid) throw new functions.https.HttpsError('permission-denied', 'Apenas o criador pode encerrar.');
-    if (event.status === 'completed') return { ok: true, noShows: 0 };
-
-    const attendees: string[] = event.attendees || [];
-    if (attendees.length > 100) throw new functions.https.HttpsError('resource-exhausted', 'Evento excede o limite de participantes.');
-    const checkedIn = new Set<string>(event.checkedIn || []);
-    const noShows = attendees.filter(attendee => attendee !== uid && !checkedIn.has(attendee));
-    const batch = db.batch();
-    batch.update(eventRef, { status: 'completed' });
-    noShows.forEach(attendee => {
-        batch.update(db.collection('users').doc(attendee), { reputation: admin.firestore.FieldValue.increment(-20) });
-    });
-    await batch.commit();
-    return { ok: true, noShows: noShows.length };
-});
-
-function requireString(data: unknown, key: string, maxLength = 2000): string {
-    const value = data && typeof data === 'object' ? (data as Record<string, unknown>)[key] : null;
-    if (typeof value !== 'string' || !value.trim() || value.length > maxLength) {
-        throw new functions.https.HttpsError('invalid-argument', `${key} inválido.`);
-    }
-    return value.trim();
-}
-
-function isBlocked(user: FirebaseFirestore.DocumentSnapshot, otherUid: string): boolean {
-    return (user.data()?.blockedUsers || []).includes(otherUid);
-}
-
-export const startDirectConversation = functions.https.onCall(async (data, context) => {
-    const uid = requireAuthenticated(context);
-    const targetUid = requireString(data, 'targetUid', 128);
-    if (uid === targetUid) throw new functions.https.HttpsError('invalid-argument', 'Você não pode iniciar uma conversa consigo mesmo.');
-    const [currentUser, targetUser] = await Promise.all([
-        db.collection('users').doc(uid).get(), db.collection('users').doc(targetUid).get()
-    ]);
-    if (!targetUser.exists) throw new functions.https.HttpsError('not-found', 'Usuário não encontrado.');
-    if (isBlocked(currentUser, targetUid) || isBlocked(targetUser, uid)) {
-        throw new functions.https.HttpsError('permission-denied', 'Esta conversa não está disponível.');
-    }
-    const participants = [uid, targetUid].sort();
-    const conversationRef = db.collection('conversations').doc(`${participants[0]}_${participants[1]}`);
-    await conversationRef.set({
-        participants,
-        participantNames: {
-            [uid]: currentUser.data()?.nick || currentUser.data()?.displayName || 'Usuário',
-            [targetUid]: targetUser.data()?.nick || targetUser.data()?.displayName || 'Usuário'
-        },
-        lastMessage: '',
-        lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
-        unreadCounts: { [uid]: 0, [targetUid]: 0 }
-    }, { merge: true });
-    return { conversationId: conversationRef.id, name: targetUser.data()?.nick || targetUser.data()?.displayName || 'Usuário' };
-});
-
-export const sendDirectMessage = functions.https.onCall(async (data, context) => {
-    const uid = requireAuthenticated(context);
-    const conversationId = requireString(data, 'conversationId', 256);
-    const text = requireString(data, 'text');
-    const conversationRef = db.collection('conversations').doc(conversationId);
-    const conversationSnap = await conversationRef.get();
-    if (!conversationSnap.exists) throw new functions.https.HttpsError('not-found', 'Conversa não encontrada.');
-    const participants: string[] = conversationSnap.data()!.participants || [];
-    const otherUid = participants.find(participant => participant !== uid);
-    if (!otherUid || !participants.includes(uid)) throw new functions.https.HttpsError('permission-denied', 'Sem acesso a esta conversa.');
-    const [currentUser, otherUser] = await Promise.all([
-        db.collection('users').doc(uid).get(), db.collection('users').doc(otherUid).get()
-    ]);
-    if (!otherUser.exists || isBlocked(currentUser, otherUid) || isBlocked(otherUser, uid)) {
-        throw new functions.https.HttpsError('permission-denied', 'Esta conversa não está disponível.');
-    }
-    const batch = db.batch();
-    batch.create(conversationRef.collection('messages').doc(), { text, senderId: uid, createdAt: admin.firestore.FieldValue.serverTimestamp() });
-    batch.update(conversationRef, {
-        lastMessage: text,
-        lastMessageTimestamp: admin.firestore.FieldValue.serverTimestamp(),
-        lastSenderId: uid,
-        deletedBy: [],
-        [`unreadCounts.${otherUid}`]: admin.firestore.FieldValue.increment(1)
-    });
-    await batch.commit();
     return { ok: true };
 });
 

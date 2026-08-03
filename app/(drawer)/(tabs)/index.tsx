@@ -4,7 +4,7 @@ import { LinearGradient } from 'expo-linear-gradient';
 import * as Location from 'expo-location';
 import { router } from 'expo-router';
 import { onAuthStateChanged } from 'firebase/auth';
-import { collection, doc, getDoc, limit, onSnapshot, query, where, orderBy } from 'firebase/firestore';
+import { collection, doc, limit, onSnapshot, query, where, orderBy } from 'firebase/firestore';
 import { useEffect, useRef, useState } from 'react';
 import { Alert, FlatList, Image, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { auth, db } from '../../../src/services/firebaseConfig';
@@ -15,6 +15,7 @@ import { CONFIG } from '../../../src/constants/Config';
 import { normalizeDate, getTodayStr } from '../../../src/utils/dateUtils';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { ManualModal } from '../../../src/components/ManualModal';
+import { hasMatchingInterest, normalizeInterests } from '../../../src/constants/Interests';
 
 import { getDistanceFromLatLonInKm } from '../../../src/utils/distance';
 
@@ -139,6 +140,7 @@ export default function HomeScreen() {
     isMounted.current = true;
     let unsubConversations: any;
     let unsubNotifications: any;
+    let unsubUserProfile: (() => void) | undefined;
     let unsubHighlights: (() => void) | undefined;
     let unsubMyEvents: (() => void) | undefined;
 
@@ -153,7 +155,7 @@ export default function HomeScreen() {
 
       const currentUid = user.uid;
 
-      getDoc(doc(db, 'users', currentUid)).then(snap => {
+      unsubUserProfile = onSnapshot(doc(db, 'users', currentUid), (snap) => {
         if (snap.exists()) {
           setUserProfile({ uid: snap.id, ...snap.data() } as User);
         }
@@ -242,7 +244,7 @@ export default function HomeScreen() {
 
       unsubHighlights = onSnapshot(qHighlights, (snap) => {
         const highlightsData = snap.docs.map(d => ({ id: d.id, ...d.data() } as Meeting));
-        const userInterests = userProfile?.interests || [];
+        const userInterests = normalizeInterests(userProfile?.interests);
 
         const upcomingHighlights = highlightsData.filter((m) => {
           if (m.status === 'cancelled' || m.status === 'completed') return false;
@@ -256,9 +258,13 @@ export default function HomeScreen() {
 
         if (isMounted.current) setAllUpcomingEvents(upcomingHighlights);
 
-        const sortedHighlights = [...upcomingHighlights].sort((a, b) => {
-          const matchA = (a.interests || []).filter((i: string) => userInterests.includes(i)).length;
-          const matchB = (b.interests || []).filter((i: string) => userInterests.includes(i)).length;
+        const highlightsForProfile = userProfile?.showPopularOutsideInterests === false
+          ? upcomingHighlights.filter((meeting) => hasMatchingInterest([...(meeting.interests || []), meeting.theme], userInterests))
+          : upcomingHighlights;
+
+        const sortedHighlights = [...highlightsForProfile].sort((a, b) => {
+          const matchA = hasMatchingInterest([...(a.interests || []), a.theme], userInterests) ? 1 : 0;
+          const matchB = hasMatchingInterest([...(b.interests || []), b.theme], userInterests) ? 1 : 0;
           if (matchA !== matchB) return matchB - matchA;
           return (b.attendees?.length || 0) - (a.attendees?.length || 0);
         });
@@ -283,10 +289,11 @@ export default function HomeScreen() {
       unsubscribeAuth();
       if (unsubConversations) unsubConversations();
       if (unsubNotifications) unsubNotifications();
+      if (unsubUserProfile) unsubUserProfile();
       if (unsubHighlights) unsubHighlights();
       if (unsubMyEvents) unsubMyEvents();
     };
-  }, [userProfile?.interests?.join(',')]);
+  }, [userProfile?.interests?.join(','), userProfile?.showPopularOutsideInterests]);
 
   const renderEventCard = ({ item }: { item: Meeting }) => (
     <TouchableOpacity style={styles.eventCard} onPress={() => router.push(`/event/${item.id}` as never)}>

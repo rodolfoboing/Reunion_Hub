@@ -12,7 +12,7 @@ import { StyledInput } from '../../src/components/StyledInput';
 import { FontAwesome } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-import { INTERESTS_OPTIONS } from '../../src/constants/Interests';
+import { INTERESTS_OPTIONS, normalizeInterests } from '../../src/constants/Interests';
 
 export default function CompleteProfileScreen() {
     const [bio, setBio] = useState('');
@@ -67,7 +67,7 @@ export default function CompleteProfileScreen() {
             const userRef = doc(db, 'users', auth.currentUser.uid);
             await updateDoc(userRef, {
                 bio,
-                interests: selectedInterests,
+                interests: normalizeInterests(selectedInterests),
                 photoURL: uploadedPhotoUrl,
                 isProfileComplete: true
             });

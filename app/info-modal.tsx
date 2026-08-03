@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { StyleSheet, View, Text, Alert, ScrollView, Platform, KeyboardAvoidingView } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { router } from 'expo-router';
 import { addDoc, collection } from 'firebase/firestore';
 import { db, auth } from '../src/services/firebaseConfig';
@@ -23,6 +24,20 @@ export default function CreateMeetingScreen() {
 
     if (!auth.currentUser) {
       Alert.alert('Erro', 'Você precisa estar logado.');
+      return;
+    }
+
+    try {
+      await auth.currentUser.reload();
+      await auth.currentUser.getIdToken(true);
+    } catch (verificationError) {
+      console.error('[CreateMeeting] Não foi possível atualizar a verificação de e-mail:', verificationError);
+      Alert.alert('Verificação necessária', 'Não foi possível confirmar seu e-mail agora. Tente novamente em instantes.');
+      return;
+    }
+
+    if (!auth.currentUser.emailVerified) {
+      Alert.alert('Verifique seu e-mail', 'Confirme seu e-mail antes de criar um evento.');
       return;
     }
 
@@ -52,6 +67,7 @@ export default function CreateMeetingScreen() {
   };
 
   return (
+    <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
     <KeyboardAvoidingView
       behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
       style={styles.container}
@@ -100,6 +116,7 @@ export default function CreateMeetingScreen() {
       </ScrollView>
       <StatusBar style={Platform.OS === 'ios' ? 'light' : 'auto'} />
     </KeyboardAvoidingView>
+    </SafeAreaView>
   );
 }
 

@@ -1,7 +1,8 @@
 import { useLocalSearchParams, router, Stack } from 'expo-router';
 import { View, Text, StyleSheet, ScrollView, Alert, ActivityIndicator, TouchableOpacity, Linking } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { useEffect, useState, useRef } from 'react';
-import { doc, getDoc, updateDoc, arrayUnion, increment, addDoc, collection, writeBatch, serverTimestamp } from 'firebase/firestore';
+import { doc, getDoc, addDoc, collection, serverTimestamp } from 'firebase/firestore';
 import { httpsCallable } from 'firebase/functions';
 import { db, auth, functions } from '../../src/services/firebaseConfig';
 import { Meeting } from '../../src/types';
@@ -11,6 +12,7 @@ import { FontAwesome } from '@expo/vector-icons';
 import { normalizeDate, getTodayStr } from '../../src/utils/dateUtils';
 import { scheduleEventReminder, cancelEventReminder } from '../../src/utils/Notifications';
 import { ReportReasonModal } from '@/src/components/ReportReasonModal';
+import { markRelatedNotificationsAsRead } from '@/src/services/notificationReadService';
 
 // Helper para verificar se hoje é o dia do evento
 const isEventDay = (eventDate: string | undefined): boolean => {
@@ -35,14 +37,16 @@ const formatDateDisplay = (dateString: string | undefined): string => {
 };
 
 export default function MeetingDetailsScreen() {
-    const { id } = useLocalSearchParams();
+    const { id, notificationType } = useLocalSearchParams<{ id?: string; notificationType?: string }>();
     const [meeting, setMeeting] = useState<Meeting | null>(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(false);
     const [rsvpLoading, setRsvpLoading] = useState(false);
     const [checkInLoading, setCheckInLoading] = useState(false);
     const [showReportReasonModal, setShowReportReasonModal] = useState(false);
+    const [creatorName, setCreatorName] = useState('Usuário');
     const isMounted = useRef(true);
+    const hasShownLinkIssueNotice = useRef(false);
 
     useEffect(() => {
         isMounted.current = true;
@@ -51,6 +55,37 @@ export default function MeetingDetailsScreen() {
             isMounted.current = false;
         };
     }, [id]);
+
+    useEffect(() => {
+        if (!meeting?.createdBy) return;
+        let active = true;
+        markRelatedNotificationsAsRead({ meetingId: meeting.id }).catch((notificationError) => {
+            console.error('[Event] Erro ao marcar notificações como lidas:', notificationError);
+        });
+
+        getDoc(doc(db, 'users', meeting.createdBy)).then((creatorSnapshot) => {
+            if (!active) return;
+            const profile = creatorSnapshot.data();
+            setCreatorName(profile?.nick || profile?.displayName || meeting.creatorName || 'Usuário');
+        }).catch((creatorError) => {
+            console.error('[Event] Erro ao carregar criador do evento:', creatorError);
+            if (active) setCreatorName(meeting.creatorName || 'Usuário');
+        });
+
+        return () => { active = false; };
+    }, [meeting?.createdBy, meeting?.creatorName, meeting?.id]);
+
+    useEffect(() => {
+        const isCreator = auth.currentUser?.uid === meeting?.createdBy;
+        if (hasShownLinkIssueNotice.current || notificationType !== 'online_access_issue' || meeting?.type !== 'online' || !isCreator) return;
+
+        hasShownLinkIssueNotice.current = true;
+        Alert.alert(
+            'Participante relatou problema de acesso',
+            'Uma pessoa informou que não conseguiu abrir o link desta reunião. Alguns serviços liberam o acesso apenas perto do horário, mas confira se o link continua correto e acessível aos participantes.',
+            [{ text: 'Entendi' }]
+        );
+    }, [meeting?.createdBy, meeting?.type, notificationType]);
 
     const fetchMeeting = async () => {
         if (!isMounted.current) return;
@@ -169,54 +204,15 @@ export default function MeetingDetailsScreen() {
                     onPress: async () => {
                         setLoading(true);
                         try {
-                            if (!meeting) return;
-                            const attendees = meeting.attendees || [];
-                            const checkedIn = meeting.checkedIn || [];
-                            
-                            // Encontrar Faltosos (No-Show) excluindo o organizador
-                            const noShows = attendees.filter((uid: string) => !checkedIn.includes(uid) && uid !== meeting.createdBy);
-                            
-                            // Punir Faltosos (-20 rep) em Batch
-                            if (noShows.length > 0) {
-                                const batch = writeBatch(db);
-                                noShows.forEach((uid: string) => {
-                                    const userRef = doc(db, 'users', uid);
-                                    batch.update(userRef, { reputation: increment(-20) });
-                                });
-                                await batch.commit().catch(e => console.log('Erro ao punir em batch:', e));
-                            }
-
-                            // Atualizar evento para status completed
-                            const meetingRef = doc(db, 'meetings', id as string);
-                            await updateDoc(meetingRef, {
-                                status: 'completed'
-                            });
-
-                            // --- LÓGICA DE PIONEIRISMO (FUNDADOR) ---
-                            if (meeting.placeId) {
-                                const placeRef = doc(db, 'places', meeting.placeId);
-                                const placeSnap = await getDoc(placeRef);
-                                if (placeSnap.exists() && !placeSnap.data().founderId) {
-                                    // O primeiro a concluir um evento vira o fundador
-                                    await updateDoc(placeRef, {
-                                        founderId: auth.currentUser?.uid,
-                                        founderName: auth.currentUser?.displayName || 'Pioneiro'
-                                    });
-
-                                    // Atualiza o contador de fundações do usuário no db
-                                    const userRefCreator = doc(db, 'users', auth.currentUser?.uid || '');
-                                    await updateDoc(userRefCreator, {
-                                        foundedPlacesCount: increment(1)
-                                    });
-                                    Alert.alert('🌟 Você é um Fundador!', 'Parabéns! Você realizou o primeiro evento neste local e agora tem o título de Fundador Oficial deste espaço!');
-                                } else {
-                                    Alert.alert('Concluído', `Evento encerrado! ${noShows.length} faltosos foram penalizados.`);
-                                }
+                            const completeEvent = httpsCallable<{ eventId: string }, { noShows: number; becameFounder: boolean; alreadyCompleted: boolean }>(functions, 'completeEvent');
+                            const result = await completeEvent({ eventId: id as string });
+                            if (result.data.alreadyCompleted) {
+                                Alert.alert('Evento já encerrado', 'Este evento já havia sido finalizado.');
+                            } else if (result.data.becameFounder) {
+                                Alert.alert('🌟 Você é um Fundador!', 'Parabéns! Você realizou o primeiro evento neste local e agora tem o título de Fundador Oficial deste espaço!');
                             } else {
-                                Alert.alert('Concluído', `Evento encerrado! ${noShows.length} faltosos foram penalizados.`);
+                                Alert.alert('Concluído', `Evento encerrado! ${result.data.noShows} faltoso(s) foram penalizados.`);
                             }
-                            // ----------------------------------------
-
                             fetchMeeting();
                         } catch (error) {
                             Alert.alert('Erro', 'Falha ao encerrar evento.');
@@ -327,7 +323,8 @@ export default function MeetingDetailsScreen() {
     return (
         <>
             <Stack.Screen options={{ title: 'Detalhes do Evento', headerBackTitle: 'Voltar' }} />
-            <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+            <SafeAreaView style={styles.container} edges={['bottom']}>
+            <ScrollView contentContainerStyle={styles.content}>
                 <Text style={styles.theme}>{meeting.theme}</Text>
                 <Text style={styles.title}>{meeting.title}</Text>
 
@@ -338,11 +335,11 @@ export default function MeetingDetailsScreen() {
                         onPress={() => router.push(`/public-profile/${meeting.createdBy}` as never)}
                     >
                         <View style={styles.creatorAvatar}>
-                            <Text style={{color: '#fff', fontWeight: 'bold'}}>{(meeting as any).creatorName?.charAt(0) || 'U'}</Text>
+                            <Text style={{color: '#fff', fontWeight: 'bold'}}>{creatorName.charAt(0).toUpperCase()}</Text>
                         </View>
                         <View>
                             <Text style={styles.creatorLabel}>Organizado por</Text>
-                            <Text style={styles.creatorName}>{(meeting as any).creatorName || 'Usuário'}</Text>
+                            <Text style={styles.creatorName}>{creatorName}</Text>
                         </View>
                         <FontAwesome name="chevron-right" size={16} color="#9ca3af" style={{ marginLeft: 'auto' }} />
                     </TouchableOpacity>
@@ -505,6 +502,7 @@ export default function MeetingDetailsScreen() {
                 )}
             </View>
             </ScrollView>
+            </SafeAreaView>
             <ReportReasonModal
                 visible={showReportReasonModal}
                 targetType="event"

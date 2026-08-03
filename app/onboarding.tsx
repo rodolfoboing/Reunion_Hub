@@ -7,7 +7,7 @@ import * as Location from 'expo-location';
 import * as ImagePicker from 'expo-image-picker';
 import { doc, updateDoc, getDoc, arrayUnion, setDoc } from 'firebase/firestore';
 import { auth, db } from '../src/services/firebaseConfig';
-import { INTERESTS_OPTIONS } from '../src/constants/Interests';
+import { INTERESTS_OPTIONS, normalizeInterests } from '../src/constants/Interests';
 import { fetchNearbyPlaces, mapOsmToPlace } from '../src/services/osmService';
 import { Place } from '../src/types';
 
@@ -138,7 +138,7 @@ export default function OnboardingScreen() {
             // 1. Update Profile (Photo/Bio/Interests)
             const userRef = doc(db, 'users', user.uid);
             await updateDoc(userRef, {
-                interests: selectedInterests,
+                interests: normalizeInterests(selectedInterests),
                 bio: bio.trim(),
                 photoURL: photoURI || user.photoURL, // Note: In a real app we'd upload to Storage first. We'll just save the local URI for MVP or skip if null.
                 isProfileComplete: true

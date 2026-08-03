@@ -2,7 +2,7 @@ import { View, Text, StyleSheet, ScrollView, Alert, TouchableOpacity, Image, Tex
 import { useState, useEffect } from 'react';
 import { auth, db, functions } from '../../src/services/firebaseConfig';
 import { httpsCallable } from 'firebase/functions';
-import { doc, getDoc, setDoc, collection, query, where, getDocs, deleteDoc } from 'firebase/firestore';
+import { doc, setDoc, collection, query, where, getDocs, deleteDoc, onSnapshot } from 'firebase/firestore';
 import { updateProfile, deleteUser, sendEmailVerification } from 'firebase/auth';
 import { storage } from '../../src/services/firebaseConfig';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
@@ -14,7 +14,7 @@ import { ManualModal } from '@/src/components/ManualModal';
 import { router } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-import { INTERESTS_OPTIONS } from '../../src/constants/Interests';
+import { INTERESTS_OPTIONS, normalizeInterests } from '../../src/constants/Interests';
 
 export default function ProfileScreen() {
     const [userProfile, setUserProfile] = useState<any>(null);
@@ -23,6 +23,7 @@ export default function ProfileScreen() {
     const [editNick, setEditNick] = useState('');
     const [editInterests, setEditInterests] = useState<string[]>([]);
     const [shareFrequentedPlaces, setShareFrequentedPlaces] = useState(false);
+    const [showPopularOutsideInterests, setShowPopularOutsideInterests] = useState(true);
     const [editPhotoURL, setEditPhotoURL] = useState<string | null>(null);
     const [loading, setLoading] = useState(false);
     const [showTermsModal, setShowTermsModal] = useState(false);
@@ -32,12 +33,14 @@ export default function ProfileScreen() {
     const [checkingEmailVerification, setCheckingEmailVerification] = useState(false);
 
     useEffect(() => {
-        if (auth.currentUser) {
-            const docRef = doc(db, 'users', auth.currentUser.uid);
-            getDoc(docRef).then(snap => {
+        const user = auth.currentUser;
+        if (!user) return;
+
+        const docRef = doc(db, 'users', user.uid);
+        return onSnapshot(docRef, (snap) => {
                 if (snap.exists()) {
                     const data = snap.data();
-                    setUserProfile(data);
+                    setUserProfile({ ...data, interests: normalizeInterests(data.interests) });
                     // Default nick to display name part if not set (fallback)
                     if (!data.nick && auth.currentUser?.displayName) {
                         setEditNick(auth.currentUser.displayName.replace(/\s/g, '').toLowerCase());
@@ -45,8 +48,9 @@ export default function ProfileScreen() {
                         setEditNick(data.nick || '');
                     }
                 }
+            }, (profileError) => {
+                console.error('[Profile] Erro ao atualizar perfil:', profileError);
             });
-        }
     }, []);
 
     const refreshEmailVerification = async () => {
@@ -82,8 +86,9 @@ export default function ProfileScreen() {
     const startEditing = () => {
         setEditBio(userProfile?.bio || '');
         setEditNick(userProfile?.nick || auth.currentUser?.displayName?.replace(/\s/g, '').toLowerCase() || '');
-        setEditInterests(userProfile?.interests || []);
+        setEditInterests(normalizeInterests(userProfile?.interests));
         setShareFrequentedPlaces(userProfile?.shareFrequentedPlaces === true);
+        setShowPopularOutsideInterests(userProfile?.showPopularOutsideInterests !== false);
         setEditPhotoURL(userProfile?.photoURL || auth.currentUser?.photoURL || null);
         setIsEditing(true);
     };
@@ -182,13 +187,16 @@ export default function ProfileScreen() {
                 finalPhotoURL = await uploadImageAsync(editPhotoURL);
             }
 
+            const normalizedInterests = normalizeInterests(editInterests);
+
             // Update local state immediately
             setUserProfile({
                 ...userProfile,
                 nick: editNick.trim(),
                 bio: editBio,
-                interests: editInterests,
+                interests: normalizedInterests,
                 shareFrequentedPlaces,
+                showPopularOutsideInterests,
                 photoURL: finalPhotoURL,
                 searchName: searchName
             });
@@ -204,8 +212,9 @@ export default function ProfileScreen() {
             await setDoc(docRef, {
                 nick: editNick.trim(),
                 bio: editBio,
-                interests: editInterests,
+                interests: normalizedInterests,
                 shareFrequentedPlaces,
+                showPopularOutsideInterests,
                 searchName: searchName,
                 displayName: editNick.trim(),
                 photoURL: finalPhotoURL
@@ -384,7 +393,7 @@ export default function ProfileScreen() {
                 <View style={styles.statItem}>
                     <FontAwesome name="calendar-check-o" size={24} color="#6366f1" />
                     <Text style={styles.statValue}>{userProfile?.eventsAttended || 0}</Text>
-                    <Text style={styles.statLabel}>Eventos</Text>
+                    <Text style={styles.statLabel}>Participações</Text>
                 </View>
                 <View style={styles.divider} />
                 <View style={styles.statItem}>
@@ -424,7 +433,7 @@ export default function ProfileScreen() {
                 </View>
             </View>
 
-            <View style={styles.section}>
+            {isEditing && <View style={styles.section}>
                 <Text style={styles.sectionTitle}>Privacidade</Text>
                 <View style={styles.privacyRow}>
                     <View style={styles.privacyTextContainer}>
@@ -434,13 +443,23 @@ export default function ProfileScreen() {
                     <Switch
                         value={shareFrequentedPlaces}
                         onValueChange={setShareFrequentedPlaces}
-                        disabled={!isEditing}
                         trackColor={{ false: '#D1D5DB', true: '#A5B4FC' }}
                         thumbColor={shareFrequentedPlaces ? '#4F46E5' : '#F9FAFB'}
                     />
                 </View>
-                {!isEditing && <Text style={styles.privacyHint}>Toque em “Editar Perfil” para alterar esta preferência.</Text>}
-            </View>
+                <View style={styles.privacyRow}>
+                    <View style={styles.privacyTextContainer}>
+                        <Text style={styles.privacyTitle}>Eventos populares fora dos meus interesses</Text>
+                        <Text style={styles.privacyDescription}>Inclui destaques populares próximos mesmo quando não combinam com suas tags.</Text>
+                    </View>
+                    <Switch
+                        value={showPopularOutsideInterests}
+                        onValueChange={setShowPopularOutsideInterests}
+                        trackColor={{ false: '#D1D5DB', true: '#A5B4FC' }}
+                        thumbColor={showPopularOutsideInterests ? '#4F46E5' : '#F9FAFB'}
+                    />
+                </View>
+            </View>}
 
             {!isEditing && (
             <View style={styles.section}>

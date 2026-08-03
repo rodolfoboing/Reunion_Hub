@@ -12,6 +12,8 @@ import { auth, db } from '../src/services/firebaseConfig'; // Import auth
 import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { useColorScheme } from '@/src/components/useColorScheme';
 import { getNotificationRoute, setupNotifications } from '../src/utils/Notifications';
+import { getNotificationTarget } from '../src/utils/Notifications';
+import { markRelatedNotificationsAsRead } from '../src/services/notificationReadService';
 import { ErrorBoundary as CustomErrorBoundary } from '../src/components/ErrorBoundary';
 
 export {
@@ -137,7 +139,16 @@ export default function RootLayout() {
     if (!loaded || !authInitialized) return;
 
     const handleNotificationResponse = async (response: Notifications.NotificationResponse) => {
-      const route = getNotificationRoute(response.notification.request.content.data);
+      const notificationData = response.notification.request.content.data;
+      const route = getNotificationRoute(notificationData);
+      const target = getNotificationTarget(notificationData);
+      if (target) {
+        try {
+          await markRelatedNotificationsAsRead(target);
+        } catch (error) {
+          console.error('[ReunionHub Debug] Erro ao marcar notificação do push como lida:', error);
+        }
+      }
       if (route) {
         console.log('[ReunionHub Debug] Abrindo notificação para:', route);
         router.push(route as never);

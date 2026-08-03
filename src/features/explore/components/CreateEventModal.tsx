@@ -3,9 +3,9 @@ import { View, Text, StyleSheet, TouchableOpacity, Modal, TextInput, ScrollView,
 import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import DateTimePicker from '@react-native-community/datetimepicker';
-import { collection, addDoc, doc, setDoc, updateDoc, arrayUnion, writeBatch } from 'firebase/firestore';
+import { collection, addDoc, doc, setDoc, updateDoc, arrayUnion, writeBatch, getDoc } from 'firebase/firestore';
 import { db, auth } from '@/src/services/firebaseConfig';
-import { INTERESTS_OPTIONS } from '@/src/constants/Interests';
+import { INTERESTS_OPTIONS, normalizeInterests } from '@/src/constants/Interests';
 import { CONFIG } from '@/src/constants/Config';
 
 interface CreateEventModalProps {
@@ -49,8 +49,23 @@ export function CreateEventModal({
 
 
     const handleCreateEvent = async () => {
-        if (!auth.currentUser) {
+        const currentUser = auth.currentUser;
+        if (!currentUser) {
             Alert.alert('Sessão Expirada', 'Por favor, faça login novamente para criar um evento.');
+            return;
+        }
+
+        try {
+            await currentUser.reload();
+            await currentUser.getIdToken(true);
+        } catch (error) {
+            console.error('[CreateEvent] Não foi possível atualizar a verificação de e-mail:', error);
+            Alert.alert('Verificação necessária', 'Não foi possível confirmar seu e-mail agora. Tente novamente em instantes.');
+            return;
+        }
+
+        if (!currentUser.emailVerified) {
+            Alert.alert('Verifique seu e-mail', 'Confirme seu e-mail antes de criar um evento. Você pode enviar ou conferir o link de verificação na tela de Perfil.');
             return;
         }
 
@@ -76,8 +91,17 @@ export function CreateEventModal({
                 {
                     text: 'Assumo a Responsabilidade',
                     onPress: async () => {
+                        const creatorId = auth.currentUser?.uid;
+                        if (!creatorId) {
+                            Alert.alert('Erro', 'Faça login para criar um evento.');
+                            return;
+                        }
                         setSubmitting(true);
                         try {
+                            const creatorProfile = await getDoc(doc(db, 'users', creatorId));
+                            const creatorData = creatorProfile.data();
+                            const creatorName = creatorData?.nick || creatorData?.displayName || auth.currentUser?.displayName || 'Usuário';
+                            const normalizedInterests = normalizeInterests(newMeeting.interests);
                             const baseDate = new Date(`${newMeeting.date}T${newMeeting.time}:00`);
                             const batch = writeBatch(db);
                             const seriesId = doc(collection(db, 'meetings')).id; // Gerar um ID de série
@@ -94,19 +118,20 @@ export function CreateEventModal({
                                 const newDocRef = doc(collection(db, 'meetings'));
                                 batch.set(newDocRef, {
                                     ...newMeeting,
+                                    interests: normalizedInterests,
                                     date: dateStr,
-                                    theme: newMeeting.interests[0],
+                                    theme: normalizedInterests[0],
                                     type: eventType,
                                     meetingLink: eventType === 'online' ? newMeeting.meetingLink : '',
                                     lat: eventType === 'in-person' ? newMeeting.lat : null,
                                     lng: eventType === 'in-person' ? newMeeting.lng : null,
                                     placeId: eventType === 'in-person' ? newMeeting.placeId : '',
-                                    createdBy: auth.currentUser?.uid || 'anonymous',
-                                    creatorName: auth.currentUser?.displayName || 'Usuário',
+                                    createdBy: creatorId,
+                                    creatorName,
                                     createdAt: new Date().toISOString(),
                                     isRepeated: repeatCount > 0,
                                     seriesId: repeatCount > 0 ? seriesId : null,
-                                    attendees: [auth.currentUser?.uid],
+                                    attendees: [creatorId],
                                 });
                             }
 

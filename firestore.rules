@@ -6,6 +6,10 @@ service cloud.firestore {
       return request.auth != null;
     }
 
+    function hasVerifiedEmail() {
+      return isAuthenticated() && request.auth.token.email_verified == true;
+    }
+
     function isOwner(userId) {
       return isAuthenticated() && request.auth.uid == userId;
     }
@@ -32,7 +36,8 @@ service cloud.firestore {
     // Cloud Functions before this rule can be narrowed further.
     match /meetings/{meetingId} {
       allow read: if true;
-      allow write: if isAuthenticated();
+      allow create: if hasVerifiedEmail();
+      allow update, delete: if false;
     }
 
     // Conversations and messages are visible only to their participants.

@@ -14,6 +14,8 @@ import { db, auth } from '../../src/services/firebaseConfig';
 import { FontAwesome } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import { StyledButton } from '@/src/components/StyledButton';
+import { normalizeInterests } from '@/src/constants/Interests';
+import { SafeAreaView } from 'react-native-safe-area-context';
 
 interface UserProfile {
     displayName: string;
@@ -50,7 +52,7 @@ export default function UserProfileScreen() {
 
             if (userSnap.exists()) {
                 const userData = userSnap.data() as UserProfile;
-                setProfile(userData);
+                setProfile({ ...userData, interests: normalizeInterests(userData.interests) });
 
                 if (!userData.shareFrequentedPlaces) {
                     setFrequentedPlaces([]);
@@ -156,7 +158,7 @@ export default function UserProfileScreen() {
     }
 
     return (
-        <View style={styles.container}>
+        <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
             <Stack.Screen options={{ headerShown: false }} />
             {/* Header com ação de voltar */}
             <View style={styles.header}>
@@ -220,7 +222,7 @@ export default function UserProfileScreen() {
                     <View style={styles.statItem}>
                         <FontAwesome name="calendar-check-o" size={24} color="#6366f1" />
                         <Text style={styles.statValue}>{profile.eventsAttended || 0}</Text>
-                        <Text style={styles.statLabel}>Eventos</Text>
+                        <Text style={styles.statLabel}>Participações</Text>
                     </View>
                     <View style={styles.divider} />
                     <View style={styles.statItem}>
@@ -301,7 +303,7 @@ export default function UserProfileScreen() {
 
                 <View style={{ height: 40 }} />
             </ScrollView>
-        </View>
+        </SafeAreaView>
     );
 }
 

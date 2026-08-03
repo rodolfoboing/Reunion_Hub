@@ -13,6 +13,7 @@ import { STRINGS } from '../../../src/constants/strings';
 import { CONFIG } from '../../../src/constants/Config';
 import { normalizeDate, getTodayStr } from '../../../src/utils/dateUtils';
 import { auth, db } from '../../../src/services/firebaseConfig';
+import { hasMatchingInterest, normalizeInterests } from '../../../src/constants/Interests';
 
 if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
     UIManager.setLayoutAnimationEnabledExperimental(true);
@@ -28,8 +29,7 @@ const getDateAfterDays = (days: number) => {
 
 const matchesUserInterest = (event: Pick<Meeting, 'interests' | 'theme'>, interests: string[]) => {
     if (interests.length === 0) return false;
-    return event.interests?.some((interest) => interests.includes(interest))
-        || (typeof event.theme === 'string' && interests.includes(event.theme));
+    return hasMatchingInterest([...(event.interests || []), event.theme], interests);
 };
 
 // Configure Locale for Calendar
@@ -128,6 +128,7 @@ export default function AgendaScreen() {
     const [filteredEvents, setFilteredEvents] = useState<any[]>([]);
     const [favorites, setFavorites] = useState<string[]>([]);
     const [userInterests, setUserInterests] = useState<string[]>([]);
+    const [showPopularOutsideInterests, setShowPopularOutsideInterests] = useState(true);
     const [userLocation, setUserLocation] = useState<Location.LocationObject | null>(null);
     const [markedDates, setMarkedDates] = useState<any>({});
     const [selectedDate, setSelectedDate] = useState('');
@@ -153,7 +154,8 @@ export default function AgendaScreen() {
                     unsubProfile = onSnapshot(doc(db, 'users', user.uid), (snap) => {
                         if (snap.exists() && isMounted.current) {
                             setFavorites(snap.data().favorites || []);
-                            setUserInterests(snap.data().interests || []);
+                            setUserInterests(normalizeInterests(snap.data().interests));
+                            setShowPopularOutsideInterests(snap.data().showPopularOutsideInterests !== false);
                         }
                     });
                 }
@@ -180,7 +182,7 @@ export default function AgendaScreen() {
 
     useEffect(() => {
         fetchEvents();
-    }, [activeTab, favorites.length, selectedDate, userLocation, userInterests.join(','), refreshKey]);
+    }, [activeTab, favorites.length, selectedDate, userLocation, userInterests.join(','), showPopularOutsideInterests, refreshKey]);
 
     useEffect(() => {
         if (allRecs.length === 0) return;
@@ -200,7 +202,8 @@ export default function AgendaScreen() {
             finalRecs = finalRecs.filter((e: any) => {
                 const matchesInterest = matchesUserInterest(e, userInterests);
                 const matchesHistory = historyTitles.includes(e.title);
-                return matchesInterest || matchesHistory;
+                const isPopular = (e.attendees?.length || 0) >= CONFIG.POPULAR_ATTENDEES_COUNT;
+                return matchesInterest || matchesHistory || (showPopularOutsideInterests && isPopular);
             });
         }
 
@@ -219,7 +222,7 @@ export default function AgendaScreen() {
         }
 
         setRecommendations(finalRecs.slice(0, 10));
-    }, [allRecs, userInterests, historyTitles, userLocation]);
+    }, [allRecs, userInterests, historyTitles, userLocation, showPopularOutsideInterests]);
 
     const fetchEvents = async () => {
         const currentUid = auth.currentUser?.uid;
@@ -356,7 +359,7 @@ export default function AgendaScreen() {
                     const isRecommended = !!matchesInterest;
                     if (!isPopular && !isRecommended) return;
                     if (!marks[event.date]) marks[event.date] = { mine: false, recurring: false, popular: false, recommended: false, past: false, hasEvent: true };
-                    if (isPopular) marks[event.date].popular = true;
+                    if (isPopular && (showPopularOutsideInterests || matchesInterest)) marks[event.date].popular = true;
                     if (isRecommended) marks[event.date].recommended = true;
                 });
                 setMarkedDates(marks);
@@ -783,7 +786,7 @@ export default function AgendaScreen() {
 
             {/* Modal de Ações da Agenda */}
             <Modal visible={!!selectedEvent} animationType="slide" transparent={true} onRequestClose={() => setSelectedEvent(null)}>
-                <View style={styles.modalOverlay}>
+                <SafeAreaView style={styles.modalOverlay} edges={['bottom']}>
                     <View style={styles.modalContent}>
                         <View style={styles.modalHandle} />
                         <Text style={styles.modalTitle} numberOfLines={2}>{selectedEvent?.title}</Text>
@@ -828,7 +831,7 @@ export default function AgendaScreen() {
                             <Text style={styles.modalCancelText}>Fechar Menu</Text>
                         </Pressable>
                     </View>
-                </View>
+                </SafeAreaView>
             </Modal>
         </SafeAreaView>
     );

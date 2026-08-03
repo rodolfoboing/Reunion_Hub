@@ -1,5 +1,6 @@
 export interface User {
     uid: string;
+    nick?: string;
     displayName?: string;
     email?: string;
     photoURL?: string;
@@ -7,6 +8,7 @@ export interface User {
     eventsAttended?: number;
     foundedPlacesCount?: number;
     interests?: string[];
+    showPopularOutsideInterests?: boolean;
     blockedUsers?: string[];
 }
 
@@ -25,6 +27,7 @@ export interface Meeting {
     meetingLink?: string;
     placeId?: string;
     createdBy?: string;
+    creatorName?: string;
     createdAt?: string;
     isRepeated?: boolean;
     attendees?: string[];

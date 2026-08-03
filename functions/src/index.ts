@@ -231,6 +231,66 @@ export const checkInToEvent = functions.https.onCall(async (data, context) => {
     return { ok: true };
 });
 
+type CompleteEventResult = {
+    noShows: number;
+    becameFounder: boolean;
+    alreadyCompleted: boolean;
+};
+
+// Completion is a single trusted transaction so status, penalties and pioneer data
+// cannot be partially applied or race with another event at the same place.
+export const completeEvent = functions.https.onCall(async (data, context): Promise<CompleteEventResult> => {
+    const uid = requireAuthenticated(context);
+    const eventId = requireEventId(data);
+    const eventRef = db.collection('meetings').doc(eventId);
+    const creatorRef = db.collection('users').doc(uid);
+
+    return db.runTransaction(async (transaction) => {
+        const eventSnap = await transaction.get(eventRef);
+        if (!eventSnap.exists) throw new functions.https.HttpsError('not-found', 'Evento não encontrado.');
+
+        const event = eventSnap.data()!;
+        if (event.createdBy !== uid) {
+            throw new functions.https.HttpsError('permission-denied', 'Apenas o criador pode encerrar este evento.');
+        }
+        if (event.status === 'completed') {
+            return { noShows: 0, becameFounder: false, alreadyCompleted: true };
+        }
+        if (event.status === 'cancelled') {
+            throw new functions.https.HttpsError('failed-precondition', 'Um evento cancelado não pode ser encerrado.');
+        }
+
+        const attendees = Array.isArray(event.attendees) ? event.attendees : [];
+        const checkedIn = new Set(Array.isArray(event.checkedIn) ? event.checkedIn : []);
+        const noShows = [...new Set(attendees)].filter((attendeeId) => attendeeId !== uid && !checkedIn.has(attendeeId));
+
+        const placeRef = typeof event.placeId === 'string' && event.placeId
+            ? db.collection('places').doc(event.placeId)
+            : null;
+        const placeSnap = placeRef ? await transaction.get(placeRef) : null;
+        const becameFounder = Boolean(placeRef && placeSnap?.exists && !placeSnap.data()?.founderId);
+
+        transaction.update(eventRef, { status: 'completed' });
+        noShows.forEach((attendeeId) => {
+            transaction.update(db.collection('users').doc(attendeeId), {
+                reputation: admin.firestore.FieldValue.increment(-20),
+            });
+        });
+
+        if (becameFounder && placeRef) {
+            transaction.update(placeRef, {
+                founderId: uid,
+                founderName: typeof event.creatorName === 'string' ? event.creatorName : 'Fundador',
+            });
+            transaction.update(creatorRef, {
+                foundedPlacesCount: admin.firestore.FieldValue.increment(1),
+            });
+        }
+
+        return { noShows: noShows.length, becameFounder, alreadyCompleted: false };
+    });
+});
+
 export const cancelEvent = functions.https.onCall(async (data, context) => {
     const uid = requireAuthenticated(context);
     const eventId = requireEventId(data);

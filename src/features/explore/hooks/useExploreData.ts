@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import * as Location from 'expo-location';
 import { collection, onSnapshot, query, where, limit, getDocs, orderBy } from 'firebase/firestore';
 import { db } from '@/src/services/firebaseConfig';
@@ -11,11 +11,15 @@ const toFiniteCoordinate = (value: unknown): number | undefined => {
     return Number.isFinite(coordinate) ? coordinate : undefined;
 };
 
-export function useExploreData() {
+const OSM_SEARCH_DELTA = 0.02;
+
+export function useExploreData(loadOsmPlaces: boolean) {
     const [location, setLocation] = useState<Location.LocationObject | null>(null);
     const [meetings, setMeetings] = useState<Meeting[]>([]);
-    const [places, setPlaces] = useState<Place[]>([]);
+    const [databasePlaces, setDatabasePlaces] = useState<Place[]>([]);
+    const [osmPlaces, setOsmPlaces] = useState<Place[]>([]);
     const [loading, setLoading] = useState(true);
+    const osmCache = useRef(new Map<string, Place[]>());
 
     useEffect(() => {
         let isActive = true;
@@ -81,39 +85,67 @@ export function useExploreData() {
 
     useEffect(() => {
         if (!location) return;
-        const fetchPlaces = async () => {
+        let active = true;
+        const fetchDatabasePlaces = async () => {
             try {
-                const lat = location.coords.latitude;
-                const lon = location.coords.longitude;
-                const delta = 0.05;
-                
-                // Fetch DB Places (Always works regardless of OSM)
                 const q = query(collection(db, 'places'), limit(30));
                 const snap = await getDocs(q);
                 const dbPlaces = snap.docs.map(d => ({id: d.id, ...d.data(), isCommunity: true} as Place));
-                
-                // Fetch OSM Places (May fail / timeout)
-                let mapped: any[] = [];
-                try {
-                    const rawOsm = await fetchNearbyPlaces(lat - delta, lon - delta, lat + delta, lon + delta);
-                    mapped = rawOsm.map(mapOsmToPlace).filter((p: Place | null) => p !== null);
-                } catch (osmError) {
-                    console.warn('Erro ao buscar locais OSM (Overpass):', osmError);
-                }
-
-                const finalPlaces = mapped.map((osmPlace: any) => {
-                    const dbMatch = dbPlaces.find((p) => p.id === osmPlace.id);
-                    return dbMatch ? { ...osmPlace, ...dbMatch, isCommunity: true } : { ...osmPlace, isCommunity: false };
-                });
-                
-                const extraDb = dbPlaces.filter((p) => !finalPlaces.some((fp: any) => fp.id === p.id));
-                setPlaces([...finalPlaces, ...extraDb] as Place[]);
+                if (active) setDatabasePlaces(dbPlaces);
             } catch (error) {
-                console.warn('Erro fatal ao buscar locais:', error);
+                console.warn('Erro ao buscar locais da comunidade:', error);
             }
         };
-        fetchPlaces();
+        fetchDatabasePlaces();
+        return () => { active = false; };
     }, [location]);
+
+    useEffect(() => {
+        if (!location || !loadOsmPlaces) return;
+        const abortController = new AbortController();
+        const lat = location.coords.latitude;
+        const lon = location.coords.longitude;
+        const cacheKey = `${lat.toFixed(2)}:${lon.toFixed(2)}`;
+        const cachedPlaces = osmCache.current.get(cacheKey);
+
+        if (cachedPlaces) {
+            setOsmPlaces(cachedPlaces);
+            return () => abortController.abort();
+        }
+
+        const fetchOsmPlaces = async () => {
+            try {
+                const rawOsm = await fetchNearbyPlaces(
+                    lat - OSM_SEARCH_DELTA,
+                    lon - OSM_SEARCH_DELTA,
+                    lat + OSM_SEARCH_DELTA,
+                    lon + OSM_SEARCH_DELTA,
+                    abortController.signal
+                );
+                if (abortController.signal.aborted) return;
+                const mappedPlaces = rawOsm
+                    .map(mapOsmToPlace)
+                    .filter((place): place is Place => place !== null);
+                osmCache.current.set(cacheKey, mappedPlaces);
+                setOsmPlaces(mappedPlaces);
+            } catch (error) {
+                if (!abortController.signal.aborted) console.warn('Erro ao buscar locais OSM (Overpass):', error);
+            }
+        };
+
+        fetchOsmPlaces();
+        return () => abortController.abort();
+    }, [location, loadOsmPlaces]);
+
+    const places = useMemo(() => {
+        const osmById = new Map(osmPlaces.map((place) => [place.id, place]));
+        const mergedOsmPlaces = osmPlaces.map((place) => {
+            const databasePlace = databasePlaces.find((candidate) => candidate.id === place.id);
+            return databasePlace ? { ...place, ...databasePlace, isCommunity: true } : { ...place, isCommunity: false };
+        });
+        const remainingDatabasePlaces = databasePlaces.filter((place) => !osmById.has(place.id));
+        return [...mergedOsmPlaces, ...remainingDatabasePlaces];
+    }, [databasePlaces, osmPlaces]);
 
     return { location, meetings, places, loading };
 }

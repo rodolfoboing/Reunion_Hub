@@ -81,7 +81,12 @@ export default function NotificationsScreen() {
             router.push(`/conversation/${notification.conversationId}` as never);
             return;
         }
-        if (notification.meetingId) router.push(`/event/${notification.meetingId}` as never);
+        if (notification.meetingId) {
+            router.push({
+                pathname: '/event/[id]',
+                params: { id: notification.meetingId, notificationType: notification.type },
+            } as never);
+        }
     };
 
     const markAllAsRead = async () => {

@@ -13,6 +13,7 @@ import { doc, getDoc } from 'firebase/firestore';
 import { db } from '../../src/services/firebaseConfig';
 import { FontAwesome } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
+import { SafeAreaView } from 'react-native-safe-area-context';
 
 interface Attendee {
     id: string;
@@ -137,7 +138,7 @@ export default function AttendeesScreen() {
     }
 
     return (
-        <View style={styles.container}>
+        <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
             {/* Header */}
             <View style={styles.header}>
                 <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}>
@@ -175,7 +176,7 @@ export default function AttendeesScreen() {
                     ItemSeparatorComponent={() => <View style={styles.separator} />}
                 />
             )}
-        </View>
+        </SafeAreaView>
     );
 }
 

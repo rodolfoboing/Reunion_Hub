@@ -64,6 +64,8 @@ export default function RegisterScreen() {
                 email: email,
                 reputation: 0,
                 eventsAttended: 0,
+                foundedPlacesCount: 0,
+                showPopularOutsideInterests: true,
                 isProfileComplete: false,
                 createdAt: new Date().toISOString(),
             });

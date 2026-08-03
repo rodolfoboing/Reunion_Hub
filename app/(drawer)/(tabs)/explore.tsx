@@ -1,5 +1,5 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, Animated, Image, FlatList, Dimensions, ActivityIndicator, Platform, ScrollView, Switch, Pressable, Modal, Alert } from 'react-native';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
+import { View, Text, StyleSheet, TouchableOpacity, Animated, Image, FlatList, Dimensions, ActivityIndicator, Platform, ScrollView, Switch, Pressable, Modal, Alert, InteractionManager } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons, FontAwesome } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -13,7 +13,7 @@ import { LocationPickerModal } from '@/src/features/explore/components/LocationP
 import { Place, User } from '../../../src/types';
 import { doc, getDoc, collection, query, where, getDocs, setDoc, updateDoc, arrayUnion } from 'firebase/firestore';
 import { db, auth } from '../../../src/services/firebaseConfig';
-import { INTERESTS_OPTIONS } from '@/src/constants/Interests';
+import { hasMatchingInterest, INTERESTS_OPTIONS } from '@/src/constants/Interests';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const { width } = Dimensions.get('window');
@@ -87,6 +87,25 @@ const getCategoryColor = (name: string) => {
     return CATEGORY_PALETTE[Math.abs(hash) % CATEGORY_PALETTE.length];
 };
 
+const getPlaceIconName = (vocations?: string[]): keyof typeof Ionicons.glyphMap => {
+    if (!vocations || vocations.length === 0) return 'pin';
+    if (vocations.includes('natureza')) return 'leaf';
+    if (vocations.includes('esporte')) return 'football';
+    if (vocations.includes('exercício')) return 'barbell';
+    if (vocations.includes('cultura')) return 'book';
+    if (vocations.includes('social')) return 'beer';
+    if (vocations.includes('Ponto de Interesse')) return 'location';
+    return 'pin';
+};
+
+const isEventAtPlace = (place: Place, meetings: import('@/src/types').Meeting[]) => meetings.some((meeting) => {
+    if (meeting.type !== 'in-person' || meeting.lat == null || meeting.lng == null) return false;
+    if (meeting.placeId === place.id) return true;
+
+    return Math.abs(Number(meeting.lat) - place.latitude) < 0.0001
+        && Math.abs(Number(meeting.lng) - place.longitude) < 0.0001;
+});
+
 const FILTER_CONFIG: { key: 'events' | 'communityPlaces' | 'osmPlaces' | 'googlePoi'; label: string; icon: any; color: string }[] = [
     { key: 'events', label: 'Eventos', icon: 'calendar', color: '#F59E0B' },
     { key: 'communityPlaces', label: 'Locais da Comunidade', icon: 'people', color: '#6366F1' },
@@ -95,8 +114,6 @@ const FILTER_CONFIG: { key: 'events' | 'communityPlaces' | 'osmPlaces' | 'google
 ];
 
 export default function ExploreScreen() {
-    const { location, meetings, places, loading } = useExploreData();
-
     const [eventType, setEventType] = useState<'in-person' | 'online'>('in-person');
     const [viewMode, setViewMode] = useState<'map' | 'list'>('map');
     const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
@@ -108,6 +125,7 @@ export default function ExploreScreen() {
         osmPlaces: false,
         googlePoi: false
     });
+    const { location, meetings, places, loading } = useExploreData(mapFilters.osmPlaces);
     const toggleMapFilter = (key: keyof typeof mapFilters) => {
         setMapFilters(prev => ({ ...prev, [key]: !prev[key] }));
     };
@@ -131,6 +149,18 @@ export default function ExploreScreen() {
     const [loadingProfiles, setLoadingProfiles] = useState(false);
 
     const mapRef = useRef<any>(null);
+    const placeRequestId = useRef(0);
+    const isExploreMounted = useRef(true);
+    const pendingCreateEventTask = useRef<ReturnType<typeof InteractionManager.runAfterInteractions> | null>(null);
+
+    useEffect(() => {
+        isExploreMounted.current = true;
+        return () => {
+            isExploreMounted.current = false;
+            placeRequestId.current += 1;
+            pendingCreateEventTask.current?.cancel();
+        };
+    }, []);
 
     useEffect(() => {
         if (location && newMeeting.lat === 0) {
@@ -163,36 +193,73 @@ export default function ExploreScreen() {
         setShowMapOnboarding(false);
     };
 
-    const handleOpenPlaceModal = async (place: Place) => {
+    const handleOpenPlaceModal = (place: Place) => {
+        const requestId = ++placeRequestId.current;
         setSelectedPlace(place);
         setShowPlaceModal(true);
         setLoadingProfiles(true);
         setFrequentersProfiles([]);
 
-        try {
-            if (place.founderId && !place.founderName) {
-                const founderDoc = await getDoc(doc(db, 'users', place.founderId));
-                if (founderDoc.exists()) place.founderName = founderDoc.data().nick || founderDoc.data().displayName;
-            }
+        InteractionManager.runAfterInteractions(() => {
+            const loadPlaceDetails = async () => {
+                try {
+                    let founderName = place.founderName;
+                    if (place.founderId && !founderName) {
+                        const founderDoc = await getDoc(doc(db, 'users', place.founderId));
+                        founderName = founderDoc.data()?.nick || founderDoc.data()?.displayName;
+                    }
 
-            if (place.frequenters && place.frequenters.length > 0) {
-                const chunks = [];
-                for (let i = 0; i < place.frequenters.length; i += 10) {
-                    chunks.push(place.frequenters.slice(i, i + 10));
+                    let profiles: User[] = [];
+                    if (place.frequenters && place.frequenters.length > 0) {
+                        const chunks: string[][] = [];
+                        for (let index = 0; index < place.frequenters.length; index += 10) {
+                            chunks.push(place.frequenters.slice(index, index + 10));
+                        }
+                        for (const chunk of chunks) {
+                            const profilesQuery = query(collection(db, 'users'), where('__name__', 'in', chunk));
+                            const profilesSnapshot = await getDocs(profilesQuery);
+                            profiles = [...profiles, ...profilesSnapshot.docs.map((profile) => ({ uid: profile.id, ...profile.data() } as User))];
+                        }
+                    }
+
+                    if (!isExploreMounted.current || requestId !== placeRequestId.current) return;
+                    if (founderName) {
+                        setSelectedPlace((currentPlace) => currentPlace?.id === place.id ? { ...currentPlace, founderName } : currentPlace);
+                    }
+                    setFrequentersProfiles(profiles);
+                } catch (error) {
+                    if (isExploreMounted.current && requestId === placeRequestId.current) console.error('[Explore] Erro ao carregar detalhes do local:', error);
+                } finally {
+                    if (isExploreMounted.current && requestId === placeRequestId.current) setLoadingProfiles(false);
                 }
-                let profiles: User[] = [];
-                for (const chunk of chunks) {
-                    const qProfiles = query(collection(db, 'users'), where('__name__', 'in', chunk));
-                    const snapProfiles = await getDocs(qProfiles);
-                    profiles = [...profiles, ...snapProfiles.docs.map(d => ({uid: d.id, ...d.data()} as User))];
-                }
-                setFrequentersProfiles(profiles);
-            }
-        } catch (error) {
-            console.error("[Explore] Erro ao buscar frequentadores:", error);
-        } finally {
-            setLoadingProfiles(false);
-        }
+            };
+            loadPlaceDetails();
+        });
+    };
+
+    const handleCreateEventAtSelectedPlace = () => {
+        if (!selectedPlace) return;
+        setNewMeeting({
+            ...newMeeting,
+            locationName: selectedPlace.name,
+            lat: selectedPlace.latitude,
+            lng: selectedPlace.longitude,
+            type: 'in-person',
+            placeId: selectedPlace.id
+        });
+        setShowPlaceModal(false);
+        pendingCreateEventTask.current?.cancel();
+        pendingCreateEventTask.current = InteractionManager.runAfterInteractions(() => {
+            if (!isExploreMounted.current) return;
+            setModalVisible(true);
+            pendingCreateEventTask.current = null;
+        });
+    };
+
+    const handleClosePlaceModal = () => {
+        placeRequestId.current += 1;
+        setLoadingProfiles(false);
+        setShowPlaceModal(false);
     };
 
 
@@ -224,9 +291,16 @@ export default function ExploreScreen() {
 
     const filteredMeetings = meetings.filter(m => {
         if (m.type !== eventType) return false;
-        if (selectedCategory && m.theme !== selectedCategory && !(m.interests || []).includes(selectedCategory)) return false;
+        if (selectedCategory && !hasMatchingInterest([m.theme, ...(m.interests || [])], [selectedCategory])) return false;
         return true;
     });
+
+    const visiblePlaces = useMemo(() => places.filter((place) => {
+        if (!place.latitude || !place.longitude || isNaN(place.latitude) || isNaN(place.longitude)) return false;
+        if (place.isCommunity && !mapFilters.communityPlaces) return false;
+        if (!place.isCommunity && !mapFilters.osmPlaces) return false;
+        return true;
+    }), [places, mapFilters.communityPlaces, mapFilters.osmPlaces]);
 
     const renderMeetingCard = ({ item }: { item: any }) => (
         <TouchableOpacity style={styles.card} onPress={() => router.push(`/event/${item.id}` as any)}>
@@ -427,22 +501,11 @@ export default function ExploreScreen() {
                                 handleOpenPlaceModal(poiPlace);
                             }}
                         >
-                            {places.filter((place) => {
-                                if (!place.latitude || !place.longitude || isNaN(place.latitude) || isNaN(place.longitude)) return false;
-                                if (place.isCommunity && !mapFilters.communityPlaces) return false;
-                                if (!place.isCommunity && !mapFilters.osmPlaces) return false;
-                                return true;
-                            }).map((place) => {
-                                const getIconName = (vocations?: string[]): any => {
-                                    if (!vocations || vocations.length === 0) return "pin";
-                                    if (vocations.includes('natureza')) return "leaf";
-                                    if (vocations.includes('esporte')) return "football";
-                                    if (vocations.includes('exercício')) return "barbell";
-                                    if (vocations.includes('cultura')) return "book";
-                                    if (vocations.includes('social')) return "beer";
-                                    if (vocations.includes('Ponto de Interesse')) return "location";
-                                    return "pin";
-                                };
+                            {visiblePlaces.map((place) => {
+                                const hasActiveEvent = isEventAtPlace(place, meetings);
+                                const isOsmPlace = place.id.startsWith('osm_');
+                                const markerColor = hasActiveEvent ? '#2563EB' : (isOsmPlace ? '#10B981' : '#8B5CF6');
+                                const markerIcon = hasActiveEvent ? 'calendar' : getPlaceIconName(place.vocations);
                                 return (
                                 <Marker
                                     key={place.id}
@@ -451,10 +514,10 @@ export default function ExploreScreen() {
                                     title={place.name}
                                 >
                                     <View style={styles.markerContainer}>
-                                        <View style={[styles.markerBubble, { borderColor: '#8B5CF6' }]}>
-                                            <Ionicons name={getIconName(place.vocations)} size={16} color="#8B5CF6" />
+                                        <View style={[styles.markerBubble, { borderColor: markerColor }]}>
+                                            <Ionicons name={markerIcon} size={16} color={markerColor} />
                                         </View>
-                                        <View style={[styles.markerArrow, { borderTopColor: '#8B5CF6' }]} />
+                                        <View style={[styles.markerArrow, { borderTopColor: markerColor }]} />
                                     </View>
                                 </Marker>
                                 );
@@ -525,7 +588,7 @@ export default function ExploreScreen() {
 
             <PlaceModal
                 visible={showPlaceModal}
-                onClose={() => setShowPlaceModal(false)}
+                onClose={handleClosePlaceModal}
                 place={selectedPlace}
                 loadingProfiles={loadingProfiles}
                 frequentersProfiles={frequentersProfiles}
@@ -534,19 +597,7 @@ export default function ExploreScreen() {
                     (Math.abs(Number(m.lat) - selectedPlace.latitude) < 0.0001 && Math.abs(Number(m.lng) - selectedPlace.longitude) < 0.0001)
                 ) : []}
                 onSaveHabit={handleSavePlaceHabit}
-                onCreateEventPress={() => {
-                    if(selectedPlace) {
-                        setNewMeeting({
-                            ...newMeeting,
-                            locationName: selectedPlace.name,
-                            lat: selectedPlace.latitude,
-                            lng: selectedPlace.longitude,
-                            type: 'in-person',
-                            placeId: selectedPlace.id
-                        });
-                        setModalVisible(true);
-                    }
-                }}
+                onCreateEventPress={handleCreateEventAtSelectedPlace}
             />
 
             <LocationPickerModal

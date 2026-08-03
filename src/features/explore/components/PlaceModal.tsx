@@ -172,10 +172,7 @@ export function PlaceModal({
 
                     <TouchableOpacity 
                         style={{ marginTop: 16, alignSelf: 'center', backgroundColor: '#EEF2FF', paddingVertical: 12, paddingHorizontal: 24, borderRadius: 12 }}
-                        onPress={() => {
-                            onClose();
-                            onCreateEventPress();
-                        }}
+                        onPress={onCreateEventPress}
                     >
                         <Text style={{ color: '#4F46E5', fontWeight: 'bold', fontSize: 16 }}>Criar Evento Neste Local</Text>
                     </TouchableOpacity>

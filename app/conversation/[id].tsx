@@ -7,6 +7,7 @@ import { auth, db } from '../../src/services/firebaseConfig';
 import { collection, addDoc, query, orderBy, onSnapshot, serverTimestamp, doc, updateDoc, limit, increment, arrayUnion } from 'firebase/firestore';
 import { Message } from '../../src/types';
 import { ReportReasonModal } from '@/src/components/ReportReasonModal';
+import { markRelatedNotificationsAsRead } from '@/src/services/notificationReadService';
 
 export default function ChatScreen() {
     const { id, name } = useLocalSearchParams();
@@ -24,6 +25,10 @@ export default function ChatScreen() {
 
     useEffect(() => {
         if (!id || !auth.currentUser) return;
+
+        markRelatedNotificationsAsRead({ conversationId: id as string }).catch((error) => {
+            console.error('[Conversation] Erro ao marcar notificações como lidas:', error);
+        });
 
         // Assinar mensagens
         const messagesRef = collection(db, 'conversations', id as string, 'messages');

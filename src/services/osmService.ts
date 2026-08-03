@@ -1,7 +1,24 @@
-export const fetchNearbyPlaces = async (south: number, west: number, north: number, east: number) => {
+import { Place } from '@/src/types';
+
+const MAX_OSM_PLACES = 40;
+const OVERPASS_TIMEOUT_SECONDS = 10;
+
+type OsmElement = {
+    id: number;
+    lat?: number;
+    lon?: number;
+    center?: { lat?: number; lon?: number };
+    tags?: Record<string, string>;
+};
+
+type OverpassResponse = {
+    elements?: OsmElement[];
+};
+
+export const fetchNearbyPlaces = async (south: number, west: number, north: number, east: number, signal?: AbortSignal): Promise<OsmElement[]> => {
     // Bounding box format para Overpass: (south, west, north, east)
     const query = `
-        [out:json][timeout:25];
+        [out:json][timeout:${OVERPASS_TIMEOUT_SECONDS}];
         (
             node["leisure"~"park|pitch|garden|fitness_station"](${south},${west},${north},${east});
             way["leisure"~"park|pitch|garden|fitness_station"](${south},${west},${north},${east});
@@ -9,14 +26,14 @@ export const fetchNearbyPlaces = async (south: number, west: number, north: numb
             node["amenity"~"library|arts_centre|community_centre|bar|cafe"](${south},${west},${north},${east});
             way["amenity"~"library|arts_centre|community_centre|bar|cafe"](${south},${west},${north},${east});
         );
-        out center;
+        out center ${MAX_OSM_PLACES};
     `;
     
     const url = 'https://overpass-api.de/api/interpreter';
     const body = `data=${encodeURIComponent(query)}`;
     
-    let retries = 3;
-    let delay = 1000;
+    let retries = 2;
+    let delay = 750;
 
     while (retries > 0) {
         try {
@@ -27,12 +44,13 @@ export const fetchNearbyPlaces = async (south: number, west: number, north: numb
                     'Accept': 'application/json',
                     'User-Agent': 'ReunionHubApp/1.0'
                 },
-                body: body
+                body,
+                signal
             });
             
             if (response.ok) {
-                const data = await response.json();
-                return data.elements || [];
+                const data = await response.json() as OverpassResponse;
+                return Array.isArray(data.elements) ? data.elements.slice(0, MAX_OSM_PLACES) : [];
             }
             
             if (response.status === 429 || response.status >= 500) {
@@ -49,21 +67,22 @@ export const fetchNearbyPlaces = async (south: number, west: number, north: numb
             console.warn(`[OSM Service] Falha na API (Status ${response.status}). Exibindo apenas locais do banco.`);
             return [];
             
-        } catch (error: any) {
+        } catch (error: unknown) {
+            if (signal?.aborted) return [];
             retries--;
             if (retries > 0) {
                 await new Promise(res => setTimeout(res, delay));
                 delay *= 2;
                 continue;
             }
-            console.warn("[OSM Service] Timeout ou Erro de rede:", error.message);
+            console.warn("[OSM Service] Timeout ou Erro de rede:", error);
             return [];
         }
     }
     return [];
 };
 
-export const mapOsmToPlace = (element: any) => {
+export const mapOsmToPlace = (element: OsmElement): Place | null => {
     const tags = element.tags || {};
     if (!tags.name) return null;
 

@@ -79,14 +79,9 @@ export default function RootLayout() {
             const docSnap = await getDoc(docRef);
             if (docSnap.exists()) {
               const data = docSnap.data();
-              // Sync email verification status if it changed
-              if (user.emailVerified && !data.emailVerified) {
-                await setDoc(docRef, { emailVerified: true }, { merge: true });
-              }
-              
               if (data.isProfileComplete === false) {
                 console.log("[ReunionHub Debug] Perfil incompleto, redirecionando para onboarding.");
-                router.replace('/onboarding' as any);
+                router.replace('/(auth)/onboarding' as never);
               }
             }
           } catch (error) {

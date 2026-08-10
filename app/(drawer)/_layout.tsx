@@ -46,26 +46,6 @@ export default function DrawerLayout() {
             ),
           }}
         />
-        <Drawer.Screen
-          name="my-events"
-          options={{
-            drawerLabel: 'Meus Eventos',
-            title: 'Meus Eventos',
-            drawerIcon: ({ color, size }) => (
-              <Ionicons name="calendar-outline" size={size} color={color} />
-            ),
-          }}
-        />
-        <Drawer.Screen
-          name="map"
-          options={{
-            drawerLabel: 'Mapa de Eventos',
-            title: 'Mapa',
-            drawerIcon: ({ color, size }) => (
-              <Ionicons name="map-outline" size={size} color={color} />
-            ),
-          }}
-        />
       </Drawer>
     </GestureHandlerRootView>
   );

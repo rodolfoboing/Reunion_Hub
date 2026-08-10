@@ -3,7 +3,8 @@ import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as Location from 'expo-location';
 import { router, useFocusEffect } from 'expo-router';
-import { arrayRemove, arrayUnion, collection, deleteDoc, doc, getDocs, onSnapshot, query, updateDoc, where, limit, orderBy } from 'firebase/firestore';
+import { arrayRemove, arrayUnion, collection, doc, getDocs, onSnapshot, query, updateDoc, where, limit, orderBy } from 'firebase/firestore';
+import { httpsCallable } from 'firebase/functions';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Alert, Animated, FlatList, LayoutAnimation, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, TouchableOpacity, UIManager, View } from 'react-native';
 import { Calendar, LocaleConfig } from 'react-native-calendars';
@@ -12,7 +13,9 @@ import { Meeting } from '../../../src/types';
 import { STRINGS } from '../../../src/constants/strings';
 import { CONFIG } from '../../../src/constants/Config';
 import { normalizeDate, getTodayStr } from '../../../src/utils/dateUtils';
-import { auth, db } from '../../../src/services/firebaseConfig';
+import { formatEventTimeRange, isEventInProgress } from '../../../src/utils/eventSchedule';
+import { useEventClock } from '../../../src/hooks/useEventClock';
+import { auth, db, functions } from '../../../src/services/firebaseConfig';
 import { hasMatchingInterest, normalizeInterests } from '../../../src/constants/Interests';
 
 if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
@@ -120,6 +123,7 @@ const CalendarDayCell = ({ date, state, marking, onPress }: any) => {
 };
 
 export default function AgendaScreen() {
+    const eventClock = useEventClock();
     // Tab State: 'upcoming' | 'history' | 'favorites'
     const [activeTab, setActiveTab] = useState<'upcoming' | 'history' | 'favorites'>('upcoming');
 
@@ -277,7 +281,8 @@ export default function AgendaScreen() {
             // to keep it simple and avoid missing indexes if 'or' triggers composite index issues.
             const q = query(
                 collection(db, 'meetings'),
-                where('attendees', 'array-contains', currentUid)
+                where('attendees', 'array-contains', currentUid),
+                limit(CONFIG.AGENDA_MY_EVENTS_LIMIT)
             );
 
             const snap = await getDocs(q);
@@ -413,8 +418,7 @@ export default function AgendaScreen() {
             {
                 text: 'Sim, Cancelar', style: 'destructive', onPress: async () => {
                     try {
-                        const docRef = doc(db, 'meetings', event.id);
-                        await updateDoc(docRef, { attendees: arrayRemove(auth.currentUser?.uid) });
+                        await httpsCallable(functions, 'leaveEvent')({ eventId: event.id });
                         LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
                         setFilteredEvents(prev => prev.filter(e => e.id !== event.id));
                         setSelectedEvent(null);
@@ -427,13 +431,12 @@ export default function AgendaScreen() {
     };
 
     const handleDeleteEvent = async (event: any) => {
-        Alert.alert('Excluir Evento', `Atenção: Isso excluirá o evento "${event.title}" permanentemente para todos. Deseja continuar?`, [
+        Alert.alert('Cancelar Evento', `Cancelar "${event.title}" avisará os participantes e reduzirá sua reputação. Deseja continuar?`, [
             { text: 'Cancelar', style: 'cancel' },
             {
-                text: 'Excluir Definitivamente', style: 'destructive', onPress: async () => {
+                text: 'Cancelar Evento', style: 'destructive', onPress: async () => {
                     try {
-                        const docRef = doc(db, 'meetings', event.id);
-                        await deleteDoc(docRef);
+                        await httpsCallable(functions, 'cancelEvent')({ eventId: event.id });
                         LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
                         setFilteredEvents(prev => prev.filter(e => e.id !== event.id));
                         setSelectedEvent(null);
@@ -453,7 +456,8 @@ export default function AgendaScreen() {
         now.setDate(now.getDate() + 1);
         const tomorrowStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 
-        const isVerySoon = item.date === todayStr || item.date === tomorrowStr;
+        const isInProgress = isEventInProgress(item, eventClock);
+        const isVerySoon = !isInProgress && (item.date === todayStr || item.date === tomorrowStr);
         const isPopular = item.attendees && item.attendees.length >= CONFIG.POPULAR_ATTENDEES_COUNT; // +3 pessoas = Popular
 
         useEffect(() => {
@@ -469,12 +473,14 @@ export default function AgendaScreen() {
 
         let indicatorColor = item.type === 'online' ? '#10B981' : '#6366F1';
         if (isPopular) indicatorColor = '#F59E0B'; // Fogo / Laranja
+        if (isInProgress) indicatorColor = '#059669';
 
         return (
             <Pressable
                 style={({ pressed }) => [
                     styles.eventCard,
                     isVerySoon && styles.eventCardSoon,
+                    isInProgress && styles.eventCardInProgress,
                     pressed && styles.cardPressed,
                 ]}
                 onPress={onPress}
@@ -487,6 +493,7 @@ export default function AgendaScreen() {
                     <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                         <View style={{ flex: 1, marginRight: 8, flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 6 }}>
                             <Text style={styles.eventTitle}>{item.title}</Text>
+                            {isInProgress && <View style={styles.badgeInProgress}><Text style={styles.badgeInProgressText}>EM ANDAMENTO</Text></View>}
                             {isPopular && <View style={styles.badgePopular}><Text style={styles.badgePopularText}>🔥 Pop</Text></View>}
                             {isVerySoon && <View style={styles.badgeSoon}><Text style={styles.badgeSoonText}>⏳ Em Breve</Text></View>}
                         </View>
@@ -509,7 +516,7 @@ export default function AgendaScreen() {
                         <View style={[styles.metaIconChip, { backgroundColor: '#F5F3FF' }]}>
                             <Ionicons name="time-outline" size={11} color="#8B5CF6" />
                         </View>
-                        <Text style={styles.eventMetaText}>{item.time || '--:--'}</Text>
+                        <Text style={styles.eventMetaText}>{formatEventTimeRange(item)}</Text>
                         <View style={[styles.metaIconChip, { backgroundColor: '#ECFDF5' }]}>
                             <Ionicons name="people-outline" size={11} color="#10B981" />
                         </View>
@@ -557,7 +564,7 @@ export default function AgendaScreen() {
     );
 
     return (
-        <SafeAreaView style={styles.container} edges={['top']}>
+        <View style={styles.container}>
             <LinearGradient
                 colors={['#6366F1', '#8B5CF6']}
                 start={{ x: 0, y: 0 }}
@@ -605,7 +612,7 @@ export default function AgendaScreen() {
             </LinearGradient>
 
 
-            <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent}>
+            <ScrollView style={styles.content} showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent}>
 
                 {error ? (
                     <View style={{ marginTop: 40 }}>
@@ -810,7 +817,7 @@ export default function AgendaScreen() {
                                 <View style={[styles.modalIconChip, { backgroundColor: '#FEF2F2' }]}>
                                     <Ionicons name="trash-outline" size={18} color="#EF4444" />
                                 </View>
-                                <Text style={[styles.modalOptionText, { color: '#EF4444' }]}>Excluir Evento Definitivamente</Text>
+                                <Text style={[styles.modalOptionText, { color: '#EF4444' }]}>Cancelar Evento</Text>
                             </Pressable>
                         ) : (
                             <Pressable
@@ -833,16 +840,17 @@ export default function AgendaScreen() {
                     </View>
                 </SafeAreaView>
             </Modal>
-        </SafeAreaView>
+        </View>
     );
 }
 
 const styles = StyleSheet.create({
     container: { flex: 1, backgroundColor: '#F8FAFC' },
+    content: { flex: 1, backgroundColor: '#F8FAFC' },
 
     // Header
     header: {
-        paddingTop: 16,
+        paddingTop: 50,
         paddingHorizontal: 24,
         paddingBottom: 30,
         borderBottomLeftRadius: 32,
@@ -948,6 +956,7 @@ const styles = StyleSheet.create({
         borderColor: '#F1F3FA'
     },
     eventCardSoon: { borderColor: '#E0E7FF', backgroundColor: '#FAFAFF' },
+    eventCardInProgress: { borderColor: '#6EE7B7', backgroundColor: '#ECFDF5' },
     cardPressed: { transform: [{ scale: 0.98 }], opacity: 0.92 },
     eventTypeIndicator: { width: 4, height: 40, borderRadius: 2, marginRight: 16 },
     eventInfo: { flex: 1 },
@@ -960,6 +969,8 @@ const styles = StyleSheet.create({
     badgePopularText: { fontSize: 10, fontWeight: 'bold', color: '#D97706' },
     badgeSoon: { backgroundColor: '#EEF2FF', paddingHorizontal: 7, paddingVertical: 3, borderRadius: 8 },
     badgeSoonText: { fontSize: 10, fontWeight: 'bold', color: '#6366F1' },
+    badgeInProgress: { backgroundColor: '#D1FAE5', paddingHorizontal: 7, paddingVertical: 3, borderRadius: 8 },
+    badgeInProgressText: { fontSize: 10, fontWeight: 'bold', color: '#047857' },
 
     emptyState: { alignItems: 'center', justifyContent: 'center', paddingVertical: 40, backgroundColor: '#fff', borderRadius: 20, borderWidth: 1, borderColor: '#F0F1F8', gap: 12 },
     emptyIconChip: { width: 56, height: 56, borderRadius: 20, justifyContent: 'center', alignItems: 'center' },

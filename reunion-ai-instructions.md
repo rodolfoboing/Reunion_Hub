@@ -15,7 +15,7 @@ Não complique o projeto sem necessidade. Prefira a menor solução que preserve
 
 ## 2. Contexto do produto
 
-O **Reunion** é um aplicativo de encontros locais para aproximar pessoas que desejam conversar ou praticar atividades em espaços públicos ou privados.
+O **Reunion Hub** é um aplicativo de encontros locais para aproximar pessoas que desejam conversar ou praticar atividades em espaços públicos ou privados.
 
 O produto combina:
 
@@ -142,7 +142,7 @@ Regras:
 - Funções puras concentram transformação, normalização e validação de dados.
 - Tipos definem contratos; não devem esconder validação ausente em tempo de execução.
 
-Não crie arquivos, hooks, contexts ou services novos sem explicar a responsabilidade específica de cada um. Não transforme uma alteração pequena em uma reestruturação ampla sem benefício demonstrável.
+Ao criar arquivos, hooks, contexts ou services novos, explique a responsabilidade específica de cada um. 
 
 ## 9. Protocolo obrigatório antes de alterar código
 
@@ -166,8 +166,6 @@ Se o usuário autorizar explicitamente a implementação, apresente o plano e pr
 
 ## 10. Regras durante a implementação
 
-- Faça mudanças pequenas, coesas e fáceis de revisar.
-- Não sobrescreva um componente inteiro quando uma alteração localizada for suficiente.
 - Preserve o comportamento não relacionado ao pedido.
 - Não altere nomes públicos, rotas, contratos do banco ou formatos persistidos sem mapear consumidores e migração.
 - Não mantenha código morto, imports inutilizados ou grandes blocos comentados “para o futuro”.
@@ -175,6 +173,8 @@ Se o usuário autorizar explicitamente a implementação, apresente o plano e pr
 - Não adicione dependências sem justificar necessidade, manutenção, tamanho e compatibilidade com Expo.
 - Não faça atualização, busca, commit, push, pull, merge, rebase ou qualquer outra operação Git/GitHub sem autorização explícita do usuário.
 - Nunca descarte ou sobrescreva alterações existentes do usuário.
+- Preservação de funcionalidades e análise de regressão:
+Antes de alterar código para corrigir um problema, identifique os componentes, hooks, services, tipos, rotas e fluxos que interagem com a parte modificada. Verifique se a mudança pode quebrar comportamentos já funcionais, inclusive fora do arquivo editado.
 
 ## 11. Investigação de problemas semelhantes
 
@@ -237,4 +237,4 @@ Antes da resposta final, confirme:
 9. Os logs são úteis, seguros e pouco ruidosos?
 10. As afirmações da resposta final são sustentadas pelas verificações executadas?
 
-Se alguma resposta for “não” ou “não sei”, investigue antes de concluir ou declare claramente a limitação.
+Após a alteração, valide especificamente os fluxos afetados e informe quais interações foram verificadas. Não presuma que uma correção localizada é segura apenas porque o arquivo alterado compila ou funciona isoladamente.

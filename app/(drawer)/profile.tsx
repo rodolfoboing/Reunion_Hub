@@ -1,9 +1,9 @@
 import { View, Text, StyleSheet, ScrollView, Alert, TouchableOpacity, Image, TextInput, Linking, Switch, AppState } from 'react-native';
-import { useState, useEffect } from 'react';
+import { Dispatch, SetStateAction, useEffect, useState } from 'react';
 import { auth, db, functions } from '../../src/services/firebaseConfig';
 import { httpsCallable } from 'firebase/functions';
-import { doc, setDoc, collection, query, where, getDocs, deleteDoc, onSnapshot } from 'firebase/firestore';
-import { updateProfile, deleteUser, sendEmailVerification } from 'firebase/auth';
+import { doc, setDoc, collection, query, where, getDocs, limit, onSnapshot } from 'firebase/firestore';
+import { updateProfile, sendEmailVerification } from 'firebase/auth';
 import { storage } from '../../src/services/firebaseConfig';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import * as ImagePicker from 'expo-image-picker';
@@ -15,9 +15,21 @@ import { router } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { INTERESTS_OPTIONS, normalizeInterests } from '../../src/constants/Interests';
+import { User } from '../../src/types';
+import { toUserProfile } from '../../src/utils/userProfile';
+
+function profileLog(event: string, context: Record<string, boolean | number> = {}) {
+    if (__DEV__) console.info(`[Profile] ${event}`, context);
+}
+
+function getErrorCode(error: unknown): string | undefined {
+    if (typeof error !== 'object' || error === null || !('code' in error)) return undefined;
+    const code = (error as { code?: unknown }).code;
+    return typeof code === 'string' ? code : undefined;
+}
 
 export default function ProfileScreen() {
-    const [userProfile, setUserProfile] = useState<any>(null);
+    const [userProfile, setUserProfile] = useState<User | null>(null);
     const [isEditing, setIsEditing] = useState(false);
     const [editBio, setEditBio] = useState('');
     const [editNick, setEditNick] = useState('');
@@ -39,7 +51,7 @@ export default function ProfileScreen() {
         const docRef = doc(db, 'users', user.uid);
         return onSnapshot(docRef, (snap) => {
                 if (snap.exists()) {
-                    const data = snap.data();
+                    const data = toUserProfile(user.uid, snap.data());
                     setUserProfile({ ...data, interests: normalizeInterests(data.interests) });
                     // Default nick to display name part if not set (fallback)
                     if (!data.nick && auth.currentUser?.displayName) {
@@ -64,7 +76,6 @@ export default function ProfileScreen() {
             setIsEmailVerified(verified);
             if (verified) {
                 setEmailVerificationSent(false);
-                await setDoc(doc(db, 'users', user.uid), { emailVerified: true }, { merge: true });
                 Alert.alert('E-mail verificado', 'Sua conta foi confirmada com sucesso.');
             }
         } catch (error) {
@@ -97,24 +108,12 @@ export default function ProfileScreen() {
         setIsEditing(false);
     };
 
-    const toggleEditSelection = (item: string, list: string[], setList: any) => {
+    const toggleEditSelection = (item: string, list: string[], setList: Dispatch<SetStateAction<string[]>>) => {
         if (list.includes(item)) {
             setList(list.filter((i: string) => i !== item));
         } else {
             setList([...list, item]);
         }
-    };
-
-    const checkNickAvailability = async (nick: string) => {
-        const usersRef = collection(db, 'users');
-        const q = query(usersRef, where('nick', '==', nick));
-        const querySnapshot = await getDocs(q);
-
-        if (querySnapshot.empty) return true;
-
-        // If matches, check if it's me
-        const isMe = querySnapshot.docs.find(d => d.id === auth.currentUser?.uid);
-        return !!isMe; // Available if the only match is me, or if no match
     };
 
     const pickImage = async () => {
@@ -151,33 +150,23 @@ export default function ProfileScreen() {
         setLoading(true);
 
         try {
-            // Check Nick Uniqueness se mudou
-            if (editNick.trim() !== userProfile?.nick) {
-                const isAvailable = await checkNickAvailability(editNick.trim());
-                if (!isAvailable) {
-                    setLoading(false);
-                    Alert.alert('Erro', 'Este Nickname já está em uso. Escolha outro.');
-                    return;
-                }
-            }
             if (editNick.trim().length < 3) {
                 Alert.alert('Atenção', 'O Nickname deve ter pelo menos 3 caracteres.');
-                setLoading(false);
                 return;
             }
 
             const searchName = editNick.trim().toLowerCase();
+            profileLog('profile_save_started', { interestsCount: editInterests.length, hasPhoto: Boolean(editPhotoURL) });
 
-            // Validate nick uniqueness
+            // A busca normalizada é a fonte única de disponibilidade do nick.
             if (searchName !== userProfile?.searchName) {
                 const usersRef = collection(db, 'users');
-                const q = query(usersRef, where('searchName', '==', searchName));
+                const q = query(usersRef, where('searchName', '==', searchName), limit(2));
                 const querySnapshot = await getDocs(q);
 
                 const isTaken = querySnapshot.docs.some(d => d.id !== auth.currentUser?.uid);
                 if (isTaken) {
                     Alert.alert('Erro', 'Este Nickname já está em uso. Por favor, escolha outro.');
-                    setLoading(false);
                     return;
                 }
             }
@@ -189,25 +178,6 @@ export default function ProfileScreen() {
 
             const normalizedInterests = normalizeInterests(editInterests);
 
-            // Update local state immediately
-            setUserProfile({
-                ...userProfile,
-                nick: editNick.trim(),
-                bio: editBio,
-                interests: normalizedInterests,
-                shareFrequentedPlaces,
-                showPopularOutsideInterests,
-                photoURL: finalPhotoURL,
-                searchName: searchName
-            });
-
-            // Update Auth Profile Display Name & Photo
-            await updateProfile(auth.currentUser, { 
-                displayName: editNick.trim(),
-                photoURL: finalPhotoURL 
-            });
-
-            // Update Firestore
             const docRef = doc(db, 'users', auth.currentUser.uid);
             await setDoc(docRef, {
                 nick: editNick.trim(),
@@ -220,10 +190,22 @@ export default function ProfileScreen() {
                 photoURL: finalPhotoURL
             }, { merge: true });
 
+            // O Firestore é a fonte do perfil público. A sessão do Auth é atualizada
+            // depois, sem permitir que uma falha nela descarte a alteração persistida.
+            try {
+                await updateProfile(auth.currentUser, {
+                    displayName: editNick.trim(),
+                    photoURL: finalPhotoURL
+                });
+            } catch (authProfileError) {
+                console.warn('[Profile] auth_profile_sync_failed', { code: getErrorCode(authProfileError) });
+            }
+
             setIsEditing(false);
+            profileLog('profile_saved', { interestsCount: normalizedInterests.length, hasPhoto: Boolean(finalPhotoURL) });
             Alert.alert('Sucesso', 'Perfil atualizado!');
         } catch (error) {
-            console.error('Save Profile error:', error);
+            console.error('[Profile] profile_save_failed', { code: getErrorCode(error) });
             Alert.alert('Erro', 'Falha ao salvar o perfil.');
         } finally {
             setLoading(false);
@@ -236,18 +218,22 @@ export default function ProfileScreen() {
         try {
             await sendEmailVerification(user);
             setEmailVerificationSent(true);
+            profileLog('email_verification_sent');
             Alert.alert('E-mail enviado', 'Abra o link recebido. Ao voltar ao app, a confirmação será atualizada automaticamente.');
         } catch (error) {
-            console.error(error);
+            console.error('[Profile] email_verification_send_failed', { code: getErrorCode(error) });
             Alert.alert('Erro', 'Não foi possível enviar o e-mail. Aguarde um momento e tente novamente.');
         }
     };
 
     const handleLogout = async () => {
         try {
+            profileLog('logout_started');
             await auth.signOut();
+            profileLog('logout_completed');
             router.replace('/login');
         } catch (error) {
+            console.error('[Profile] logout_failed', { code: getErrorCode(error) });
             Alert.alert('Erro', 'Falha ao sair.');
         }
     };
@@ -266,16 +252,17 @@ export default function ProfileScreen() {
                             const user = auth.currentUser;
                             if (user) {
                                 setLoading(true);
-                                await httpsCallable(functions, 'deleteMyAccount')({});
+                                profileLog('account_deletion_started');
+                                await httpsCallable<Record<string, never>, { ok: boolean }>(functions, 'deleteMyAccount')({});
                                 await auth.signOut();
+                                profileLog('account_deletion_completed');
+                                router.replace('/login');
                             }
-                        } catch (error: any) {
+                        } catch (error) {
+                            console.error('[Profile] account_deletion_failed', { code: getErrorCode(error) });
+                            Alert.alert("Erro", "Ocorreu um erro ao tentar excluir a conta. Tente novamente mais tarde.");
+                        } finally {
                             setLoading(false);
-                            if (error.code === 'auth/requires-recent-login') {
-                                Alert.alert("Atenção", "Por motivos de segurança, você precisa sair e fazer login novamente antes de excluir sua conta.");
-                            } else {
-                                Alert.alert("Erro", "Ocorreu um erro ao tentar excluir a conta. Tente novamente mais tarde.");
-                            }
                         }
                     }
                 }
@@ -310,7 +297,7 @@ export default function ProfileScreen() {
                         </TouchableOpacity>
                     )}
                 </View>
-                <Text style={styles.name}>{auth.currentUser.displayName}</Text>
+                <Text style={styles.name}>{userProfile?.displayName || auth.currentUser.displayName || 'Usuário'}</Text>
                 {isEmailVerified ? (
                     <View style={{flexDirection: 'row', alignItems: 'center', marginTop: 4}}>
                         <FontAwesome name="check-circle" size={14} color="#10B981" />

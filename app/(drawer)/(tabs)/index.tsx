@@ -9,10 +9,11 @@ import { useEffect, useRef, useState } from 'react';
 import { Alert, FlatList, Image, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { auth, db } from '../../../src/services/firebaseConfig';
 import { Meeting, User } from '../../../src/types';
-import { sendLocalNotification } from '../../../src/utils/Notifications';
 import { STRINGS } from '../../../src/constants/strings';
 import { CONFIG } from '../../../src/constants/Config';
 import { normalizeDate, getTodayStr } from '../../../src/utils/dateUtils';
+import { isEventInProgress, isEventToday } from '../../../src/utils/eventSchedule';
+import { useEventClock } from '../../../src/hooks/useEventClock';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { ManualModal } from '../../../src/components/ManualModal';
 import { hasMatchingInterest, normalizeInterests } from '../../../src/constants/Interests';
@@ -45,6 +46,7 @@ const formatEventDate = (dateString: string | undefined) => {
 };
 
 export default function HomeScreen() {
+  const eventClock = useEventClock();
   const [userProfile, setUserProfile] = useState<User | null>(null);
   const [highlights, setHighlights] = useState<Meeting[]>([]);
   const [allUpcomingEvents, setAllUpcomingEvents] = useState<Meeting[]>([]);
@@ -58,7 +60,6 @@ export default function HomeScreen() {
   const [loading, setLoading] = useState(true);
   const [showManualModal, setShowManualModal] = useState(false);
 
-  const isFirstNotificationLoad = useRef(true);
   const isMounted = useRef(true);
 
   useEffect(() => {
@@ -195,20 +196,6 @@ export default function HomeScreen() {
       unsubNotifications = onSnapshot(qNotifications, (snapshot) => {
         noteCount = snapshot.size;
         updateTotal();
-
-        if (isFirstNotificationLoad.current) {
-          isFirstNotificationLoad.current = false;
-          return;
-        }
-
-        snapshot.docChanges().forEach((change) => {
-          if (change.type === "added") {
-            const data = change.doc.data();
-            const notificationTitle = data.title || 'Nova Notificação';
-            const notificationBody = data.message || data.body || 'Você tem uma nova interação no Reunion Hub.';
-            sendLocalNotification(notificationTitle, notificationBody);
-          }
-        });
       }, (error) => {
         console.warn('[Index] Erro no listener de notificações:', error);
       });
@@ -417,14 +404,20 @@ export default function HomeScreen() {
             ) : (
               myEvents.map(event => {
                 const { day, month } = formatEventDate(event.date);
+                const eventIsToday = isEventToday(event, eventClock);
+                const eventIsInProgress = isEventInProgress(event, eventClock);
                 return (
-                  <TouchableOpacity key={event.id} style={styles.listCard} onPress={() => router.push(`/event/${event.id}` as any)}>
-                    <View style={styles.dateBox}>
+                  <TouchableOpacity key={event.id} style={[styles.listCard, eventIsToday && styles.listCardToday, eventIsInProgress && styles.listCardInProgress]} onPress={() => router.push(`/event/${event.id}` as any)}>
+                    <View style={[styles.dateBox, eventIsToday && styles.dateBoxToday, eventIsInProgress && styles.dateBoxInProgress]}>
                       <Text style={styles.dateDay}>{day}</Text>
                       <Text style={styles.dateMonth}>{month}</Text>
                     </View>
                     <View style={styles.listContent}>
-                      <Text style={styles.listTitle}>{event.title}</Text>
+                      <View style={styles.listTitleRow}>
+                        <Text style={styles.listTitle}>{event.title}</Text>
+                        {eventIsInProgress && <View style={styles.inProgressBadge}><Text style={styles.inProgressBadgeText}>EM ANDAMENTO</Text></View>}
+                        {!eventIsInProgress && eventIsToday && <View style={styles.todayEventBadge}><Text style={styles.todayEventBadgeText}>HOJE</Text></View>}
+                      </View>
                       <Text style={styles.listTime}>{event.time || 'Horário a definir'} • {event.locationName || 'Local a definir'}</Text>
                     </View>
                   </TouchableOpacity>
@@ -622,14 +615,23 @@ const styles = StyleSheet.create({
     flexDirection: 'row', backgroundColor: '#fff', borderRadius: 12, padding: 16, marginBottom: 12,
     shadowColor: '#000', shadowOpacity: 0.05, shadowRadius: 2, elevation: 1, alignItems: 'center'
   },
+  listCardToday: { borderWidth: 1, borderColor: '#FBBF24', backgroundColor: '#FFFBEB' },
+  listCardInProgress: { borderColor: '#34D399', backgroundColor: '#ECFDF5' },
   dateBox: {
     backgroundColor: '#f3f4f6', borderRadius: 8, padding: 10, alignItems: 'center', justifyContent: 'center',
     marginRight: 16, minWidth: 55
   },
+  dateBoxToday: { backgroundColor: '#FEF3C7' },
+  dateBoxInProgress: { backgroundColor: '#D1FAE5' },
   dateDay: { fontSize: 18, fontWeight: 'bold', color: '#1f2937' },
   dateMonth: { fontSize: 10, color: '#6b7280', fontWeight: 'bold', textTransform: 'uppercase' },
   listContent: { flex: 1 },
+  listTitleRow: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 6 },
   listTitle: { fontSize: 16, fontWeight: 'bold', color: '#1f2937', marginBottom: 2 },
   listTime: { fontSize: 12, color: '#6b7280' },
+  todayEventBadge: { backgroundColor: '#FEF3C7', borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 },
+  todayEventBadgeText: { color: '#B45309', fontSize: 9, fontWeight: '800' },
+  inProgressBadge: { backgroundColor: '#059669', borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 },
+  inProgressBadgeText: { color: '#FFFFFF', fontSize: 9, fontWeight: '800' },
   badgeText: { color: '#fff', fontSize: 10, fontWeight: 'bold' },
 });

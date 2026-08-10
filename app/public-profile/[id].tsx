@@ -5,132 +5,140 @@ import {
     StyleSheet,
     ScrollView,
     ActivityIndicator,
+    Alert,
     TouchableOpacity,
     Image,
 } from 'react-native';
 import { useEffect, useState } from 'react';
-import { doc, getDoc, collection, query, where, getDocs, addDoc, serverTimestamp } from 'firebase/firestore';
-import { db, auth } from '../../src/services/firebaseConfig';
+import { addDoc, collection, doc, getDoc, limit, query, serverTimestamp, where, getDocs } from 'firebase/firestore';
+import { db, auth, functions } from '../../src/services/firebaseConfig';
+import { httpsCallable } from 'firebase/functions';
 import { FontAwesome } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import { StyledButton } from '@/src/components/StyledButton';
 import { normalizeInterests } from '@/src/constants/Interests';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { Place, User } from '@/src/types';
+import { CONFIG } from '@/src/constants/Config';
+import { toUserProfile } from '@/src/utils/userProfile';
+import { ReportReasonModal } from '@/src/components/ReportReasonModal';
 
-interface UserProfile {
-    displayName: string;
-    nick?: string;
-    email?: string;
-    photoURL?: string;
-    bio?: string;
-    interests?: string[];
-    eventTypes?: string[];
-    emailVerified?: boolean;
-    reputation?: number;
-    eventsAttended?: number;
-    foundedPlacesCount?: number;
-    shareFrequentedPlaces?: boolean;
-    createdAt?: any;
+function publicProfileLog(event: string, context: Record<string, boolean | number> = {}) {
+    if (__DEV__) console.info(`[PublicProfile] ${event}`, context);
 }
 
 export default function UserProfileScreen() {
     const { id } = useLocalSearchParams();
-    const [profile, setProfile] = useState<UserProfile | null>(null);
-    const [frequentedPlaces, setFrequentedPlaces] = useState<any[]>([]);
+    const profileId = typeof id === 'string' ? id : null;
+    const [profile, setProfile] = useState<User | null>(null);
+    const [frequentedPlaces, setFrequentedPlaces] = useState<Place[]>([]);
     const [loading, setLoading] = useState(true);
+    const [startingConversation, setStartingConversation] = useState(false);
+    const [showReportReasonModal, setShowReportReasonModal] = useState(false);
 
-    const isOwnProfile = auth.currentUser?.uid === id;
+    const isOwnProfile = auth.currentUser?.uid === profileId;
+    const joinedYear = profile?.createdAt ? new Date(profile.createdAt).getFullYear() : undefined;
 
     useEffect(() => {
-        fetchUserProfile();
-    }, [id]);
+        let cancelled = false;
 
-    const fetchUserProfile = async () => {
-        try {
-            const userRef = doc(db, 'users', id as string);
-            const userSnap = await getDoc(userRef);
-
-            if (userSnap.exists()) {
-                const userData = userSnap.data() as UserProfile;
-                setProfile({ ...userData, interests: normalizeInterests(userData.interests) });
-
-                if (!userData.shareFrequentedPlaces) {
+        const loadProfile = async () => {
+            if (!profileId) {
+                if (!cancelled) {
+                    setProfile(null);
                     setFrequentedPlaces([]);
-                    return;
+                    setLoading(false);
                 }
+                return;
             }
 
-            // Busca os lugares que o usuário frequenta
-            const placesRef = collection(db, 'places');
-            const placesQuery = query(placesRef, where('frequenters', 'array-contains', id as string));
-            const placesSnap = await getDocs(placesQuery);
-            const places = placesSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-            setFrequentedPlaces(places);
+            setLoading(true);
+            try {
+                const userSnap = await getDoc(doc(db, 'users', profileId));
+                if (!userSnap.exists()) {
+                    publicProfileLog('profile_not_found');
+                    if (!cancelled) {
+                        setProfile(null);
+                        setFrequentedPlaces([]);
+                    }
+                    return;
+                }
+
+                const userData = toUserProfile(profileId, userSnap.data());
+                if (!cancelled) setProfile({ ...userData, interests: normalizeInterests(userData.interests) });
+
+                // A preferência controla a visibilidade pública, não a do próprio dono.
+                if (!isOwnProfile && userData.shareFrequentedPlaces !== true) {
+                    if (!cancelled) setFrequentedPlaces([]);
+                    return;
+                }
+
+                const placesQuery = query(
+                    collection(db, 'places'),
+                    where('frequenters', 'array-contains', profileId),
+                    limit(CONFIG.PROFILE_PLACES_LIMIT)
+                );
+                const placesSnap = await getDocs(placesQuery);
+                if (!cancelled) {
+                    setFrequentedPlaces(placesSnap.docs.map((place) => ({
+                        id: place.id,
+                        ...(place.data() as Omit<Place, 'id'>),
+                    })));
+                }
+            } catch (error) {
+                console.error('[PublicProfile] profile_load_failed');
+                if (!cancelled) {
+                    setProfile(null);
+                    setFrequentedPlaces([]);
+                }
+            } finally {
+                if (!cancelled) setLoading(false);
+            }
+        };
+
+        loadProfile();
+        return () => { cancelled = true; };
+    }, [isOwnProfile, profileId]);
+
+    const handleSendMessage = async () => {
+        if (!auth.currentUser || !profile || !profileId) return;
+        setStartingConversation(true);
+        publicProfileLog('conversation_start_requested');
+
+        try {
+            const getOrCreateConversation = httpsCallable<
+                { targetUserId: string },
+                { conversationId: string; participantName: string }
+            >(functions, 'getOrCreateConversation');
+            const result = await getOrCreateConversation({ targetUserId: profileId });
+            publicProfileLog('conversation_opened');
+            router.push({
+                pathname: '/conversation/[id]',
+                params: { id: result.data.conversationId, name: result.data.participantName }
+            });
         } catch (error) {
-            console.error('Error fetching user profile:', error);
+            console.error('[PublicProfile] conversation_start_failed');
+            Alert.alert('Conversa indisponível', 'Não foi possível iniciar uma conversa com esta pessoa. Ela pode ter bloqueado contatos ou não estar mais disponível.');
         } finally {
-            setLoading(false);
+            setStartingConversation(false);
         }
     };
 
-    const handleSendMessage = async () => {
-        if (!auth.currentUser || !profile) return;
-        setLoading(true);
-
+    const submitUserReport = async (reason: string) => {
+        if (!auth.currentUser || !profileId || isOwnProfile) return;
         try {
-            const conversationsRef = collection(db, 'conversations');
-            
-            // Check if conversation already exists where both users are participants
-            // Firestore doesn't support 'contains-all' on arrays easily without ordering trick or double query.
-            // A common pattern: query where array-contains currentUid, then filter locally for targetUid.
-            const q = query(conversationsRef, where('participants', 'array-contains', auth.currentUser.uid));
-            const querySnapshot = await getDocs(q);
-            
-            let existingConversationId = null;
-            querySnapshot.forEach((docSnap) => {
-                const data = docSnap.data();
-                if (data.participants && data.participants.includes(id as string)) {
-                    existingConversationId = docSnap.id;
-                }
+            await addDoc(collection(db, 'reports'), {
+                type: 'user',
+                targetId: profileId,
+                reportedBy: auth.currentUser.uid,
+                reason,
+                createdAt: serverTimestamp(),
             });
-
-            if (existingConversationId) {
-                router.push({
-                    pathname: '/conversation/[id]',
-                    params: {
-                        id: existingConversationId,
-                        name: profile.displayName
-                    }
-                });
-            } else {
-                // Create new conversation
-                const newConvRef = await addDoc(conversationsRef, {
-                    participants: [auth.currentUser.uid, id],
-                    participantNames: {
-                        [auth.currentUser.uid]: auth.currentUser.displayName || 'Usuário',
-                        [id as string]: profile.displayName || 'Usuário'
-                    },
-                    lastMessage: '',
-                    updatedAt: serverTimestamp(),
-                    createdAt: serverTimestamp(),
-                    unreadCounts: {
-                        [auth.currentUser.uid]: 0,
-                        [id as string]: 0
-                    }
-                });
-
-                router.push({
-                    pathname: '/conversation/[id]',
-                    params: {
-                        id: newConvRef.id,
-                        name: profile.displayName
-                    }
-                });
-            }
-        } catch (error) {
-            console.error('Error starting conversation:', error);
-        } finally {
-            setLoading(false);
+            setShowReportReasonModal(false);
+            Alert.alert('Denúncia enviada', 'Obrigado. A denúncia será analisada pela moderação.');
+        } catch {
+            console.error('[PublicProfile] report_submit_failed');
+            Alert.alert('Não foi possível enviar', 'Tente novamente em instantes.');
         }
     };
 
@@ -196,16 +204,13 @@ export default function UserProfileScreen() {
                 {/* Nome e Nick */}
                 <View style={{flexDirection: 'row', alignItems: 'center', justifyContent: 'center'}}>
                     <Text style={styles.displayName}>{profile.displayName}</Text>
-                    {profile.emailVerified && (
-                        <FontAwesome name="check-circle" size={18} color="#10B981" style={{marginLeft: 8}} />
-                    )}
                 </View>
                 {profile.nick && (
                     <Text style={styles.nick}>@{profile.nick}</Text>
                 )}
-                {profile.createdAt && (
+                {joinedYear && Number.isFinite(joinedYear) && (
                     <Text style={{color: '#E0E7FF', fontSize: 12, marginTop: 4}}>
-                        No app desde {new Date(profile.createdAt).getFullYear()}
+                        No app desde {joinedYear}
                     </Text>
                 )}
             </LinearGradient>
@@ -274,35 +279,30 @@ export default function UserProfileScreen() {
                     </View>
                 ) : null}
 
-                {/* Tipos de Eventos Preferidos */}
-                {profile.eventTypes && profile.eventTypes.length > 0 ? (
-                    <View style={styles.section}>
-                        <Text style={styles.sectionTitle}>
-                            <FontAwesome name="calendar" size={14} color="#10b981" /> Eventos Preferidos
-                        </Text>
-                        <View style={styles.tagsContainer}>
-                            {profile.eventTypes.map((type, index) => (
-                                <View key={index} style={[styles.tag, styles.eventTag]}>
-                                    <Text style={[styles.tagText, styles.eventTagText]}>{type}</Text>
-                                </View>
-                            ))}
-                        </View>
-                    </View>
-                ) : null}
-
                 {/* Ações */}
                 {!isOwnProfile && (
                     <View style={styles.actionsContainer}>
                         <StyledButton
                             title="Enviar Mensagem"
                             onPress={handleSendMessage}
+                            isLoading={startingConversation}
                             colors={['#6366f1', '#8b5cf6']}
                         />
+                        <TouchableOpacity style={styles.reportButton} onPress={() => setShowReportReasonModal(true)}>
+                            <FontAwesome name="flag" size={15} color="#DC2626" />
+                            <Text style={styles.reportButtonText}>Denunciar usuário</Text>
+                        </TouchableOpacity>
                     </View>
                 )}
 
                 <View style={{ height: 40 }} />
             </ScrollView>
+            <ReportReasonModal
+                visible={showReportReasonModal}
+                targetType="user"
+                onClose={() => setShowReportReasonModal(false)}
+                onSelectReason={submitUserReport}
+            />
         </SafeAreaView>
     );
 }
@@ -466,13 +466,9 @@ const styles = StyleSheet.create({
         fontSize: 13,
         fontWeight: '500',
     },
-    eventTag: {
-        backgroundColor: '#d1fae5',
-    },
-    eventTagText: {
-        color: '#047857',
-    },
     actionsContainer: {
         marginTop: 8,
     },
+    reportButton: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 8, paddingVertical: 16 },
+    reportButtonText: { color: '#DC2626', fontWeight: '700', fontSize: 14 },
 });

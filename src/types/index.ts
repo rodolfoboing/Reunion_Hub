@@ -4,12 +4,20 @@ export interface User {
     displayName?: string;
     email?: string;
     photoURL?: string;
+    bio?: string;
+    searchName?: string;
+    createdAt?: string;
+    isProfileComplete?: boolean;
+    expoPushToken?: string;
     reputation?: number;
     eventsAttended?: number;
     foundedPlacesCount?: number;
     interests?: string[];
     showPopularOutsideInterests?: boolean;
+    shareFrequentedPlaces?: boolean;
+    favorites?: string[];
     blockedUsers?: string[];
+    role?: 'admin' | 'moderator';
 }
 
 export interface Meeting {
@@ -21,6 +29,7 @@ export interface Meeting {
     locationName?: string;
     date?: string;
     time?: string;
+    endTime?: string;
     lat?: number;
     lng?: number;
     type?: 'in-person' | 'online';
@@ -30,11 +39,22 @@ export interface Meeting {
     creatorName?: string;
     createdAt?: string;
     isRepeated?: boolean;
+    seriesId?: string | null;
     attendees?: string[];
     checkedIn?: string[];
+    pendingCheckIns?: CheckInRequest[];
     status?: 'active' | 'completed' | 'cancelled';
     distance?: number; // local helper
 }
+
+export interface CheckInRequest {
+    userId: string;
+    displayName: string;
+}
+
+export type HabitWeekday = 'monday' | 'tuesday' | 'wednesday' | 'thursday' | 'friday' | 'saturday' | 'sunday';
+
+export type HabitSchedule = Partial<Record<HabitWeekday, string[]>>;
 
 export interface Place {
     id: string;
@@ -45,6 +65,7 @@ export interface Place {
     founderId?: string;
     founderName?: string;
     frequenters?: string[];
+    habitSchedules?: Record<string, HabitSchedule>;
     habits?: Record<string, string[]>;
     isCommunity?: boolean;
 }
@@ -53,7 +74,7 @@ export interface Message {
     id: string;
     text: string;
     senderId: string;
-    createdAt: any; // Firestore Timestamp
+    createdAt?: Timestamp | null;
 }
 
 export interface Notification {
@@ -64,9 +85,22 @@ export interface Notification {
     body: string;
     meetingId?: string;
     conversationId?: string;
-    createdAt: any;
+    createdAt?: Timestamp | null;
     read: boolean;
     fromUserId?: string;
+}
+
+export interface EventInviteCandidate {
+    uid: string;
+    displayName: string;
+    nick?: string;
+    photoURL?: string;
+    sharedEventsCount: number;
+}
+
+export interface EventInviteResult {
+    ok: boolean;
+    alreadyInvited: boolean;
 }
 
 export type ReportTargetType = 'user' | 'event';
@@ -79,3 +113,4 @@ export interface Report {
     reason?: string;
     createdAt?: unknown;
 }
+import type { Timestamp } from 'firebase/firestore';

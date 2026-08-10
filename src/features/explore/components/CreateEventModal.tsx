@@ -7,6 +7,7 @@ import { collection, addDoc, doc, setDoc, updateDoc, arrayUnion, writeBatch, get
 import { db, auth } from '@/src/services/firebaseConfig';
 import { INTERESTS_OPTIONS, normalizeInterests } from '@/src/constants/Interests';
 import { CONFIG } from '@/src/constants/Config';
+import { isEndTimeAfterStart } from '@/src/utils/eventSchedule';
 
 interface CreateEventModalProps {
     visible: boolean;
@@ -19,6 +20,7 @@ interface CreateEventModalProps {
     setRepeatCount: (count: number) => void;
     selectedPlace?: any;
     places?: any[];
+    onCreated?: (eventId: string) => void;
 }
 
 export function CreateEventModal({
@@ -31,11 +33,14 @@ export function CreateEventModal({
     repeatCount,
     setRepeatCount,
     selectedPlace,
-    places
+    places,
+    onCreated,
 }: CreateEventModalProps) {
     const [submitting, setSubmitting] = useState(false);
     const [showDatePicker, setShowDatePicker] = useState(false);
     const [showTimePicker, setShowTimePicker] = useState(false);
+    const [showEndTimePicker, setShowEndTimePicker] = useState(false);
+    const [inviteAfterCreate, setInviteAfterCreate] = useState(false);
 
     const toggleInterest = (interest: string) => {
         setNewMeeting((prev: any) => {
@@ -69,9 +74,13 @@ export function CreateEventModal({
             return;
         }
 
-        const isFieldsMissing = !newMeeting.title.trim() || newMeeting.interests.length === 0 || !newMeeting.locationName.trim() || !newMeeting.description.trim() || !newMeeting.date || !newMeeting.time;
+        const isFieldsMissing = !newMeeting.title.trim() || newMeeting.interests.length === 0 || !newMeeting.locationName.trim() || !newMeeting.description.trim() || !newMeeting.date || !newMeeting.time || !newMeeting.endTime;
         if (isFieldsMissing) {
             Alert.alert('Atenção', 'Por favor, preencha todos os campos obrigatórios.');
+            return;
+        }
+        if (!isEndTimeAfterStart(newMeeting.time, newMeeting.endTime)) {
+            Alert.alert('Horário inválido', 'O horário de término deve ser posterior ao horário de início no mesmo dia.');
             return;
         }
         if (eventType === 'online' && !newMeeting.meetingLink.trim()) {
@@ -105,6 +114,7 @@ export function CreateEventModal({
                             const baseDate = new Date(`${newMeeting.date}T${newMeeting.time}:00`);
                             const batch = writeBatch(db);
                             const seriesId = doc(collection(db, 'meetings')).id; // Gerar um ID de série
+                            let firstEventId = '';
                             
                             for (let i = 0; i <= repeatCount; i++) {
                                 const currentEventDate = new Date(baseDate);
@@ -116,6 +126,7 @@ export function CreateEventModal({
                                 const dateStr = `${year}-${month}-${day}`;
                                 
                                 const newDocRef = doc(collection(db, 'meetings'));
+                                if (i === 0) firstEventId = newDocRef.id;
                                 batch.set(newDocRef, {
                                     ...newMeeting,
                                     interests: normalizedInterests,
@@ -132,6 +143,7 @@ export function CreateEventModal({
                                     isRepeated: repeatCount > 0,
                                     seriesId: repeatCount > 0 ? seriesId : null,
                                     attendees: [creatorId],
+                                    status: 'active',
                                 });
                             }
 
@@ -139,13 +151,21 @@ export function CreateEventModal({
 
 
 
-                            Alert.alert('Sucesso', repeatCount > 0 ? `Evento criado com ${repeatCount} repetições semanais!` : 'Seu evento foi criado e já está disponível para a comunidade!');
-                            
+                            const successMessage = repeatCount > 0
+                                ? `Evento criado com ${repeatCount} repetições semanais!`
+                                : 'Seu evento foi criado e já está disponível para a comunidade!';
                             setNewMeeting({
-                                title: '', interests: [], description: '', locationName: '', date: '', time: '',
+                                title: '', interests: [], description: '', locationName: '', date: '', time: '', endTime: '',
                                 lat: newMeeting.lat, lng: newMeeting.lng, type: 'in-person', meetingLink: '', placeId: '',
                             });
+                            setInviteAfterCreate(false);
                             onClose();
+                            if (inviteAfterCreate && firstEventId) {
+                                Alert.alert('Evento criado', `${successMessage}\n\nAgora escolha quem você deseja convidar.`);
+                                onCreated?.(firstEventId);
+                            } else {
+                                Alert.alert('Sucesso', successMessage);
+                            }
                         } catch (error) {
                             console.error('Error adding document: ', error);
                             Alert.alert('Erro', 'Ocorreu um problema ao criar seu evento.');
@@ -194,6 +214,11 @@ export function CreateEventModal({
                                 </TouchableOpacity>
                             </View>
                         </View>
+                        <View style={styles.inputGroup}>
+                            <TouchableOpacity style={[styles.input, { justifyContent: 'center' }]} onPress={() => setShowEndTimePicker(true)}>
+                                <Text style={{ color: newMeeting.endTime ? '#111827' : '#9CA3AF' }}>{newMeeting.endTime || 'Horário de término'}</Text>
+                            </TouchableOpacity>
+                        </View>
                         {showDatePicker && (
                             <DateTimePicker value={new Date()} mode="date" display={Platform.OS === 'ios' ? 'spinner' : 'default'} onChange={(event, selectedDate) => {
                                 setShowDatePicker(false);
@@ -212,6 +237,16 @@ export function CreateEventModal({
                                     const hours = String(selectedDate.getHours()).padStart(2, '0');
                                     const minutes = String(selectedDate.getMinutes()).padStart(2, '0');
                                     setNewMeeting({ ...newMeeting, time: `${hours}:${minutes}` });
+                                }
+                            }} />
+                        )}
+                        {showEndTimePicker && (
+                            <DateTimePicker value={new Date()} mode="time" display={Platform.OS === 'ios' ? 'spinner' : 'default'} is24Hour={true} onChange={(event, selectedDate) => {
+                                setShowEndTimePicker(false);
+                                if (selectedDate) {
+                                    const hours = String(selectedDate.getHours()).padStart(2, '0');
+                                    const minutes = String(selectedDate.getMinutes()).padStart(2, '0');
+                                    setNewMeeting({ ...newMeeting, endTime: `${hours}:${minutes}` });
                                 }
                             }} />
                         )}
@@ -251,6 +286,18 @@ export function CreateEventModal({
                             </View>
                             <Text style={styles.helperText}>Máximo de {CONFIG.MAX_REPEAT_WEEKS} repetições (aprox. 30 dias) para garantir que o evento não fique obsoleto.</Text>
                         </View>
+                        <TouchableOpacity
+                            style={[styles.inviteOption, inviteAfterCreate && styles.inviteOptionSelected]}
+                            onPress={() => setInviteAfterCreate((current) => !current)}
+                            accessibilityRole="checkbox"
+                            accessibilityState={{ checked: inviteAfterCreate }}
+                        >
+                            <Ionicons name={inviteAfterCreate ? 'checkbox' : 'square-outline'} size={22} color="#4F46E5" />
+                            <View style={styles.inviteOptionText}>
+                                <Text style={styles.inviteOptionTitle}>Convidar pessoas após criar</Text>
+                                <Text style={styles.helperText}>Você poderá escolher contatos recentes ou buscar pelo nick. Em eventos repetidos, o convite vale para a primeira data.</Text>
+                            </View>
+                        </TouchableOpacity>
                         <View style={styles.modalFooter}>
                             <TouchableOpacity style={[styles.submitButton, submitting && styles.submitButtonDisabled]} onPress={handleCreateEvent} disabled={submitting}>
                                 {submitting ? <ActivityIndicator color="#fff" /> : <><Ionicons name="checkmark-circle" size={20} color="#fff" style={{ marginRight: 8 }} /><Text style={styles.submitButtonText}>Confirmar Criação</Text></>}
@@ -290,5 +337,9 @@ const styles = StyleSheet.create({
     repeatControls: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff', borderRadius: 8, padding: 4 },
     repeatBtn: { padding: 8 },
     repeatCount: { fontSize: 16, fontWeight: 'bold', color: '#111827', marginHorizontal: 10, width: 20, textAlign: 'center' },
-    helperText: { fontSize: 12, color: '#6B7280', marginTop: 6, fontStyle: 'italic' }
+    helperText: { fontSize: 12, color: '#6B7280', marginTop: 6, fontStyle: 'italic' },
+    inviteOption: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, padding: 14, borderRadius: 12, borderWidth: 1, borderColor: '#E5E7EB', backgroundColor: '#F9FAFB' },
+    inviteOptionSelected: { borderColor: '#A5B4FC', backgroundColor: '#EEF2FF' },
+    inviteOptionText: { flex: 1 },
+    inviteOptionTitle: { color: '#312E81', fontSize: 14, fontWeight: '700' },
 });

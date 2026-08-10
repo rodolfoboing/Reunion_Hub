@@ -1,20 +1,22 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { View, Text, StyleSheet, KeyboardAvoidingView, Platform, Alert, ScrollView, TouchableOpacity, Linking } from 'react-native';
 import { router, Link } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { createUserWithEmailAndPassword, updateProfile, onAuthStateChanged } from 'firebase/auth';
-import { doc, setDoc, collection, query, where, getDocs } from 'firebase/firestore';
+import { createUserWithEmailAndPassword, deleteUser, sendEmailVerification, updateProfile, User as FirebaseUser } from 'firebase/auth';
+import { doc, setDoc, collection, query, where, getDocs, limit } from 'firebase/firestore';
 import { auth, db } from '../../src/services/firebaseConfig';
 import { StyledInput } from '../../src/components/StyledInput';
 import { StyledButton } from '../../src/components/StyledButton';
 import { TermsModal } from '../../src/components/TermsModal';
 import { STRINGS } from '../../src/constants/strings';
+import { authLog, getFirebaseErrorCode } from '../../src/utils/authError';
 
 export default function RegisterScreen() {
     const [nick, setNick] = useState('');
     const [email, setEmail] = useState('');
     const [password, setPassword] = useState('');
+    const [confirmPassword, setConfirmPassword] = useState('');
     const [loading, setLoading] = useState(false);
     const [acceptedTerms, setAcceptedTerms] = useState(false);
     const [showTermsModal, setShowTermsModal] = useState(false);
@@ -31,26 +33,41 @@ export default function RegisterScreen() {
             return;
         }
 
+        const normalizedEmail = email.trim().toLowerCase();
         const sanitizedNick = nick.trim().toLowerCase().replace(/\s+/g, '');
-        if (sanitizedNick.length < 3) {
-            Alert.alert('Erro', 'O Nick deve ter pelo menos 3 caracteres.');
+        if (!/^[a-z0-9._-]{3,20}$/.test(sanitizedNick)) {
+            Alert.alert('Erro', 'O nick deve ter de 3 a 20 caracteres: letras, números, ponto, hífen ou sublinhado.');
+            return;
+        }
+        if (!/^\S+@\S+\.\S+$/.test(normalizedEmail)) {
+            Alert.alert('E-mail inválido', 'Informe um e-mail válido.');
+            return;
+        }
+        if (password.length < 6) {
+            Alert.alert('Senha fraca', 'A senha deve ter pelo menos 6 caracteres.');
+            return;
+        }
+        if (password !== confirmPassword) {
+            Alert.alert('Senhas diferentes', 'Digite a mesma senha nos dois campos.');
             return;
         }
 
         setLoading(true);
+        let createdUser: FirebaseUser | null = null;
+        let profileSaved = false;
         try {
             // 0. Verificar se Nick já existe
-            const q = query(collection(db, 'users'), where('searchName', '==', sanitizedNick));
+            const q = query(collection(db, 'users'), where('searchName', '==', sanitizedNick), limit(1));
             const nickCheck = await getDocs(q);
             if (!nickCheck.empty) {
                 Alert.alert('Nick Indisponível', STRINGS.AUTH_ERROR_NICK_EXISTS);
-                setLoading(false);
                 return;
             }
 
             // 1. Criar Auth
-            const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+            const userCredential = await createUserWithEmailAndPassword(auth, normalizedEmail, password);
             const user = userCredential.user;
+            createdUser = user;
 
             // 2. Atualizar Perfil
             await updateProfile(user, { displayName: nick.trim() });
@@ -61,7 +78,7 @@ export default function RegisterScreen() {
                 displayName: nick.trim(),
                 nick: sanitizedNick,
                 searchName: sanitizedNick,
-                email: email,
+                email: normalizedEmail,
                 reputation: 0,
                 eventsAttended: 0,
                 foundedPlacesCount: 0,
@@ -69,19 +86,33 @@ export default function RegisterScreen() {
                 isProfileComplete: false,
                 createdAt: new Date().toISOString(),
             });
+            profileSaved = true;
+
+            sendEmailVerification(user).then(
+                () => authLog('email_verification_sent_after_registration'),
+                (verificationError: unknown) => console.warn('[Auth] email_verification_send_failed', { code: getFirebaseErrorCode(verificationError) })
+            );
+            authLog('registration_completed');
 
             Alert.alert('Sucesso', STRINGS.AUTH_REGISTER_SUCCESS, [
-                { text: 'OK', onPress: () => router.replace('/' as any) }
+                { text: 'OK', onPress: () => router.replace('/') }
             ]);
-        } catch (error: any) {
-            console.error(`${STRINGS.LOG_AUTH} [Register] Failed:`, error.code, error.message);
+        } catch (error) {
+            const code = getFirebaseErrorCode(error);
+            console.error('[Auth] registration_failed', { code });
+
+            if (createdUser && !profileSaved) {
+                deleteUser(createdUser).catch((cleanupError: unknown) => {
+                    console.error('[Auth] incomplete_registration_cleanup_failed', { code: getFirebaseErrorCode(cleanupError) });
+                });
+            }
             
             let msg = STRINGS.ERROR_DEFAULT;
-            if (error.code === 'auth/email-already-in-use') {
+            if (code === 'auth/email-already-in-use') {
                 msg = 'Este email já está em uso.';
-            } else if (error.code === 'auth/weak-password') {
+            } else if (code === 'auth/weak-password') {
                 msg = 'A senha deve ter pelo menos 6 caracteres.';
-            } else if (error.code === 'auth/network-request-failed') {
+            } else if (code === 'auth/network-request-failed') {
                 msg = STRINGS.ERROR_NETWORK;
             }
             Alert.alert('Erro no Cadastro', msg);
@@ -125,6 +156,14 @@ export default function RegisterScreen() {
                         placeholder="********"
                         value={password}
                         onChangeText={setPassword}
+                        secureTextEntry
+                    />
+
+                    <StyledInput
+                        label="Confirmar senha"
+                        placeholder="********"
+                        value={confirmPassword}
+                        onChangeText={setConfirmPassword}
                         secureTextEntry
                     />
 

@@ -23,7 +23,12 @@ export class ErrorBoundary extends Component<Props, State> {
   }
 
   public componentDidCatch(error: Error, errorInfo: ErrorInfo) {
-    console.error("Uncaught error:", error, errorInfo);
+    if (__DEV__) {
+      console.error('[ErrorBoundary] uncaught_error', {
+        name: error.name,
+        componentStack: errorInfo.componentStack,
+      });
+    }
   }
 
   private handleReset = () => {

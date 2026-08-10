@@ -10,29 +10,22 @@ import { useExploreData } from '@/src/features/explore/hooks/useExploreData';
 import { CreateEventModal } from '@/src/features/explore/components/CreateEventModal';
 import { PlaceModal } from '@/src/features/explore/components/PlaceModal';
 import { LocationPickerModal } from '@/src/features/explore/components/LocationPickerModal';
+import { EventInviteModal } from '@/src/features/events/components/EventInviteModal';
 import { Place, User } from '../../../src/types';
 import { doc, getDoc, collection, query, where, getDocs, setDoc, updateDoc, arrayUnion } from 'firebase/firestore';
 import { db, auth } from '../../../src/services/firebaseConfig';
+import { functions } from '../../../src/services/firebaseConfig';
+import { httpsCallable } from 'firebase/functions';
 import { hasMatchingInterest, INTERESTS_OPTIONS } from '@/src/constants/Interests';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const { width } = Dimensions.get('window');
 
 import { normalizeDate } from '@/src/utils/dateUtils';
+import { isEventInProgress } from '@/src/utils/eventSchedule';
+import { useEventClock } from '@/src/hooks/useEventClock';
 
-const isEventLive = (dateStr?: string, timeStr?: string) => {
-    if (!dateStr || !timeStr) return false;
-    try {
-        const normalized = normalizeDate(dateStr) || dateStr;
-        const eventDateTime = new Date(`${normalized}T${timeStr}:00`);
-        const now = new Date();
-        const diffMs = now.getTime() - eventDateTime.getTime();
-        const diffMinutes = diffMs / (1000 * 60);
-        return diffMinutes >= -30 && diffMinutes <= 180;
-    } catch (e) {
-        return false;
-    }
-};
+const isEventLive = (date?: string, time?: string, endTime?: string, now?: Date) => isEventInProgress({ date, time, endTime }, now);
 
 const PulsingMarker = () => {
     const scaleAnim = useRef(new Animated.Value(1)).current;
@@ -114,6 +107,7 @@ const FILTER_CONFIG: { key: 'events' | 'communityPlaces' | 'osmPlaces' | 'google
 ];
 
 export default function ExploreScreen() {
+    const eventClock = useEventClock();
     const [eventType, setEventType] = useState<'in-person' | 'online'>('in-person');
     const [viewMode, setViewMode] = useState<'map' | 'list'>('map');
     const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
@@ -136,10 +130,11 @@ export default function ExploreScreen() {
 
     const [showMapOnboarding, setShowMapOnboarding] = useState(false);
     const [modalVisible, setModalVisible] = useState(false);
+    const [createdEventIdForInvite, setCreatedEventIdForInvite] = useState<string | null>(null);
     const [repeatCount, setRepeatCount] = useState(0);
     const [pickingLocation, setPickingLocation] = useState(false);
     const [newMeeting, setNewMeeting] = useState({
-        title: '', interests: [] as string[], description: '', locationName: '', date: '', time: '',
+        title: '', interests: [] as string[], description: '', locationName: '', date: '', time: '', endTime: '',
         lat: 0, lng: 0, type: 'in-person', meetingLink: '', placeId: '',
     });
 
@@ -264,22 +259,17 @@ export default function ExploreScreen() {
 
 
 
-    const handleSavePlaceHabit = async (periods: string[]) => {
+    const handleSavePlaceHabit = async (weekday: import('@/src/types').HabitWeekday, periods: string[]) => {
         if (!selectedPlace || !auth.currentUser) return;
         try {
-            const placeRef = doc(db, 'places', selectedPlace.id);
-            await setDoc(placeRef, { 
-                id: selectedPlace.id, 
-                name: selectedPlace.name, 
-                latitude: selectedPlace.latitude, 
-                longitude: selectedPlace.longitude, 
+            await httpsCallable(functions, 'savePlaceHabit')({
+                placeId: selectedPlace.id,
+                name: selectedPlace.name,
+                latitude: selectedPlace.latitude,
+                longitude: selectedPlace.longitude,
                 vocations: selectedPlace.vocations || [],
-                isCommunity: true
-            }, { merge: true });
-            
-            await updateDoc(placeRef, {
-                frequenters: arrayUnion(auth.currentUser.uid),
-                [`habits.${auth.currentUser.uid}`]: periods
+                weekday,
+                periods,
             });
             Alert.alert("Sucesso", "Sua rotina foi salva neste local!");
             setShowPlaceModal(false);
@@ -314,7 +304,7 @@ export default function ExploreScreen() {
                     <Ionicons name={eventType === 'online' ? "videocam-outline" : "location-outline"} size={16} color="#6B7280" />
                     <Text style={styles.locationText} numberOfLines={1}>{item.locationName}</Text>
                 </View>
-                {isEventLive(item.date, item.time) && (
+                {isEventLive(item.date, item.time, item.endTime, eventClock) && (
                     <View style={styles.liveBadge}>
                         <View style={styles.liveDot} />
                         <Text style={styles.liveText}>Ao vivo</Text>
@@ -333,7 +323,7 @@ export default function ExploreScreen() {
     }
 
     return (
-        <SafeAreaView style={styles.container} edges={['top']}>
+        <View style={styles.container}>
             <LinearGradient
                 colors={['#6366F1', '#8B5CF6']}
                 start={{ x: 0, y: 0 }}
@@ -528,9 +518,9 @@ export default function ExploreScreen() {
                                     coordinate={{ latitude: Number(meeting.lat), longitude: Number(meeting.lng) }}
                                     onPress={() => router.push(`/event/${meeting.id}` as any)}
                                     title={meeting.title}
-                                    zIndex={isEventLive(meeting.date, meeting.time) ? 100 : 1}
+                                    zIndex={isEventLive(meeting.date, meeting.time, meeting.endTime, eventClock) ? 100 : 1}
                                 >
-                                    {isEventLive(meeting.date, meeting.time) ? <PulsingMarker /> : (
+                                    {isEventLive(meeting.date, meeting.time, meeting.endTime, eventClock) ? <PulsingMarker /> : (
                                         <View style={styles.markerContainer}>
                                             <View style={[styles.markerBubble, { borderColor: '#6366F1' }]}>
                                                 <Ionicons name="people" size={16} color="#6366F1" />
@@ -584,6 +574,7 @@ export default function ExploreScreen() {
                 setRepeatCount={setRepeatCount}
                 selectedPlace={selectedPlace}
                 places={places}
+                onCreated={setCreatedEventIdForInvite}
             />
 
             <PlaceModal
@@ -599,6 +590,13 @@ export default function ExploreScreen() {
                 onSaveHabit={handleSavePlaceHabit}
                 onCreateEventPress={handleCreateEventAtSelectedPlace}
             />
+            {createdEventIdForInvite && (
+                <EventInviteModal
+                    visible
+                    eventId={createdEventIdForInvite}
+                    onClose={() => setCreatedEventIdForInvite(null)}
+                />
+            )}
 
             <LocationPickerModal
                 visible={pickingLocation}
@@ -633,7 +631,7 @@ export default function ExploreScreen() {
                     </View>
                 </View>
             </Modal>
-        </SafeAreaView>
+        </View>
     );
 }
 
@@ -641,6 +639,7 @@ const styles = StyleSheet.create({
     container: { flex: 1, backgroundColor: '#F9FAFB' },
     center: { alignItems: 'center', justifyContent: 'center' },
     headerContainer: {
+        paddingTop: 50,
         paddingBottom: 25,
         borderBottomLeftRadius: 30,
         borderBottomRightRadius: 30,
@@ -709,7 +708,7 @@ const styles = StyleSheet.create({
     categoryText: { fontSize: 12, fontWeight: '700' },
     categoryDot: { width: 6, height: 6, borderRadius: 3, marginRight: 6 },
 
-    content: { flex: 1 },
+    content: { flex: 1, backgroundColor: '#F9FAFB' },
     mapContainer: { flex: 1, width: '100%', height: '100%' },
     map: { width: '100%', height: '100%' },
     mapActions: { position: 'absolute', bottom: 100, right: 20, alignItems: 'center' },

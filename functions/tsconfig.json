@@ -4,13 +4,18 @@
     "module": "commonjs",
     "noImplicitReturns": true,
     "noUnusedLocals": true,
-    "outDir": "lib",
+    "rootDir": "./src",
+    "outDir": "./lib",
     "sourceMap": true,
     "strict": true,
     "target": "es2017"
   },
   "compileOnSave": true,
   "include": [
-    "src"
+    "src/**/*.ts"
+  ],
+  "exclude": [
+    "lib",
+    "node_modules"
   ]
 }

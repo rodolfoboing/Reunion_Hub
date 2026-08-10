@@ -3,7 +3,22 @@ import { View, Text, StyleSheet, TouchableOpacity, Modal, ActivityIndicator, Ima
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import { Place, User, Meeting } from '@/src/types';
+import { HabitWeekday, Place, User, Meeting } from '@/src/types';
+
+const WEEKDAYS: { key: HabitWeekday; label: string }[] = [
+    { key: 'monday', label: 'Seg' },
+    { key: 'tuesday', label: 'Ter' },
+    { key: 'wednesday', label: 'Qua' },
+    { key: 'thursday', label: 'Qui' },
+    { key: 'friday', label: 'Sex' },
+    { key: 'saturday', label: 'Sáb' },
+    { key: 'sunday', label: 'Dom' },
+];
+
+function currentWeekday(): HabitWeekday {
+    const days: HabitWeekday[] = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+    return days[new Date().getDay()];
+}
 
 interface PlaceModalProps {
     visible: boolean;
@@ -12,7 +27,7 @@ interface PlaceModalProps {
     loadingProfiles: boolean;
     frequentersProfiles: User[];
     placeEvents?: Meeting[];
-    onSaveHabit?: (periods: string[]) => void;
+    onSaveHabit?: (weekday: HabitWeekday, periods: string[]) => void;
     onCreateEventPress: () => void;
 }
 
@@ -28,11 +43,13 @@ export function PlaceModal({
 }: PlaceModalProps) {
     const [isPickingHabit, setIsPickingHabit] = React.useState(false);
     const [selectedPeriods, setSelectedPeriods] = React.useState<string[]>([]);
+    const [selectedWeekday, setSelectedWeekday] = React.useState<HabitWeekday>(currentWeekday);
     
     // Reset state when modal opens/closes
     React.useEffect(() => {
         setIsPickingHabit(false);
         setSelectedPeriods([]);
+        setSelectedWeekday(currentWeekday());
     }, [visible, place]);
 
     if (!place) return null;
@@ -86,7 +103,7 @@ export function PlaceModal({
                                             </View>
                                         )}
                                         <Text style={{ fontSize: 11, color: '#4B5563', marginTop: 4, textAlign: 'center' }} numberOfLines={1}>
-                                            {(prof as any).nick || prof.displayName?.split(' ')[0]}
+                                            {prof.nick || prof.displayName?.split(' ')[0]}
                                         </Text>
                                     </TouchableOpacity>
                                 ))}
@@ -111,7 +128,18 @@ export function PlaceModal({
                         </TouchableOpacity>
                     ) : (
                         <View style={{ backgroundColor: '#F0FDF4', padding: 16, borderRadius: 12, borderWidth: 1, borderColor: '#BBF7D0', marginBottom: 20 }}>
-                            <Text style={{ color: '#15803D', fontWeight: 'bold', marginBottom: 8 }}>Quando você costuma vir aqui?</Text>
+                            <Text style={{ color: '#15803D', fontWeight: 'bold', marginBottom: 8 }}>Em qual dia e período você costuma vir?</Text>
+                            <View style={styles.weekdayContainer}>
+                                {WEEKDAYS.map(({ key, label }) => (
+                                    <TouchableOpacity
+                                        key={key}
+                                        style={[styles.weekdayChip, selectedWeekday === key && styles.weekdayChipSelected]}
+                                        onPress={() => setSelectedWeekday(key)}
+                                    >
+                                        <Text style={[styles.weekdayText, selectedWeekday === key && styles.weekdayTextSelected]}>{label}</Text>
+                                    </TouchableOpacity>
+                                ))}
+                            </View>
                             <View style={{ flexDirection: 'row', gap: 8, marginBottom: 12 }}>
                                 {['Manhã', 'Tarde', 'Noite'].map(period => (
                                     <TouchableOpacity 
@@ -138,7 +166,7 @@ export function PlaceModal({
                                     style={{ flex: 1, backgroundColor: '#16A34A', padding: 10, borderRadius: 8, alignItems: 'center', opacity: selectedPeriods.length > 0 ? 1 : 0.5 }}
                                     disabled={selectedPeriods.length === 0}
                                     onPress={() => {
-                                        if (onSaveHabit) onSaveHabit(selectedPeriods);
+                                        if (onSaveHabit) onSaveHabit(selectedWeekday, selectedPeriods);
                                         setIsPickingHabit(false);
                                     }}
                                 >
@@ -198,4 +226,9 @@ const styles = StyleSheet.create({
     periodChipSelected: { backgroundColor: '#16A34A', borderColor: '#16A34A' },
     periodText: { fontSize: 14, color: '#166534' },
     periodTextSelected: { color: '#fff', fontWeight: 'bold' },
+    weekdayContainer: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 12 },
+    weekdayChip: { minWidth: 44, paddingVertical: 8, paddingHorizontal: 8, borderRadius: 8, backgroundColor: '#fff', borderWidth: 1, borderColor: '#86EFAC', alignItems: 'center' },
+    weekdayChipSelected: { backgroundColor: '#16A34A', borderColor: '#16A34A' },
+    weekdayText: { fontSize: 13, color: '#166534' },
+    weekdayTextSelected: { color: '#fff', fontWeight: 'bold' },
 });

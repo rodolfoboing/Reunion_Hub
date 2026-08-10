@@ -3,7 +3,8 @@ import { View, Text, StyleSheet, FlatList, TextInput, TouchableOpacity, Keyboard
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useLocalSearchParams, useRouter, Stack } from 'expo-router';
 import { FontAwesome, Ionicons } from '@expo/vector-icons';
-import { auth, db } from '../../src/services/firebaseConfig';
+import { auth, db, functions } from '../../src/services/firebaseConfig';
+import { httpsCallable } from 'firebase/functions';
 import { collection, addDoc, query, orderBy, onSnapshot, serverTimestamp, doc, updateDoc, limit, increment, arrayUnion } from 'firebase/firestore';
 import { Message } from '../../src/types';
 import { ReportReasonModal } from '@/src/components/ReportReasonModal';
@@ -84,39 +85,16 @@ export default function ChatScreen() {
         if (!inputText.trim() || !auth.currentUser || !id) return;
 
         const text = inputText.trim();
-        setInputText('');
 
         try {
-            // 1. Add message to subcollection
-            const messagesRef = collection(db, 'conversations', id as string, 'messages');
-            await addDoc(messagesRef, {
+            await httpsCallable<{ conversationId: string; text: string }, { ok: boolean }>(functions, 'sendChatMessage')({
+                conversationId: id as string,
                 text,
-                senderId: auth.currentUser.uid,
-                createdAt: serverTimestamp(),
             });
-
-            // Identifica o outro usuário para incrementar a contagem de não-lidas dele
-            let otherUid = '';
-            if (conversationData && conversationData.participants) {
-                otherUid = conversationData.participants.find((p: string) => p !== auth.currentUser?.uid) || '';
-            }
-
-            // 2. Update conversation summary (last message)
-            const conversationRef = doc(db, 'conversations', id as string);
-            const updates: any = {
-                lastMessage: text,
-                lastMessageTimestamp: serverTimestamp(),
-                lastSenderId: auth.currentUser.uid,
-                deletedBy: [] // Resuscita a conversa se foi deletada por alguém
-            };
-            if (otherUid) {
-                updates[`unreadCounts.${otherUid}`] = increment(1);
-            }
-
-            await updateDoc(conversationRef, updates);
-
+            setInputText('');
         } catch (error) {
             console.error("Error sending message: ", error);
+            Alert.alert('Mensagem não enviada', 'Não foi possível enviar sua mensagem. Tente novamente.');
         }
     };
 

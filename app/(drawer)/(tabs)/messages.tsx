@@ -2,7 +2,8 @@ import React, { useState, useEffect } from 'react';
 import { View, Text, StyleSheet, FlatList, TouchableOpacity, Modal, TextInput, Alert, ActivityIndicator, Linking } from 'react-native';
 import { FontAwesome, Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import { auth, db } from '../../../src/services/firebaseConfig';
+import { auth, db, functions } from '../../../src/services/firebaseConfig';
+import { httpsCallable } from 'firebase/functions';
 import { collection, query, where, onSnapshot, doc, getDoc, setDoc, serverTimestamp, getDocs, orderBy, deleteDoc, updateDoc, arrayUnion, addDoc, limit } from 'firebase/firestore';
 import { LinearGradient } from 'expo-linear-gradient';
 import { ReportReasonModal } from '@/src/components/ReportReasonModal';
@@ -93,24 +94,12 @@ export default function MessagesScreen() {
                 return;
             }
 
-            const uids = [auth.currentUser!.uid, targetUid].sort();
-            const chatId = `${uids[0]}_${uids[1]}`;
-            const chatRef = doc(db, 'conversations', chatId);
-
-            const chatDoc = await getDoc(chatRef);
-
-            if (!chatDoc.exists()) {
-                await setDoc(chatRef, {
-                    participants: uids,
-                    participantNames: {
-                        [auth.currentUser!.uid]: auth.currentUser?.displayName || 'Eu',
-                        [targetUid]: targetUser.nick || targetUser.displayName || 'Usuário'
-                    },
-                    lastMessage: 'Conversa iniciada',
-                    lastMessageTimestamp: serverTimestamp(),
-                    unreadCounts: { [auth.currentUser!.uid]: 0, [targetUid]: 0 }
-                });
-            }
+            const getOrCreateConversation = httpsCallable<
+                { targetUserId: string },
+                { conversationId: string; participantName: string }
+            >(functions, 'getOrCreateConversation');
+            const result = await getOrCreateConversation({ targetUserId: targetUid });
+            const chatId = result.data.conversationId;
 
             setShowNewChatModal(false);
             setTargetNick('');
@@ -118,7 +107,7 @@ export default function MessagesScreen() {
                 pathname: '/conversation/[id]',
                 params: {
                     id: chatId,
-                    name: targetUser.nick || targetUser.displayName || 'Usuário'
+                    name: result.data.participantName
                 }
             });
 

@@ -19,56 +19,76 @@ service cloud.firestore {
         && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ['admin', 'moderator'];
     }
 
-    // Public profiles can be read, but a client may only manage its own profile.
-    // Roles are managed exclusively through a trusted Admin SDK environment.
+    function editableUserFields() {
+      return [
+        'displayName', 'nick', 'searchName', 'bio', 'interests', 'photoURL',
+        'shareFrequentedPlaces', 'showPopularOutsideInterests', 'favorites',
+        'blockedUsers', 'isProfileComplete', 'expoPushToken'
+      ];
+    }
+
     match /users/{userId} {
       allow read: if true;
       allow create: if isOwner(userId)
         && request.resource.data.uid == request.auth.uid
-        && !request.resource.data.keys().hasAny(['role']);
+        && request.resource.data.keys().hasOnly([
+          'uid', 'displayName', 'nick', 'searchName', 'email', 'reputation',
+          'eventsAttended', 'foundedPlacesCount', 'showPopularOutsideInterests',
+          'isProfileComplete', 'createdAt', 'interests', 'photoURL', 'bio',
+          'shareFrequentedPlaces', 'favorites', 'blockedUsers', 'expoPushToken'
+        ]);
       allow update: if isOwner(userId)
-        && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role']);
-      allow delete: if isOwner(userId);
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(editableUserFields());
+      allow delete: if false;
     }
 
-    // Event mutations remain temporarily compatible with the current client flow.
-    // Privileged mutations (completion, reputation and place founding) must move to
-    // Cloud Functions before this rule can be narrowed further.
     match /meetings/{meetingId} {
       allow read: if true;
-      allow create: if hasVerifiedEmail();
+      allow create: if hasVerifiedEmail()
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.keys().hasAll(['title', 'date', 'time', 'endTime', 'type', 'createdBy', 'attendees'])
+        && request.resource.data.type in ['in-person', 'online']
+        && request.resource.data.attendees.size() == 1
+        && request.resource.data.attendees[0] == request.auth.uid
+        && !request.resource.data.keys().hasAny(['checkedIn'])
+        && (!request.resource.data.keys().hasAny(['status']) || request.resource.data.status == 'active');
       allow update, delete: if false;
     }
 
-    // Conversations and messages are visible only to their participants.
     match /conversations/{conversationId} {
-      allow create: if isAuthenticated()
-        && request.auth.uid in request.resource.data.participants;
-      allow read, update: if isAuthenticated()
-        && request.auth.uid in resource.data.participants;
+      allow create: if false;
+      allow read: if isAuthenticated() && request.auth.uid in resource.data.participants;
+      allow update: if isAuthenticated()
+        && request.auth.uid in resource.data.participants
+        && request.resource.data.participants == resource.data.participants
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'lastMessage', 'lastMessageTimestamp', 'lastSenderId', 'unreadCounts',
+          'deletedBy', 'participantNames', 'updatedAt'
+        ]);
       allow delete: if false;
 
       match /messages/{messageId} {
         allow read: if isAuthenticated()
           && request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants;
-        allow create: if isAuthenticated()
-          && request.resource.data.senderId == request.auth.uid
-          && request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants;
-        allow update, delete: if false;
+        allow create, update, delete: if false;
       }
     }
 
     match /places/{placeId} {
       allow read: if true;
-      allow write: if isAuthenticated();
+      allow write: if false;
     }
 
     match /notifications/{notificationId} {
-      allow read, write: if isAuthenticated();
+      allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      allow update: if isAuthenticated()
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read'])
+        && request.resource.data.read == true;
+      allow create, delete: if false;
     }
 
-    // A report is private evidence: only its author can submit it and only staff
-    // members can inspect or resolve it.
     match /reports/{reportId} {
       allow create: if isAuthenticated()
         && request.resource.data.reportedBy == request.auth.uid;

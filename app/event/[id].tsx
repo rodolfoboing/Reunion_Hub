@@ -5,22 +5,19 @@ import { useEffect, useState, useRef } from 'react';
 import { doc, getDoc, addDoc, collection, serverTimestamp } from 'firebase/firestore';
 import { httpsCallable } from 'firebase/functions';
 import { db, auth, functions } from '../../src/services/firebaseConfig';
-import { Meeting } from '../../src/types';
+import { CheckInRequest, Meeting } from '../../src/types';
 import { StyledButton } from '@/src/components/StyledButton';
 import { ErrorState } from '@/src/components/ErrorState';
 import { FontAwesome } from '@expo/vector-icons';
-import { normalizeDate, getTodayStr } from '../../src/utils/dateUtils';
+import { normalizeDate } from '../../src/utils/dateUtils';
+import { formatEventTimeRange, isEventInProgress, isEventToday } from '../../src/utils/eventSchedule';
+import { useEventClock } from '@/src/hooks/useEventClock';
 import { scheduleEventReminder, cancelEventReminder } from '../../src/utils/Notifications';
 import { ReportReasonModal } from '@/src/components/ReportReasonModal';
 import { markRelatedNotificationsAsRead } from '@/src/services/notificationReadService';
+import { EventInviteModal } from '@/src/features/events/components/EventInviteModal';
 
 // Helper para verificar se hoje é o dia do evento
-const isEventDay = (eventDate: string | undefined): boolean => {
-    const normalized = normalizeDate(eventDate);
-    if (!normalized) return false;
-    return normalized === getTodayStr();
-};
-
 // Formata a data para exibição amigável
 const formatDateDisplay = (dateString: string | undefined): string => {
     const normalized = normalizeDate(dateString);
@@ -37,13 +34,16 @@ const formatDateDisplay = (dateString: string | undefined): string => {
 };
 
 export default function MeetingDetailsScreen() {
+    const eventClock = useEventClock();
     const { id, notificationType } = useLocalSearchParams<{ id?: string; notificationType?: string }>();
     const [meeting, setMeeting] = useState<Meeting | null>(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(false);
     const [rsvpLoading, setRsvpLoading] = useState(false);
     const [checkInLoading, setCheckInLoading] = useState(false);
+    const [confirmingCheckInUserId, setConfirmingCheckInUserId] = useState<string | null>(null);
     const [showReportReasonModal, setShowReportReasonModal] = useState(false);
+    const [showInviteModal, setShowInviteModal] = useState(false);
     const [creatorName, setCreatorName] = useState('Usuário');
     const isMounted = useRef(true);
     const hasShownLinkIssueNotice = useRef(false);
@@ -164,23 +164,23 @@ export default function MeetingDetailsScreen() {
             return;
         }
 
-        // Verificar se é o dia do evento
-        if (!isEventDay(meeting.date)) {
+        if (!isEventInProgress(meeting, eventClock)) {
             Alert.alert(
                 'Check-in indisponível',
-                'O check-in só pode ser feito no dia do evento.'
+                'O check-in só pode ser solicitado entre o horário de início e o término do evento.'
             );
             return;
         }
 
         setCheckInLoading(true);
         try {
-            await httpsCallable(functions, 'checkInToEvent')({ eventId: id });
-
+            const requestCheckIn = httpsCallable<{ eventId: string }, { requested: boolean; alreadyConfirmed: boolean }>(functions, 'checkInToEvent');
+            const result = await requestCheckIn({ eventId: id as string });
             Alert.alert(
-                '✅ Check-in Confirmado!',
-                'Parabéns! Você ganhou +10 pontos de reputação por participar deste evento.',
-                [{ text: 'Legal!', style: 'default' }]
+                result.data.alreadyConfirmed ? 'Check-in já confirmado' : 'Solicitação enviada',
+                result.data.alreadyConfirmed
+                    ? 'Sua presença já foi confirmada neste evento.'
+                    : 'Aguarde a confirmação do organizador ou de outro participante. Os +10 pontos serão adicionados após a confirmação.'
             );
 
             fetchMeeting(); // Refresh UI
@@ -189,6 +189,25 @@ export default function MeetingDetailsScreen() {
             Alert.alert('Erro', 'Falha ao fazer check-in. Tente novamente.');
         } finally {
             setCheckInLoading(false);
+        }
+    };
+
+    const handleConfirmCheckIn = async (request: CheckInRequest) => {
+        if (!meeting || !id) return;
+        setConfirmingCheckInUserId(request.userId);
+        try {
+            const confirmCheckIn = httpsCallable<{ eventId: string; targetUserId: string }, { confirmed: boolean }>(functions, 'confirmEventCheckIn');
+            const result = await confirmCheckIn({ eventId: id as string, targetUserId: request.userId });
+            Alert.alert(
+                result.data.confirmed ? 'Presença confirmada' : 'Check-in já confirmado',
+                result.data.confirmed ? `${request.displayName} recebeu os pontos de participação.` : 'Esta solicitação já foi processada.'
+            );
+            fetchMeeting();
+        } catch (error) {
+            console.error('[Event] checkin_confirmation_failed');
+            Alert.alert('Não foi possível confirmar', 'Verifique se o evento ainda está em andamento e tente novamente.');
+        } finally {
+            setConfirmingCheckInUserId(null);
         }
     };
 
@@ -287,19 +306,14 @@ export default function MeetingDetailsScreen() {
                     text: 'Avisar criador',
                     onPress: async () => {
                         try {
-                            const reporterId = auth.currentUser?.uid;
-                            if (!reporterId || !meeting?.createdBy) return;
-                            await addDoc(collection(db, 'notifications'), {
-                                userId: meeting.createdBy,
-                                type: 'online_access_issue',
-                                title: 'Possível problema no link do evento',
-                                body: `Um participante informou dificuldade para acessar "${meeting.title}". Alguns links só ficam disponíveis perto do horário; confira quando possível.`,
-                                meetingId: id,
-                                fromUserId: reporterId,
-                                createdAt: serverTimestamp(),
-                                read: false
-                            });
-                            Alert.alert('Aviso enviado', 'O criador foi avisado para conferir o acesso ao evento.');
+                            if (!auth.currentUser || !meeting?.createdBy) return;
+                            const result = await httpsCallable<{ eventId: string }, { ok: boolean; alreadyReported: boolean }>(functions, 'reportOnlineAccessIssue')({ eventId: id as string });
+                            Alert.alert(
+                                result.data.alreadyReported ? 'Aviso já enviado' : 'Aviso enviado',
+                                result.data.alreadyReported
+                                    ? 'Você já avisou o criador sobre este link. Evitamos repetir a notificação.'
+                                    : 'O criador foi avisado para conferir o acesso ao evento.'
+                            );
                         } catch (error) {
                             console.error('[Event] Erro ao avisar criador sobre link:', error);
                             Alert.alert('Erro', 'Não foi possível enviar o aviso agora.');
@@ -316,7 +330,13 @@ export default function MeetingDetailsScreen() {
     const currentUid = auth.currentUser?.uid;
     const isAttending = currentUid ? meeting.attendees?.includes(currentUid) : false;
     const hasCheckedIn = currentUid ? meeting.checkedIn?.includes(currentUid) : false;
-    const isToday = isEventDay(meeting.date);
+    const pendingCheckIns = meeting.pendingCheckIns || [];
+    const hasPendingCheckIn = currentUid ? pendingCheckIns.some((request) => request.userId === currentUid) : false;
+    const confirmableCheckIns = currentUid && isAttending
+        ? pendingCheckIns.filter((request) => request.userId !== currentUid)
+        : [];
+    const isToday = isEventToday(meeting, eventClock);
+    const isInProgress = isEventInProgress(meeting, eventClock);
     const isCreator = currentUid ? meeting.createdBy === currentUid : false;
     const isCompleted = meeting.status === 'completed';
 
@@ -327,6 +347,12 @@ export default function MeetingDetailsScreen() {
             <ScrollView contentContainerStyle={styles.content}>
                 <Text style={styles.theme}>{meeting.theme}</Text>
                 <Text style={styles.title}>{meeting.title}</Text>
+                {isInProgress && (
+                    <View style={styles.inProgressBanner}>
+                        <FontAwesome name="play-circle" size={16} color="#047857" />
+                        <Text style={styles.inProgressBannerText}>Evento em andamento</Text>
+                    </View>
+                )}
 
                 {/* Criador do Evento */}
                 {meeting.createdBy && (
@@ -363,7 +389,7 @@ export default function MeetingDetailsScreen() {
             {meeting.time && (
                 <View style={styles.infoRow}>
                     <FontAwesome name="clock-o" size={18} color="#6b7280" />
-                    <Text style={styles.infoText}>{meeting.time}</Text>
+                    <Text style={styles.infoText}>{formatEventTimeRange(meeting)}</Text>
                 </View>
             )}
 
@@ -396,6 +422,17 @@ export default function MeetingDetailsScreen() {
                 </Text>
             </TouchableOpacity>
 
+            {isAttending && (!meeting.status || meeting.status === 'active') && (
+                <TouchableOpacity style={styles.inviteSection} onPress={() => setShowInviteModal(true)} activeOpacity={0.75}>
+                    <View style={styles.inviteIcon}><FontAwesome name="user-plus" size={17} color="#4338CA" /></View>
+                    <View style={styles.inviteContent}>
+                        <Text style={styles.inviteTitle}>Convidar pessoas</Text>
+                        <Text style={styles.inviteHint}>Chame alguém por nick ou de eventos em comum.</Text>
+                    </View>
+                    <FontAwesome name="chevron-right" size={16} color="#6B7280" />
+                </TouchableOpacity>
+            )}
+
             {/* Check-in Stats - só mostra se houver check-ins */}
             {meeting.checkedIn && meeting.checkedIn.length > 0 && (
                 <View style={styles.checkInStats}>
@@ -403,6 +440,27 @@ export default function MeetingDetailsScreen() {
                     <Text style={styles.checkInStatsText}>
                         {meeting.checkedIn.length} pessoa(s) fizeram check-in
                     </Text>
+                </View>
+            )}
+
+            {confirmableCheckIns.length > 0 && (
+                <View style={styles.pendingCheckInsSection}>
+                    <Text style={styles.pendingCheckInsTitle}>Confirmações pendentes</Text>
+                    <Text style={styles.pendingCheckInsHint}>Confirme somente a presença de quem você encontrou no evento.</Text>
+                    {confirmableCheckIns.map((request) => (
+                        <View key={request.userId} style={styles.pendingCheckInRow}>
+                            <Text style={styles.pendingCheckInName} numberOfLines={1}>{request.displayName}</Text>
+                            <TouchableOpacity
+                                style={styles.confirmCheckInButton}
+                                onPress={() => handleConfirmCheckIn(request)}
+                                disabled={confirmingCheckInUserId === request.userId}
+                            >
+                                {confirmingCheckInUserId === request.userId
+                                    ? <ActivityIndicator size="small" color="#fff" />
+                                    : <Text style={styles.confirmCheckInButtonText}>Confirmar</Text>}
+                            </TouchableOpacity>
+                        </View>
+                    ))}
                 </View>
             )}
 
@@ -433,11 +491,17 @@ export default function MeetingDetailsScreen() {
                             <View style={styles.checkedInContainer}>
                                 <FontAwesome name="check-circle" size={24} color="#10b981" />
                                 <Text style={styles.checkedInText}>Check-in realizado! ✅</Text>
-                                <Text style={styles.checkedInSubtext}>Você confirmou sua presença neste evento</Text>
+                                <Text style={styles.checkedInSubtext}>Sua presença foi confirmada e os pontos foram adicionados.</Text>
                             </View>
-                        ) : isToday ? (
+                        ) : hasPendingCheckIn ? (
+                            <View style={styles.waitingCheckIn}>
+                                <FontAwesome name="hourglass-half" size={20} color="#D97706" />
+                                <Text style={styles.waitingText}>Aguardando confirmação</Text>
+                                <Text style={styles.waitingSubtext}>O organizador ou outro participante precisa confirmar sua presença.</Text>
+                            </View>
+                        ) : isInProgress ? (
                             <StyledButton
-                                title="📍 Fazer Check-in"
+                                title="📍 Solicitar confirmação de check-in"
                                 onPress={handleCheckIn}
                                 isLoading={checkInLoading}
                                 colors={['#10b981', '#34d399']}
@@ -447,7 +511,7 @@ export default function MeetingDetailsScreen() {
                                 <FontAwesome name="clock-o" size={20} color="#6b7280" />
                                 <Text style={styles.waitingText}>Presença confirmada</Text>
                                 <Text style={styles.waitingSubtext}>
-                                    O check-in estará disponível no dia do evento ({formatDateDisplay(meeting.date)})
+                                    O check-in poderá ser solicitado entre o início e o término do evento ({formatDateDisplay(meeting.date)})
                                 </Text>
                             </View>
                         )}
@@ -509,6 +573,7 @@ export default function MeetingDetailsScreen() {
                 onClose={() => setShowReportReasonModal(false)}
                 onSelectReason={submitEventReport}
             />
+            {meeting && <EventInviteModal visible={showInviteModal} eventId={meeting.id} onClose={() => setShowInviteModal(false)} />}
         </>
     );
 }
@@ -519,6 +584,8 @@ const styles = StyleSheet.create({
     center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
     theme: { color: '#6366f1', fontWeight: 'bold', fontSize: 14, textTransform: 'uppercase', marginBottom: 4 },
     title: { fontSize: 28, fontWeight: 'bold', color: '#111', marginBottom: 16 },
+    inProgressBanner: { flexDirection: 'row', alignItems: 'center', alignSelf: 'flex-start', gap: 8, backgroundColor: '#D1FAE5', borderRadius: 10, paddingHorizontal: 12, paddingVertical: 8, marginBottom: 16 },
+    inProgressBannerText: { color: '#047857', fontSize: 13, fontWeight: '800' },
     infoRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
     infoText: { marginLeft: 8, color: '#374151', fontSize: 16 },
     section: { marginTop: 24 },
@@ -559,6 +626,11 @@ const styles = StyleSheet.create({
         color: '#9ca3af',
         marginTop: 8,
     },
+    inviteSection: { flexDirection: 'row', alignItems: 'center', marginTop: 12, padding: 16, backgroundColor: '#F5F3FF', borderRadius: 16, borderWidth: 1, borderColor: '#DDD6FE' },
+    inviteIcon: { width: 38, height: 38, borderRadius: 19, alignItems: 'center', justifyContent: 'center', backgroundColor: '#EDE9FE', marginRight: 12 },
+    inviteContent: { flex: 1 },
+    inviteTitle: { color: '#312E81', fontWeight: '800', fontSize: 15 },
+    inviteHint: { color: '#6B7280', fontSize: 12, marginTop: 3 },
     creatorCard: {
         flexDirection: 'row',
         alignItems: 'center',
@@ -655,5 +727,12 @@ const styles = StyleSheet.create({
         marginLeft: 6,
         fontWeight: '500',
     },
+    pendingCheckInsSection: { marginTop: 18, padding: 16, borderRadius: 14, borderWidth: 1, borderColor: '#FDE68A', backgroundColor: '#FFFBEB' },
+    pendingCheckInsTitle: { color: '#92400E', fontSize: 15, fontWeight: '800' },
+    pendingCheckInsHint: { color: '#A16207', fontSize: 12, lineHeight: 17, marginTop: 4, marginBottom: 10 },
+    pendingCheckInRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingTop: 8 },
+    pendingCheckInName: { flex: 1, color: '#374151', fontSize: 14, fontWeight: '600' },
+    confirmCheckInButton: { minWidth: 88, minHeight: 36, borderRadius: 9, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 10, backgroundColor: '#16A34A' },
+    confirmCheckInButtonText: { color: '#fff', fontSize: 13, fontWeight: '800' },
 });
 

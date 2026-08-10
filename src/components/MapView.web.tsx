@@ -1,7 +1,12 @@
 import React from 'react';
-import { View, Text } from 'react-native';
+import { StyleProp, Text, View, ViewStyle } from 'react-native';
 
-const MapView = ({ children, style }: any) => (
+type MapViewPlaceholderProps = {
+  children?: React.ReactNode;
+  style?: StyleProp<ViewStyle>;
+};
+
+const MapView = ({ style }: MapViewPlaceholderProps) => (
   <View style={[style, { justifyContent: 'center', alignItems: 'center', backgroundColor: '#e5e7eb' }]}>
     <Text>Mapa não suportado na Web</Text>
   </View>

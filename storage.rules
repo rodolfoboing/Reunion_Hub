@@ -1,0 +1,14 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /avatars/{fileName} {
+      allow read: if true;
+      allow create, update: if request.auth != null
+        && fileName.matches(request.auth.uid + '_.*')
+        && request.resource.size < 5 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+      allow delete: if request.auth != null && fileName.matches(request.auth.uid + '_.*');
+    }
+  }
+}

@@ -3,13 +3,13 @@ import { DarkTheme, DefaultTheme, ThemeProvider } from '@react-navigation/native
 import { useFonts } from 'expo-font';
 import { Stack, router } from 'expo-router';
 import * as SplashScreen from 'expo-splash-screen';
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { View, Text } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import * as Notifications from 'expo-notifications';
 import 'react-native-reanimated';
 import { auth, db } from '../src/services/firebaseConfig'; // Import auth
-import { doc, getDoc, setDoc } from 'firebase/firestore';
+import { doc, onSnapshot, setDoc } from 'firebase/firestore';
 import { useColorScheme } from '@/src/components/useColorScheme';
 import { getNotificationRoute, setupNotifications } from '../src/utils/Notifications';
 import { getNotificationTarget } from '../src/utils/Notifications';
@@ -37,6 +37,7 @@ export default function RootLayout() {
 
   const [authInitialized, setAuthInitialized] = useState(false);
   const [user, setUser] = useState<any>(null);
+  const lastProfileRoute = useRef<string | null>(null);
 
   // Expo Router uses Error Boundaries to catch errors in the navigation tree.
   useEffect(() => {
@@ -69,26 +70,29 @@ export default function RootLayout() {
       SplashScreen.hideAsync().catch(e => console.warn(e));
 
       if (!user) {
+        lastProfileRoute.current = null;
         // Redireciona para login se não houver usuário
         router.replace('/login');
       } else {
-        // Verifica se o perfil está completo
-        const checkProfile = async () => {
-          try {
-            const docRef = doc(db, 'users', user.uid);
-            const docSnap = await getDoc(docRef);
-            if (docSnap.exists()) {
-              const data = docSnap.data();
-              if (data.isProfileComplete === false) {
-                console.log("[ReunionHub Debug] Perfil incompleto, redirecionando para onboarding.");
-                router.replace('/(auth)/onboarding' as never);
-              }
-            }
-          } catch (error) {
-            console.error("Erro ao checar perfil completo", error);
+        const profileRef = doc(db, 'users', user.uid);
+        const unsubscribeProfile = onSnapshot(profileRef, (snapshot) => {
+          if (snapshot.exists() && snapshot.data().banned === true) {
+            console.warn('[RootLayout] banned_account_session_ended');
+            auth.signOut().catch(() => console.error('[RootLayout] banned_sign_out_failed'));
+            router.replace('/login');
+            return;
           }
-        };
-        checkProfile();
+          // Cadastros novos gravam false explicitamente. Perfis antigos que já existiam
+          // antes desse campo são tratados como concluídos e não voltam ao onboarding.
+          const target = snapshot.exists() && snapshot.data().isProfileComplete !== false
+            ? '/(drawer)/(tabs)'
+            : '/(auth)/onboarding';
+          if (lastProfileRoute.current !== target) {
+            lastProfileRoute.current = target;
+            router.replace(target as never);
+          }
+        }, () => console.error('[RootLayout] profile_route_check_failed'));
+        return unsubscribeProfile;
       }
     }
   }, [loaded, authInitialized, user]);

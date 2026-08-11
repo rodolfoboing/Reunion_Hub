@@ -43,6 +43,7 @@ export interface Meeting {
     attendees?: string[];
     checkedIn?: string[];
     pendingCheckIns?: CheckInRequest[];
+    suggestedInviteeIds?: string[];
     status?: 'active' | 'completed' | 'cancelled';
     distance?: number; // local helper
 }
@@ -50,6 +51,12 @@ export interface Meeting {
 export interface CheckInRequest {
     userId: string;
     displayName: string;
+}
+
+export interface FavoriteEventSnapshot extends Meeting {
+    sourceEventId: string;
+    favoritedAt?: Timestamp | null;
+    isFavoriteSnapshot: true;
 }
 
 export type HabitWeekday = 'monday' | 'tuesday' | 'wednesday' | 'thursday' | 'friday' | 'saturday' | 'sunday';

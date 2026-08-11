@@ -8,6 +8,10 @@ import { collection, query, where, onSnapshot, doc, getDoc, setDoc, serverTimest
 import { LinearGradient } from 'expo-linear-gradient';
 import { ReportReasonModal } from '@/src/components/ReportReasonModal';
 
+function getErrorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : '';
+}
+
 export default function MessagesScreen() {
     const [conversations, setConversations] = useState<any[]>([]);
     const [loading, setLoading] = useState(true);
@@ -113,7 +117,13 @@ export default function MessagesScreen() {
 
         } catch (error) {
             console.error("[MessagesScreen] Erro ao iniciar chat:", error);
-            Alert.alert('Erro', 'Não foi possível iniciar a conversa. Verifique sua conexão.');
+            const message = getErrorMessage(error);
+            Alert.alert(
+                'Conversa indisponível',
+                message.includes('bloqueou você')
+                    ? 'Esta pessoa bloqueou você e não pode receber suas mensagens.'
+                    : 'Não foi possível iniciar a conversa. Verifique sua conexão.'
+            );
         } finally {
             setCreatingChat(false);
         }

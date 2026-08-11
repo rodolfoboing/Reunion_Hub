@@ -18,6 +18,8 @@ interface CreateEventModalProps {
     onOpenLocationPicker: () => void;
     repeatCount: number;
     setRepeatCount: (count: number) => void;
+    repeatStartDate: string;
+    setRepeatStartDate: (date: string) => void;
     selectedPlace?: any;
     places?: any[];
     onCreated?: (eventId: string) => void;
@@ -32,6 +34,8 @@ export function CreateEventModal({
     onOpenLocationPicker,
     repeatCount,
     setRepeatCount,
+    repeatStartDate,
+    setRepeatStartDate,
     selectedPlace,
     places,
     onCreated,
@@ -40,6 +44,7 @@ export function CreateEventModal({
     const [showDatePicker, setShowDatePicker] = useState(false);
     const [showTimePicker, setShowTimePicker] = useState(false);
     const [showEndTimePicker, setShowEndTimePicker] = useState(false);
+    const [showRepeatStartDatePicker, setShowRepeatStartDatePicker] = useState(false);
     const [inviteAfterCreate, setInviteAfterCreate] = useState(false);
 
     const toggleInterest = (interest: string) => {
@@ -60,16 +65,20 @@ export function CreateEventModal({
             return;
         }
 
-        try {
-            await currentUser.reload();
-            await currentUser.getIdToken(true);
-        } catch (error) {
-            console.error('[CreateEvent] Não foi possível atualizar a verificação de e-mail:', error);
-            Alert.alert('Verificação necessária', 'Não foi possível confirmar seu e-mail agora. Tente novamente em instantes.');
-            return;
+        let isEmailVerified = currentUser.emailVerified;
+        if (!isEmailVerified) {
+            try {
+                await currentUser.reload();
+                isEmailVerified = currentUser.emailVerified;
+                if (isEmailVerified) await currentUser.getIdToken(true);
+            } catch {
+                console.warn('[CreateEvent] email_verification_refresh_failed');
+                Alert.alert('Sem conexão', 'Não foi possível atualizar a verificação do e-mail. Confira sua internet e tente novamente.');
+                return;
+            }
         }
 
-        if (!currentUser.emailVerified) {
+        if (!isEmailVerified) {
             Alert.alert('Verifique seu e-mail', 'Confirme seu e-mail antes de criar um evento. Você pode enviar ou conferir o link de verificação na tela de Perfil.');
             return;
         }
@@ -81,6 +90,10 @@ export function CreateEventModal({
         }
         if (!isEndTimeAfterStart(newMeeting.time, newMeeting.endTime)) {
             Alert.alert('Horário inválido', 'O horário de término deve ser posterior ao horário de início no mesmo dia.');
+            return;
+        }
+        if (repeatCount > 0 && (!repeatStartDate || repeatStartDate <= newMeeting.date)) {
+            Alert.alert('Data de repetição inválida', 'Escolha uma data posterior à primeira edição para a próxima repetição.');
             return;
         }
         if (eventType === 'online' && !newMeeting.meetingLink.trim()) {
@@ -109,16 +122,23 @@ export function CreateEventModal({
                         try {
                             const creatorProfile = await getDoc(doc(db, 'users', creatorId));
                             const creatorData = creatorProfile.data();
+                            if ((creatorData?.reputation ?? 0) <= -50) {
+                                Alert.alert('Conta sem nível de confiança', 'Sua reputação atual não permite criar novos eventos. Participe de eventos e mantenha presenças confirmadas para recuperar confiança.');
+                                return;
+                            }
                             const creatorName = creatorData?.nick || creatorData?.displayName || auth.currentUser?.displayName || 'Usuário';
                             const normalizedInterests = normalizeInterests(newMeeting.interests);
                             const baseDate = new Date(`${newMeeting.date}T${newMeeting.time}:00`);
+                            const repeatBaseDate = repeatCount > 0 ? new Date(`${repeatStartDate}T${newMeeting.time}:00`) : null;
                             const batch = writeBatch(db);
                             const seriesId = doc(collection(db, 'meetings')).id; // Gerar um ID de série
                             let firstEventId = '';
                             
                             for (let i = 0; i <= repeatCount; i++) {
-                                const currentEventDate = new Date(baseDate);
-                                currentEventDate.setDate(baseDate.getDate() + (i * 7));
+                                const currentEventDate = i === 0 || !repeatBaseDate
+                                    ? new Date(baseDate)
+                                    : new Date(repeatBaseDate);
+                                if (i > 1 && repeatBaseDate) currentEventDate.setDate(repeatBaseDate.getDate() + ((i - 1) * 7));
 
                                 const year = currentEventDate.getFullYear();
                                 const month = String(currentEventDate.getMonth() + 1).padStart(2, '0');
@@ -158,6 +178,7 @@ export function CreateEventModal({
                                 title: '', interests: [], description: '', locationName: '', date: '', time: '', endTime: '',
                                 lat: newMeeting.lat, lng: newMeeting.lng, type: 'in-person', meetingLink: '', placeId: '',
                             });
+                            setRepeatStartDate('');
                             setInviteAfterCreate(false);
                             onClose();
                             if (inviteAfterCreate && firstEventId) {
@@ -191,7 +212,7 @@ export function CreateEventModal({
                     <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.formContent}>
                         <View style={styles.inputGroup}>
                             <Text style={styles.inputLabel}>Nome do Evento</Text>
-                            <TextInput style={styles.input} placeholder="Ex: Café com Tecnologia" value={newMeeting.title} onChangeText={(text) => setNewMeeting({ ...newMeeting, title: text })} />
+                            <TextInput style={styles.input} placeholderTextColor="#B6C0CE" placeholder="Ex: Café com Tecnologia" value={newMeeting.title} onChangeText={(text) => setNewMeeting({ ...newMeeting, title: text })} />
                         </View>
                         <View style={styles.inputGroup}>
                             <Text style={styles.inputLabel}>Interesses Envolvidos</Text>
@@ -207,16 +228,16 @@ export function CreateEventModal({
                             <Text style={styles.inputLabel}>Data e Horário</Text>
                             <View style={styles.row}>
                                 <TouchableOpacity style={[styles.input, { flex: 1, marginRight: 8, justifyContent: 'center' }]} onPress={() => setShowDatePicker(true)}>
-                                    <Text style={{ color: newMeeting.date ? '#111827' : '#9CA3AF' }}>{newMeeting.date ? newMeeting.date.split('-').reverse().join('/') : 'Data (Dia/Mês)'}</Text>
+                                    <Text style={{ color: newMeeting.date ? '#111827' : '#B6C0CE' }}>{newMeeting.date ? newMeeting.date.split('-').reverse().join('/') : 'Data (Dia/Mês)'}</Text>
                                 </TouchableOpacity>
                                 <TouchableOpacity style={[styles.input, { flex: 1, justifyContent: 'center' }]} onPress={() => setShowTimePicker(true)}>
-                                    <Text style={{ color: newMeeting.time ? '#111827' : '#9CA3AF' }}>{newMeeting.time || 'Horário'}</Text>
+                                    <Text style={{ color: newMeeting.time ? '#111827' : '#B6C0CE' }}>{newMeeting.time || 'Horário'}</Text>
                                 </TouchableOpacity>
                             </View>
                         </View>
                         <View style={styles.inputGroup}>
                             <TouchableOpacity style={[styles.input, { justifyContent: 'center' }]} onPress={() => setShowEndTimePicker(true)}>
-                                <Text style={{ color: newMeeting.endTime ? '#111827' : '#9CA3AF' }}>{newMeeting.endTime || 'Horário de término'}</Text>
+                                <Text style={{ color: newMeeting.endTime ? '#111827' : '#B6C0CE' }}>{newMeeting.endTime || 'Horário de término'}</Text>
                             </TouchableOpacity>
                         </View>
                         {showDatePicker && (
@@ -252,12 +273,12 @@ export function CreateEventModal({
                         )}
                         <View style={styles.inputGroup}>
                             <Text style={styles.inputLabel}>{eventType === 'online' ? 'Plataforma (ex: Zoom, Meet)' : 'Nome do Local'}</Text>
-                            <TextInput style={styles.input} placeholder={eventType === 'online' ? "Ex: Google Meet" : "Ex: Parque do Ibirapuera, SP"} value={newMeeting.locationName} onChangeText={(text) => setNewMeeting({ ...newMeeting, locationName: text })} />
+                            <TextInput style={styles.input} placeholderTextColor="#B6C0CE" placeholder={eventType === 'online' ? "Ex: Google Meet" : "Ex: Parque do Ibirapuera, SP"} value={newMeeting.locationName} onChangeText={(text) => setNewMeeting({ ...newMeeting, locationName: text })} />
                         </View>
                         {eventType === 'online' && (
                             <View style={styles.inputGroup}>
                                 <Text style={styles.inputLabel}>Link da Reunião</Text>
-                                <TextInput style={styles.input} placeholder="Cole aqui o link (https://...)" value={newMeeting.meetingLink} onChangeText={(text) => setNewMeeting({ ...newMeeting, meetingLink: text })} autoCapitalize="none" keyboardType="url" />
+                                <TextInput style={styles.input} placeholderTextColor="#B6C0CE" placeholder="Cole aqui o link (https://...)" value={newMeeting.meetingLink} onChangeText={(text) => setNewMeeting({ ...newMeeting, meetingLink: text })} autoCapitalize="none" keyboardType="url" />
                             </View>
                         )}
                         {eventType === 'in-person' && (
@@ -272,7 +293,7 @@ export function CreateEventModal({
 
                         <View style={styles.inputGroup}>
                             <Text style={styles.inputLabel}>Descrição Detalhada</Text>
-                            <TextInput style={[styles.input, styles.textArea]} placeholder="Conte mais sobre o que vai acontecer no evento..." multiline numberOfLines={4} textAlignVertical="top" value={newMeeting.description} onChangeText={(text) => setNewMeeting({ ...newMeeting, description: text })} />
+                            <TextInput style={[styles.input, styles.textArea]} placeholderTextColor="#B6C0CE" placeholder="Conte mais sobre o que vai acontecer no evento..." multiline numberOfLines={4} textAlignVertical="top" value={newMeeting.description} onChangeText={(text) => setNewMeeting({ ...newMeeting, description: text })} />
                         </View>
                         <View style={styles.inputGroup}>
                             <Text style={styles.inputLabel}>Repetição Semanal (Opcional)</Text>
@@ -286,6 +307,27 @@ export function CreateEventModal({
                             </View>
                             <Text style={styles.helperText}>Máximo de {CONFIG.MAX_REPEAT_WEEKS} repetições (aprox. 30 dias) para garantir que o evento não fique obsoleto.</Text>
                         </View>
+                        {repeatCount > 0 && (
+                            <View style={styles.inputGroup}>
+                                <Text style={styles.inputLabel}>Data da próxima repetição</Text>
+                                <TouchableOpacity style={[styles.input, { justifyContent: 'center' }]} onPress={() => setShowRepeatStartDatePicker(true)}>
+                                    <Text style={{ color: repeatStartDate ? '#111827' : '#9CA3AF' }}>
+                                        {repeatStartDate ? repeatStartDate.split('-').reverse().join('/') : 'Escolher próxima data'}
+                                    </Text>
+                                </TouchableOpacity>
+                                <Text style={styles.helperText}>As demais repetições serão semanais a partir desta data.</Text>
+                            </View>
+                        )}
+                        {showRepeatStartDatePicker && (
+                            <DateTimePicker value={new Date()} mode="date" display={Platform.OS === 'ios' ? 'spinner' : 'default'} onChange={(_event, selectedDate) => {
+                                setShowRepeatStartDatePicker(false);
+                                if (!selectedDate) return;
+                                const year = selectedDate.getFullYear();
+                                const month = String(selectedDate.getMonth() + 1).padStart(2, '0');
+                                const day = String(selectedDate.getDate()).padStart(2, '0');
+                                setRepeatStartDate(`${year}-${month}-${day}`);
+                            }} />
+                        )}
                         <TouchableOpacity
                             style={[styles.inviteOption, inviteAfterCreate && styles.inviteOptionSelected]}
                             onPress={() => setInviteAfterCreate((current) => !current)}

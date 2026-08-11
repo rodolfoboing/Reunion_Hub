@@ -8,7 +8,7 @@ import { useClientOnlyValue } from '@/src/components/useClientOnlyValue';
 import { useEffect, useState } from 'react';
 import { auth, db } from '../../../src/services/firebaseConfig';
 import { onAuthStateChanged } from 'firebase/auth';
-import { doc, getDoc } from 'firebase/firestore';
+import { doc, onSnapshot } from 'firebase/firestore';
 
 // You can explore the built-in icon families and icons on the web at https://icons.expo.fyi/
 function TabBarIcon(props: {
@@ -25,28 +25,32 @@ export default function TabLayout() {
   useEffect(() => {
     let isActive = true;
 
-    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+    let unsubscribeProfile: (() => void) | undefined;
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      if (unsubscribeProfile) {
+        unsubscribeProfile();
+        unsubscribeProfile = undefined;
+      }
       if (!user) {
         if (isActive) setIsAdmin(false);
         return;
       }
 
-      try {
-        const userDoc = await getDoc(doc(db, 'users', user.uid));
+      unsubscribeProfile = onSnapshot(doc(db, 'users', user.uid), (userDoc) => {
         const role = userDoc.exists() ? userDoc.get('role') : null;
-
         if (isActive) {
           setIsAdmin(role === 'admin' || role === 'moderator');
         }
-      } catch (error) {
+      }, (error) => {
         console.error('[Tabs] Failed to load moderation role:', error);
         if (isActive) setIsAdmin(false);
-      }
+      });
     });
 
     return () => {
       isActive = false;
       unsubscribe();
+      if (unsubscribeProfile) unsubscribeProfile();
     };
   }, []);
 

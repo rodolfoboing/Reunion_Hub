@@ -8,6 +8,7 @@ import { httpsCallable } from 'firebase/functions';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Alert, Animated, FlatList, LayoutAnimation, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, TouchableOpacity, UIManager, View } from 'react-native';
 import { Calendar, LocaleConfig } from 'react-native-calendars';
+import DateTimePicker from '@react-native-community/datetimepicker';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Meeting } from '../../../src/types';
 import { STRINGS } from '../../../src/constants/strings';
@@ -140,6 +141,7 @@ export default function AgendaScreen() {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(false);
     const [selectedEvent, setSelectedEvent] = useState<any>(null);
+    const [showFavoriteRepeatDatePicker, setShowFavoriteRepeatDatePicker] = useState(false);
     const [recommendations, setRecommendations] = useState<any[]>([]);
     const [allRecs, setAllRecs] = useState<any[]>([]);
     const [historyTitles, setHistoryTitles] = useState<string[]>([]);
@@ -245,27 +247,17 @@ export default function AgendaScreen() {
                     return;
                 }
 
-                // Firestore 'in' query supports max 10 items.
-                const chunks = [];
-                const favoriteIds = favorites.slice(0, CONFIG.AGENDA_FAVORITES_LIMIT);
-                for (let i = 0; i < favoriteIds.length; i += 10) {
-                    chunks.push(favoriteIds.slice(i, i + 10));
-                }
-
-                const promises = chunks.map(chunk =>
-                    getDocs(query(collection(db, 'meetings'), where('__name__', 'in', chunk)))
-                );
-
-                const snaps = await Promise.all(promises);
-                let events: any[] = [];
-                snaps.forEach(snap => {
-                    const mapped = snap.docs.map(d => ({
-                        id: d.id,
-                        ...d.data(),
-                        date: normalizeDate(d.data().date)
-                    })).filter((e: any) => e.status !== 'cancelled');
-                    events = [...events, ...mapped];
-                });
+                const favoritesSnapshot = await getDocs(query(
+                    collection(db, 'users', currentUid, 'favoriteEvents'),
+                    orderBy('favoritedAt', 'desc'),
+                    limit(CONFIG.AGENDA_FAVORITES_LIMIT),
+                ));
+                const events = favoritesSnapshot.docs.map((favorite) => ({
+                    id: favorite.id,
+                    ...favorite.data(),
+                    date: normalizeDate(favorite.data().date),
+                    isFavoriteSnapshot: true,
+                }));
 
                 events.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
                 setFilteredEvents(events);
@@ -274,34 +266,40 @@ export default function AgendaScreen() {
                 return;
             }
 
-            // For Upcoming and History
-            // Query where user is attendee OR creator to prevent downloading the whole DB
-            // 'or' requires import from firebase/firestore
-            // Since 'or' might not be imported, we will query attendees and filter locally for creator 
-            // to keep it simple and avoid missing indexes if 'or' triggers composite index issues.
-            const q = query(
-                collection(db, 'meetings'),
-                where('attendees', 'array-contains', currentUid),
-                limit(CONFIG.AGENDA_MY_EVENTS_LIMIT)
-            );
-
-            const snap = await getDocs(q);
-            let events = snap.docs.map(d => {
+            // Firestore não permite combinar array-contains e createdBy sem uma consulta OR.
+            // Duas leituras pequenas cobrem eventos confirmados e eventos criados, inclusive os legados
+            // em que o criador não foi salvo no array de participantes.
+            const [attendingSnapshot, createdSnapshot] = await Promise.all([
+                getDocs(query(
+                    collection(db, 'meetings'),
+                    where('attendees', 'array-contains', currentUid),
+                    limit(CONFIG.AGENDA_MY_EVENTS_LIMIT)
+                )),
+                getDocs(query(
+                    collection(db, 'meetings'),
+                    where('createdBy', '==', currentUid),
+                    limit(CONFIG.AGENDA_MY_EVENTS_LIMIT)
+                )),
+            ]);
+            const eventDocuments = new Map<string, typeof attendingSnapshot.docs[number]>();
+            attendingSnapshot.docs.forEach((eventDocument) => eventDocuments.set(eventDocument.id, eventDocument));
+            createdSnapshot.docs.forEach((eventDocument) => eventDocuments.set(eventDocument.id, eventDocument));
+            const events = [...eventDocuments.values()].map(d => {
                 const data = d.data();
                 return {
                     id: d.id,
                     ...data,
                     date: normalizeDate(data.date)
                 };
-            }).filter((e: any) => e.date !== null && e.status !== 'cancelled' && e.status !== 'completed');
+            }).filter((e: any) => e.date !== null && e.status !== 'cancelled');
 
             // Local filter for Upcoming vs History
             let results: any[] = [];
             let historyEvents: any[] = [];
 
             if (activeTab === 'upcoming') {
-                results = events.filter((ev: any) => ev.date >= todayStr);
-                historyEvents = events.filter((ev: any) => ev.date < todayStr);
+                results = events.filter((ev: any) => ev.status !== 'completed' && ev.date >= todayStr);
+                historyEvents = events.filter((ev: any) => ev.date < todayStr || ev.status === 'completed');
 
                 // Marcações do calendário: cada dia recebe um objeto com as flags de
                 // sinalização (criado por você, recorrente, popular, passado/próximo).
@@ -376,7 +374,7 @@ export default function AgendaScreen() {
                 return;
 
             } else if (activeTab === 'history') {
-                results = events.filter((ev: any) => ev.date < todayStr);
+                results = events.filter((ev: any) => ev.date < todayStr || ev.status === 'completed');
                 setMarkedDates({});
                 // Sort most recent past first
                 results.sort((a: any, b: any) => (b.date || '').localeCompare(a.date || ''));
@@ -394,14 +392,9 @@ export default function AgendaScreen() {
 
     const toggleFavorite = async (eventId: string) => {
         if (!auth.currentUser) return;
-        const userRef = doc(db, 'users', auth.currentUser.uid);
 
         try {
-            if (favorites.includes(eventId)) {
-                await updateDoc(userRef, { favorites: arrayRemove(eventId) });
-            } else {
-                await updateDoc(userRef, { favorites: arrayUnion(eventId) });
-            }
+            await httpsCallable<{ eventId: string }, { favorited: boolean }>(functions, 'toggleEventFavorite')({ eventId });
         } catch (err) {
             console.error("[Agenda] Erro ao adicionar aos favoritos", err);
         }
@@ -431,7 +424,10 @@ export default function AgendaScreen() {
     };
 
     const handleDeleteEvent = async (event: any) => {
-        Alert.alert('Cancelar Evento', `Cancelar "${event.title}" avisará os participantes e reduzirá sua reputação. Deseja continuar?`, [
+        const hasOtherAttendees = (event.attendees || []).some((attendeeId: string) => attendeeId !== auth.currentUser?.uid);
+        Alert.alert('Cancelar Evento', hasOtherAttendees
+            ? `Cancelar "${event.title}" avisará os participantes e reduzirá sua reputação.`
+            : `Cancelar "${event.title}" não reduz sua reputação, pois não há outros participantes.`, [
             { text: 'Cancelar', style: 'cancel' },
             {
                 text: 'Cancelar Evento', style: 'destructive', onPress: async () => {
@@ -446,6 +442,36 @@ export default function AgendaScreen() {
                 }
             }
         ]);
+    };
+
+    const handleRepeatFavorite = async (selectedDate: Date) => {
+        if (!selectedEvent?.isFavoriteSnapshot) return;
+        const date = `${selectedDate.getFullYear()}-${String(selectedDate.getMonth() + 1).padStart(2, '0')}-${String(selectedDate.getDate()).padStart(2, '0')}`;
+        try {
+            const recreateEvent = httpsCallable<{ eventId: string; date: string }, { eventId: string }>(functions, 'recreateFavoriteEvent');
+            const result = await recreateEvent({ eventId: selectedEvent.sourceEventId || selectedEvent.id, date });
+            setShowFavoriteRepeatDatePicker(false);
+            setSelectedEvent(null);
+            Alert.alert('Evento repetido', 'O novo evento foi criado. Abra-o para convidar participantes de edições anteriores.');
+            router.push(`/event/${result.data.eventId}` as any);
+        } catch (error) {
+            console.error('[Agenda] favorite_recreation_failed');
+            Alert.alert('Não foi possível repetir', 'Escolha uma data futura e tente novamente.');
+        }
+    };
+
+    const handleProposeFavoriteRepeat = async () => {
+        if (!selectedEvent?.isFavoriteSnapshot) return;
+        try {
+            await httpsCallable<{ eventId: string }, { ok: boolean }>(functions, 'proposeFavoriteEventRepeat')({
+                eventId: selectedEvent.sourceEventId || selectedEvent.id,
+            });
+            setSelectedEvent(null);
+            Alert.alert('Proposta enviada', 'O criador foi avisado de que você gostaria de uma nova edição.');
+        } catch (error) {
+            console.error('[Agenda] favorite_repeat_proposal_failed');
+            Alert.alert('Não foi possível enviar', 'Tente novamente em instantes.');
+        }
     };
 
     const AnimatedEventCard = ({ item, onPress }: { item: any, onPress: () => void }) => {
@@ -798,7 +824,7 @@ export default function AgendaScreen() {
                         <View style={styles.modalHandle} />
                         <Text style={styles.modalTitle} numberOfLines={2}>{selectedEvent?.title}</Text>
 
-                        <Pressable
+                        {!selectedEvent?.isFavoriteSnapshot && <Pressable
                             style={({ pressed }) => [styles.modalOption, pressed && styles.modalOptionPressed]}
                             onPress={() => { router.push(`/event/${selectedEvent.id}` as any); setSelectedEvent(null); }}
                         >
@@ -807,9 +833,45 @@ export default function AgendaScreen() {
                             </View>
                             <Text style={styles.modalOptionText}>Ver Detalhes do Evento</Text>
                             <Ionicons name="chevron-forward" size={16} color="#CBD5E1" style={{ marginLeft: 'auto' }} />
-                        </Pressable>
+                        </Pressable>}
 
-                        {selectedEvent?.createdBy === auth.currentUser?.uid ? (
+                        {!selectedEvent?.isFavoriteSnapshot && selectedEvent?.status === 'completed' && selectedEvent?.checkedIn?.includes(auth.currentUser?.uid) && (
+                            <Pressable
+                                style={({ pressed }) => [styles.modalOption, styles.modalOptionDivider, pressed && styles.modalOptionPressed]}
+                                onPress={() => toggleFavorite(selectedEvent.id)}
+                            >
+                                <View style={[styles.modalIconChip, { backgroundColor: '#FFF1F2' }]}>
+                                    <Ionicons name="heart-outline" size={18} color="#E11D48" />
+                                </View>
+                                <Text style={[styles.modalOptionText, { color: '#E11D48' }]}>Adicionar aos favoritos</Text>
+                            </Pressable>
+                        )}
+
+                        {selectedEvent?.isFavoriteSnapshot && selectedEvent?.createdBy === auth.currentUser?.uid && (
+                            <Pressable
+                                style={({ pressed }) => [styles.modalOption, styles.modalOptionDivider, pressed && styles.modalOptionPressed]}
+                                onPress={() => setShowFavoriteRepeatDatePicker(true)}
+                            >
+                                <View style={[styles.modalIconChip, { backgroundColor: '#ECFDF5' }]}>
+                                    <Ionicons name="repeat-outline" size={18} color="#059669" />
+                                </View>
+                                <Text style={[styles.modalOptionText, { color: '#047857' }]}>Repetir este evento</Text>
+                            </Pressable>
+                        )}
+
+                        {selectedEvent?.isFavoriteSnapshot && selectedEvent?.createdBy !== auth.currentUser?.uid && (
+                            <Pressable
+                                style={({ pressed }) => [styles.modalOption, styles.modalOptionDivider, pressed && styles.modalOptionPressed]}
+                                onPress={handleProposeFavoriteRepeat}
+                            >
+                                <View style={[styles.modalIconChip, { backgroundColor: '#EEF2FF' }]}>
+                                    <Ionicons name="paper-plane-outline" size={18} color="#4F46E5" />
+                                </View>
+                                <Text style={styles.modalOptionText}>Pedir nova edição ao criador</Text>
+                            </Pressable>
+                        )}
+
+                        {!selectedEvent?.isFavoriteSnapshot && (selectedEvent?.createdBy === auth.currentUser?.uid || selectedEvent?.attendees?.includes(auth.currentUser?.uid)) && (selectedEvent?.createdBy === auth.currentUser?.uid ? (
                             <Pressable
                                 style={({ pressed }) => [styles.modalOption, styles.modalOptionDivider, pressed && styles.modalOptionPressed]}
                                 onPress={() => handleDeleteEvent(selectedEvent)}
@@ -829,7 +891,7 @@ export default function AgendaScreen() {
                                 </View>
                                 <Text style={[styles.modalOptionText, { color: '#EF4444' }]}>Cancelar Presença (Sair)</Text>
                             </Pressable>
-                        )}
+                        ))}
 
                         <Pressable
                             style={({ pressed }) => [styles.modalCancel, pressed && { backgroundColor: '#E2E8F0' }]}
@@ -840,6 +902,21 @@ export default function AgendaScreen() {
                     </View>
                 </SafeAreaView>
             </Modal>
+            {showFavoriteRepeatDatePicker && (
+                <DateTimePicker
+                    value={new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)}
+                    mode="date"
+                    display={Platform.OS === 'ios' ? 'spinner' : 'default'}
+                    minimumDate={new Date(Date.now() + 24 * 60 * 60 * 1000)}
+                    onChange={(_event, date) => {
+                        if (!date) {
+                            setShowFavoriteRepeatDatePicker(false);
+                            return;
+                        }
+                        handleRepeatFavorite(date);
+                    }}
+                />
+            )}
         </View>
     );
 }

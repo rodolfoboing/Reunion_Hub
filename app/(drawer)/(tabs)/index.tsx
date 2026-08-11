@@ -49,6 +49,7 @@ export default function HomeScreen() {
   const eventClock = useEventClock();
   const [userProfile, setUserProfile] = useState<User | null>(null);
   const [highlights, setHighlights] = useState<Meeting[]>([]);
+  const [popularHighlights, setPopularHighlights] = useState<Meeting[]>([]);
   const [allUpcomingEvents, setAllUpcomingEvents] = useState<Meeting[]>([]);
   const [myEvents, setMyEvents] = useState<Meeting[]>([]);
   const [location, setLocation] = useState<Location.LocationObject | null>(null);
@@ -245,9 +246,11 @@ export default function HomeScreen() {
 
         if (isMounted.current) setAllUpcomingEvents(upcomingHighlights);
 
-        const highlightsForProfile = userProfile?.showPopularOutsideInterests === false
-          ? upcomingHighlights.filter((meeting) => hasMatchingInterest([...(meeting.interests || []), meeting.theme], userInterests))
-          : upcomingHighlights;
+        // Esta seção é exclusivamente por interesse. Eventos populares fora das tags
+        // continuam disponíveis em outras recomendações, sem serem rotulados de interesse.
+        const highlightsForProfile = upcomingHighlights.filter((meeting) =>
+          hasMatchingInterest([...(meeting.interests || []), meeting.theme], userInterests)
+        );
 
         const sortedHighlights = [...highlightsForProfile].sort((a, b) => {
           const matchA = hasMatchingInterest([...(a.interests || []), a.theme], userInterests) ? 1 : 0;
@@ -257,6 +260,15 @@ export default function HomeScreen() {
         });
 
         if (isMounted.current) setHighlights(sortedHighlights.slice(0, 5));
+        const popularOutsideInterests = upcomingHighlights
+          .filter((meeting) =>
+            (meeting.attendees?.length || 0) >= 3
+            && !hasMatchingInterest([...(meeting.interests || []), meeting.theme], userInterests)
+          )
+          .sort((a, b) => (b.attendees?.length || 0) - (a.attendees?.length || 0));
+        if (isMounted.current) {
+          setPopularHighlights(userProfile?.showPopularOutsideInterests ? popularOutsideInterests.slice(0, 5) : []);
+        }
         if (isMounted.current) {
           setError(false);
           setLoading(false);
@@ -282,13 +294,16 @@ export default function HomeScreen() {
     };
   }, [userProfile?.interests?.join(','), userProfile?.showPopularOutsideInterests]);
 
-  const renderEventCard = ({ item }: { item: Meeting }) => (
+  const renderEventCard = ({ item, showPopularLabel = false }: { item: Meeting; showPopularLabel?: boolean }) => (
     <TouchableOpacity style={styles.eventCard} onPress={() => router.push(`/event/${item.id}` as never)}>
       <View style={styles.eventHeader}>
         <FontAwesome name="calendar" size={14} color="#6366f1" />
         <Text style={styles.eventDate}>{item.date || 'Data a definir'}</Text>
       </View>
-      <Text style={styles.eventTitle} numberOfLines={1}>{item.title}</Text>
+      <View style={styles.eventTitleRow}>
+        <Text style={styles.eventTitle} numberOfLines={1}>{item.title}</Text>
+        {showPopularLabel && <Text style={styles.popularTag}>Popular</Text>}
+      </View>
       <Text style={styles.eventLoc} numberOfLines={1}>{item.locationName || 'Local a definir'}</Text>
     </TouchableOpacity>
   );
@@ -372,6 +387,23 @@ export default function HomeScreen() {
               contentContainerStyle={styles.horizontalList}
             />
           </View>
+
+          {popularHighlights.length > 0 && (
+            <View style={styles.section}>
+              <View style={styles.sectionHeader}>
+                <Text style={styles.sectionTitle}>Eventos populares</Text>
+              </View>
+              <Text style={styles.interestTag}>Sugeridos pela quantidade de participantes, fora das suas tags.</Text>
+              <FlatList
+                horizontal
+                data={popularHighlights}
+                renderItem={({ item }) => renderEventCard({ item, showPopularLabel: true })}
+                keyExtractor={item => `popular-${item.id}`}
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.horizontalList}
+              />
+            </View>
+          )}
 
           <View style={styles.section}>
             <Text style={styles.sectionTitle}>Seus Próximos Eventos</Text>
@@ -594,7 +626,9 @@ const styles = StyleSheet.create({
   },
   eventHeader: { flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
   eventDate: { marginLeft: 6, color: '#6366f1', fontSize: 12, fontWeight: 'bold' },
-  eventTitle: { fontSize: 16, fontWeight: 'bold', color: '#1f2937', marginBottom: 4 },
+  eventTitle: { flex: 1, fontSize: 16, fontWeight: 'bold', color: '#1f2937', marginBottom: 4 },
+  eventTitleRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  popularTag: { color: '#B45309', backgroundColor: '#FEF3C7', borderRadius: 7, paddingHorizontal: 6, paddingVertical: 2, fontSize: 10, fontWeight: '800' },
   eventLoc: { fontSize: 12, color: '#6b7280' },
 
   emptyText: { color: '#6b7280', fontSize: 14, fontStyle: 'italic', textAlign: 'center', marginTop: 10 },

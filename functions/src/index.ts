@@ -11,6 +11,23 @@ const smallFunction = functions.runWith({
     maxInstances: 5,
 });
 
+function isErrorWithCode(error: unknown, code: string): boolean {
+    return typeof error === 'object'
+        && error !== null
+        && 'code' in error
+        && error.code === code;
+}
+
+async function requireStaff(context: functions.https.CallableContext): Promise<string> {
+    const uid = requireAuthenticated(context);
+    const profile = await db.collection('users').doc(uid).get();
+    const role = profile.data()?.role;
+    if (role !== 'admin' && role !== 'moderator') {
+        throw new functions.https.HttpsError('permission-denied', 'Apenas a moderacao pode executar esta limpeza.');
+    }
+    return uid;
+}
+
 // Helper: Envio de Push Notifications via API HTTP do Expo
 async function sendExpoPushNotification(pushTokens: string[], title: string, body: string, data: Record<string, unknown> = {}) {
     if (!pushTokens || pushTokens.length === 0) return;
@@ -74,37 +91,39 @@ export const onNewChatMessage = smallFunction.firestore
             senderName = senderSnap.data()?.nick || senderSnap.data()?.displayName || senderName;
         }
 
-        // Busca os tokens e registra uma notificação interna para cada destinatário.
-        // O ID determinístico evita duplicação se o gatilho for reexecutado.
-        const tokens: string[] = [];
-        const notificationsBatch = db.batch();
-        for (const uid of recipientIds) {
-            const userSnap = await db.collection('users').doc(uid).get();
-            if (userSnap.exists) {
-                const token = userSnap.data()?.expoPushToken;
-                if (token) tokens.push(token);
-            }
-            notificationsBatch.set(db.collection('notifications').doc(`chat_${context.params.messageId}_${uid}`), {
-                userId: uid,
-                type: 'chat',
-                title: `Nova mensagem de ${senderName}`,
-                body: msgData.text,
-                conversationId: context.params.conversationId,
-                fromUserId: msgData.senderId,
-                createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                read: false
-            });
-        }
-
-        await Promise.all([
-            notificationsBatch.commit(),
-            sendExpoPushNotification(
-                tokens,
-                `Nova mensagem de ${senderName}`,
-                msgData.text,
-                { path: `/conversation/${context.params.conversationId}`, conversationId: context.params.conversationId }
-            )
-        ]);
+        // Uma conversa mantém apenas uma notificação não lida por destinatário.
+        // Mensagens posteriores atualizam o texto da mesma notificação, sem novo push.
+        const deliveryTokens = await Promise.all(recipientIds.map(async (uid: string) => {
+            const [userSnap, shouldPush] = await Promise.all([
+                db.collection('users').doc(uid).get(),
+                db.runTransaction(async (transaction) => {
+                    const notificationRef = db.collection('notifications').doc(`chat_${context.params.conversationId}_${uid}`);
+                    const existingNotification = await transaction.get(notificationRef);
+                    const hasUnreadNotification = existingNotification.exists && existingNotification.data()?.read === false;
+                    transaction.set(notificationRef, {
+                        userId: uid,
+                        type: 'chat',
+                        title: `Nova mensagem de ${senderName}`,
+                        body: msgData.text,
+                        conversationId: context.params.conversationId,
+                        fromUserId: msgData.senderId,
+                        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                        read: false,
+                    }, { merge: true });
+                    return !hasUnreadNotification;
+                }),
+            ]);
+            const token = userSnap.data()?.expoPushToken;
+            return shouldPush && typeof token === 'string' ? token : null;
+        }));
+        const tokens = deliveryTokens.filter((token): token is string => typeof token === 'string');
+        await sendExpoPushNotification(
+            tokens,
+            `Nova mensagem de ${senderName}`,
+            msgData.text,
+            { path: `/conversation/${context.params.conversationId}`, conversationId: context.params.conversationId }
+        );
+        console.info('[ChatNotification] grouped_delivery', { recipientCount: recipientIds.length, pushCount: tokens.length });
     });
 
 // Notificações derivadas de uma alteração de evento ficam no mesmo gatilho para
@@ -180,36 +199,6 @@ export const onMeetingUpdated = smallFunction.firestore
             }
         }
 
-        const beforeCount = before.attendees?.length || 0;
-        const afterCount = after.attendees?.length || 0;
-
-        if (beforeCount === 1 && afterCount === 2) {
-            console.info('[MeetingNotification] first_rsvp');
-            const creatorId = after.createdBy;
-            if (!creatorId) return;
-
-            const creatorSnap = await db.collection('users').doc(creatorId).get();
-            if (!creatorSnap.exists) return;
-
-            const token = creatorSnap.data()?.expoPushToken;
-            await db.collection('notifications').doc(`first_rsvp_${context.params.meetingId}_${creatorId}`).set({
-                userId: creatorId,
-                type: 'event_first_rsvp',
-                title: 'Primeiro confirmado!',
-                body: `Alguém acabou de confirmar presença no seu evento "${after.title || 'sem título'}".`,
-                meetingId: context.params.meetingId,
-                createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                read: false,
-            }, { merge: true });
-            if (token) {
-                await sendExpoPushNotification(
-                    [token],
-                    'Primeiro confirmado!',
-                    `Alguém acabou de confirmar presença no seu evento "${after.title}".`,
-                    { path: `/event/${context.params.meetingId}`, meetingId: context.params.meetingId }
-                );
-            }
-        }
     });
 
 function requireAuthenticated(context: functions.https.CallableContext): string {
@@ -337,7 +326,7 @@ export const rsvpToEvent = smallFunction.https.onCall(async (data, context) => {
     const eventRef = db.collection('meetings').doc(eventId);
     const userRef = db.collection('users').doc(uid);
 
-    await db.runTransaction(async (transaction) => {
+    const result = await db.runTransaction(async (transaction) => {
         const [eventSnap, userSnap] = await Promise.all([transaction.get(eventRef), transaction.get(userRef)]);
         if (!eventSnap.exists) throw new functions.https.HttpsError('not-found', 'Evento não encontrado.');
 
@@ -345,15 +334,205 @@ export const rsvpToEvent = smallFunction.https.onCall(async (data, context) => {
         if (event.status && event.status !== 'active') {
             throw new functions.https.HttpsError('failed-precondition', 'Este evento não está disponível.');
         }
-        if (event.createdBy === uid) return;
-        if ((event.attendees || []).includes(uid)) return;
+        if (event.createdBy === uid || stringIds(event.attendees).includes(uid)) {
+            return { added: false, creatorId: '', eventTitle: '' };
+        }
         if ((userSnap.data()?.reputation || 0) <= -50) {
             throw new functions.https.HttpsError('permission-denied', 'Sua reputação não permite novas confirmações.');
         }
 
         transaction.update(eventRef, { attendees: admin.firestore.FieldValue.arrayUnion(uid) });
+        return {
+            added: true,
+            creatorId: typeof event.createdBy === 'string' ? event.createdBy : '',
+            eventTitle: typeof event.title === 'string' ? event.title : 'seu evento',
+        };
     });
 
+    if (result.added && result.creatorId) {
+        const [creatorSnap, attendeeSnap] = await Promise.all([
+            db.collection('users').doc(result.creatorId).get(),
+            userRef.get(),
+        ]);
+        const attendeeName = displayNameFor(attendeeSnap.data());
+        await db.collection('notifications').doc(`event_rsvp_${eventId}_${uid}`).set({
+            userId: result.creatorId,
+            type: 'event_rsvp',
+            title: 'Nova presença confirmada',
+            body: `${attendeeName} confirmou presença em "${result.eventTitle}".`,
+            meetingId: eventId,
+            fromUserId: uid,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            read: false,
+        }, { merge: true });
+        const token = creatorSnap.data()?.expoPushToken;
+        if (typeof token === 'string') {
+            await sendExpoPushNotification(
+                [token],
+                'Nova presença confirmada',
+                `${attendeeName} confirmou presença em "${result.eventTitle}".`,
+                { path: `/event/${eventId}`, meetingId: eventId, notificationType: 'event_rsvp' }
+            );
+        }
+        console.info('[EventRsvp] organizer_notified');
+    }
+
+    return { ok: true, added: result.added };
+});
+
+function favoriteSnapshotFor(event: FirebaseFirestore.DocumentData, eventId: string): FirebaseFirestore.DocumentData {
+    const eventTime = typeof event.time === 'string' ? event.time : '';
+    const legacyTimeMatch = /^(\d{2}):(\d{2})$/.exec(eventTime);
+    const legacyStartMinutes = legacyTimeMatch
+        ? Number(legacyTimeMatch[1]) * 60 + Number(legacyTimeMatch[2])
+        : Number.NaN;
+    const legacyEndMinutes = Number.isFinite(legacyStartMinutes) && legacyStartMinutes < (23 * 60 + 59)
+        ? Math.min(legacyStartMinutes + 180, 23 * 60 + 59)
+        : Number.NaN;
+    const compatibleEndTime = typeof event.endTime === 'string' && event.endTime
+        ? event.endTime
+        : Number.isFinite(legacyEndMinutes)
+            ? `${String(Math.floor(legacyEndMinutes / 60)).padStart(2, '0')}:${String(legacyEndMinutes % 60).padStart(2, '0')}`
+            : '';
+
+    return {
+        sourceEventId: eventId,
+        isFavoriteSnapshot: true,
+        title: typeof event.title === 'string' ? event.title : 'Evento',
+        theme: typeof event.theme === 'string' ? event.theme : '',
+        interests: Array.isArray(event.interests) ? event.interests.filter((interest): interest is string => typeof interest === 'string').slice(0, 10) : [],
+        description: typeof event.description === 'string' ? event.description : '',
+        locationName: typeof event.locationName === 'string' ? event.locationName : '',
+        date: typeof event.date === 'string' ? event.date : '',
+        time: eventTime,
+        endTime: compatibleEndTime,
+        type: event.type === 'online' ? 'online' : 'in-person',
+        meetingLink: typeof event.meetingLink === 'string' ? event.meetingLink : '',
+        placeId: typeof event.placeId === 'string' ? event.placeId : '',
+        lat: typeof event.lat === 'number' ? event.lat : null,
+        lng: typeof event.lng === 'number' ? event.lng : null,
+        createdBy: typeof event.createdBy === 'string' ? event.createdBy : '',
+        creatorName: typeof event.creatorName === 'string' ? event.creatorName : 'Usuário',
+        attendees: stringIds(event.attendees),
+        checkedIn: stringIds(event.checkedIn),
+        status: 'completed',
+        favoritedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+}
+
+function requireDateField(data: unknown, field: string): string {
+    const date = requireStringField(data, field);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(new Date(`${date}T12:00:00-03:00`).getTime())) {
+        throw new functions.https.HttpsError('invalid-argument', `${field} é inválida.`);
+    }
+    return date;
+}
+
+export const toggleEventFavorite = smallFunction.https.onCall(async (data, context) => {
+    const uid = requireAuthenticated(context);
+    const eventId = requireEventId(data);
+    const eventRef = db.collection('meetings').doc(eventId);
+    const userRef = db.collection('users').doc(uid);
+    const favoriteRef = userRef.collection('favoriteEvents').doc(eventId);
+
+    const result = await db.runTransaction(async (transaction) => {
+        const [eventSnap, userSnap, favoriteSnap] = await Promise.all([
+            transaction.get(eventRef),
+            transaction.get(userRef),
+            transaction.get(favoriteRef),
+        ]);
+        if (!userSnap.exists) throw new functions.https.HttpsError('not-found', 'Perfil não encontrado.');
+        const currentFavorites = stringIds(userSnap.data()?.favorites);
+        if (favoriteSnap.exists) {
+            transaction.delete(favoriteRef);
+            transaction.update(userRef, { favorites: currentFavorites.filter((favoriteId) => favoriteId !== eventId) });
+            return { favorited: false };
+        }
+        if (!eventSnap.exists) throw new functions.https.HttpsError('not-found', 'Evento não encontrado.');
+        const event = eventSnap.data()!;
+        if (event.status !== 'completed' || !stringIds(event.checkedIn).includes(uid)) {
+            throw new functions.https.HttpsError('failed-precondition', 'Somente eventos concluídos com seu check-in confirmado podem ser favoritadas.');
+        }
+        transaction.set(favoriteRef, favoriteSnapshotFor(event, eventId));
+        transaction.update(userRef, { favorites: [...new Set([...currentFavorites, eventId])] });
+        return { favorited: true };
+    });
+    console.info('[FavoriteEvent] toggled', { favorited: result.favorited });
+    return { ok: true, ...result };
+});
+
+export const recreateFavoriteEvent = smallFunction.https.onCall(async (data, context) => {
+    const uid = requireAuthenticated(context);
+    const eventId = requireEventId(data);
+    const date = requireDateField(data, 'date');
+    const userRef = db.collection('users').doc(uid);
+    const favoriteRef = userRef.collection('favoriteEvents').doc(eventId);
+    const newEventRef = db.collection('meetings').doc();
+
+    await db.runTransaction(async (transaction) => {
+        const [favoriteSnap, userSnap] = await Promise.all([transaction.get(favoriteRef), transaction.get(userRef)]);
+        if (!favoriteSnap.exists || !userSnap.exists) throw new functions.https.HttpsError('not-found', 'Favorito ou perfil não encontrado.');
+        if ((userSnap.data()?.reputation ?? 0) <= -50) throw new functions.https.HttpsError('permission-denied', 'Sua reputação não permite criar novos eventos.');
+        const favorite = favoriteSnap.data()!;
+        if (favorite.createdBy !== uid) throw new functions.https.HttpsError('permission-denied', 'Apenas o criador original pode repetir este evento.');
+        if (date <= dateInSaoPaulo()) throw new functions.https.HttpsError('invalid-argument', 'Escolha uma data futura para repetir o evento.');
+        if (typeof favorite.time !== 'string' || typeof favorite.endTime !== 'string') throw new functions.https.HttpsError('failed-precondition', 'Este favorito não possui horários suficientes para ser repetido.');
+
+        transaction.create(newEventRef, {
+            title: favorite.title,
+            theme: favorite.theme,
+            interests: Array.isArray(favorite.interests) ? favorite.interests : [],
+            description: favorite.description,
+            locationName: favorite.locationName,
+            date,
+            time: favorite.time,
+            endTime: favorite.endTime,
+            type: favorite.type === 'online' ? 'online' : 'in-person',
+            meetingLink: favorite.type === 'online' ? favorite.meetingLink || '' : '',
+            placeId: favorite.type === 'in-person' ? favorite.placeId || '' : '',
+            lat: favorite.type === 'in-person' && typeof favorite.lat === 'number' ? favorite.lat : null,
+            lng: favorite.type === 'in-person' && typeof favorite.lng === 'number' ? favorite.lng : null,
+            createdBy: uid,
+            creatorName: displayNameFor(userSnap.data()),
+            createdAt: new Date().toISOString(),
+            attendees: [uid],
+            suggestedInviteeIds: stringIds(favorite.checkedIn).filter((participantId) => participantId !== uid).slice(0, 50),
+            status: 'active',
+            isRepeated: false,
+            seriesId: null,
+        });
+    });
+    console.info('[FavoriteEvent] recreated');
+    return { ok: true, eventId: newEventRef.id };
+});
+
+export const proposeFavoriteEventRepeat = smallFunction.https.onCall(async (data, context) => {
+    const uid = requireAuthenticated(context);
+    const eventId = requireEventId(data);
+    const favoriteRef = db.collection('users').doc(uid).collection('favoriteEvents').doc(eventId);
+    const favoriteSnap = await favoriteRef.get();
+    if (!favoriteSnap.exists) throw new functions.https.HttpsError('failed-precondition', 'Favorite este evento antes de propor uma nova edição.');
+    const favorite = favoriteSnap.data()!;
+    const creatorId = typeof favorite.createdBy === 'string' ? favorite.createdBy : '';
+    if (!creatorId || creatorId === uid) throw new functions.https.HttpsError('failed-precondition', 'Você pode repetir diretamente um evento que criou.');
+
+    const notificationRef = db.collection('notifications').doc(`repeat_proposal_${eventId}_${uid}`);
+    await notificationRef.set({
+        userId: creatorId,
+        type: 'repeat_proposal',
+        title: 'Pedido para repetir evento',
+        body: `Uma pessoa que participou de "${typeof favorite.title === 'string' ? favorite.title : 'seu evento'}" gostaria de uma nova edição.`,
+        meetingId: eventId,
+        fromUserId: uid,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        read: false,
+    }, { merge: true });
+    const creatorSnap = await db.collection('users').doc(creatorId).get();
+    const token = creatorSnap.data()?.expoPushToken;
+    if (typeof token === 'string') {
+        await sendExpoPushNotification([token], 'Pedido para repetir evento', 'Uma pessoa pediu uma nova edição de um evento seu.', { path: '/(drawer)/(tabs)/agenda', notificationType: 'repeat_proposal' });
+    }
+    console.info('[FavoriteEvent] repeat_proposal_sent');
     return { ok: true };
 });
 
@@ -362,8 +541,11 @@ export const leaveEvent = smallFunction.https.onCall(async (data, context) => {
     const eventId = requireEventId(data);
     const eventRef = db.collection('meetings').doc(eventId);
 
-    await db.runTransaction(async (transaction) => {
-        const eventSnap = await transaction.get(eventRef);
+    const result = await db.runTransaction(async (transaction) => {
+        const [eventSnap, attendeeSnap] = await Promise.all([
+            transaction.get(eventRef),
+            transaction.get(db.collection('users').doc(uid)),
+        ]);
         if (!eventSnap.exists) throw new functions.https.HttpsError('not-found', 'Evento não encontrado.');
         const event = eventSnap.data()!;
         if (event.createdBy === uid) {
@@ -375,8 +557,37 @@ export const leaveEvent = smallFunction.https.onCall(async (data, context) => {
         transaction.update(eventRef, {
             attendees: admin.firestore.FieldValue.arrayRemove(uid),
             checkedIn: admin.firestore.FieldValue.arrayRemove(uid),
+            pendingCheckIns: pendingCheckIns(event.pendingCheckIns).filter((request) => request.userId !== uid),
         });
+        return {
+            creatorId: typeof event.createdBy === 'string' ? event.createdBy : '',
+            eventTitle: typeof event.title === 'string' ? event.title : 'seu evento',
+            attendeeName: displayNameFor(attendeeSnap.data()),
+        };
     });
+
+    if (result.creatorId) {
+        const creatorSnap = await db.collection('users').doc(result.creatorId).get();
+        await db.collection('notifications').doc(`event_leave_${eventId}_${uid}`).set({
+            userId: result.creatorId,
+            type: 'event_attendee_left',
+            title: 'Participante cancelou presença',
+            body: `${result.attendeeName} saiu de "${result.eventTitle}".`,
+            meetingId: eventId,
+            fromUserId: uid,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            read: false,
+        }, { merge: true });
+        const token = creatorSnap.data()?.expoPushToken;
+        if (typeof token === 'string') {
+            await sendExpoPushNotification(
+                [token],
+                'Participante cancelou presença',
+                `${result.attendeeName} saiu de "${result.eventTitle}".`,
+                { path: `/event/${eventId}`, meetingId: eventId, notificationType: 'event_attendee_left' }
+            );
+        }
+    }
 
     return { ok: true };
 });
@@ -413,6 +624,9 @@ export const getEventInviteCandidates = smallFunction.https.onCall(async (data, 
 
     const currentAttendees = new Set(stringIds(event.attendees));
     const candidates = new Map<string, number>();
+    stringIds(event.suggestedInviteeIds).forEach((candidateId) => {
+        if (candidateId !== uid && !currentAttendees.has(candidateId)) candidates.set(candidateId, 100);
+    });
     const now = new Date();
     for (const historyDocument of historySnap.docs) {
         if (historyDocument.id === eventId) continue;
@@ -428,7 +642,10 @@ export const getEventInviteCandidates = smallFunction.https.onCall(async (data, 
         });
     }
 
-    const candidateIds = [...candidates.keys()].slice(0, 12);
+    const candidateIds = [...candidates.entries()]
+        .sort((first, second) => second[1] - first[1])
+        .slice(0, 12)
+        .map(([candidateId]) => candidateId);
     if (candidateIds.length === 0) return { candidates: [] };
 
     const candidateProfiles = await db.getAll(...candidateIds.map((candidateId) => db.collection('users').doc(candidateId)));
@@ -561,8 +778,11 @@ export const getOrCreateConversation = smallFunction.https.onCall(async (data, c
             transaction.get(targetRef),
         ]);
         if (!targetSnap.exists) throw new functions.https.HttpsError('not-found', 'Usuário não encontrado.');
-        if (isBlockedBy(callerSnap.data(), targetUserId) || isBlockedBy(targetSnap.data(), uid)) {
-            throw new functions.https.HttpsError('permission-denied', 'Uma das pessoas bloqueou esta conversa.');
+        if (isBlockedBy(callerSnap.data(), targetUserId)) {
+            throw new functions.https.HttpsError('permission-denied', 'Você bloqueou esta pessoa. Desbloqueie-a no seu perfil para conversar.');
+        }
+        if (isBlockedBy(targetSnap.data(), uid)) {
+            throw new functions.https.HttpsError('permission-denied', 'Esta pessoa bloqueou você e não pode receber suas mensagens.');
         }
 
         const target = targetSnap.data();
@@ -617,8 +837,11 @@ export const sendChatMessage = smallFunction.https.onCall(async (data, context) 
             transaction.get(db.collection('users').doc(otherUserId)),
         ]);
         if (!recipientSnap.exists) throw new functions.https.HttpsError('failed-precondition', 'Este usuário não está mais disponível.');
-        if (isBlockedBy(senderSnap.data(), otherUserId) || isBlockedBy(recipientSnap.data(), uid)) {
-            throw new functions.https.HttpsError('permission-denied', 'Não é possível enviar mensagens nesta conversa.');
+        if (isBlockedBy(senderSnap.data(), otherUserId)) {
+            throw new functions.https.HttpsError('permission-denied', 'Você bloqueou esta pessoa. Desbloqueie-a no seu perfil para enviar mensagens.');
+        }
+        if (isBlockedBy(recipientSnap.data(), uid)) {
+            throw new functions.https.HttpsError('permission-denied', 'Esta pessoa bloqueou você e não pode receber suas mensagens.');
         }
 
         const messageRef = conversationRef.collection('messages').doc();
@@ -682,51 +905,6 @@ export const savePlaceHabit = smallFunction.https.onCall(async (data, context) =
 
     console.info('[PlaceHabit] saved', { weekday, periodsCount: periods.length });
     return { ok: true };
-});
-
-export const reportOnlineAccessIssue = smallFunction.https.onCall(async (data, context) => {
-    const uid = requireAuthenticated(context);
-    const eventId = requireEventId(data);
-    const eventSnap = await db.collection('meetings').doc(eventId).get();
-    if (!eventSnap.exists) throw new functions.https.HttpsError('not-found', 'Evento não encontrado.');
-    const event = eventSnap.data()!;
-    if (event.type !== 'online' || !event.createdBy || event.createdBy === uid || !(event.attendees || []).includes(uid)) {
-        throw new functions.https.HttpsError('permission-denied', 'Este aviso não está disponível.');
-    }
-
-    const notificationRef = db.collection('notifications').doc(`online_access_${eventId}_${uid}`);
-    const created = await db.runTransaction(async (transaction) => {
-        const existing = await transaction.get(notificationRef);
-        if (existing.exists) return false;
-        transaction.create(notificationRef, {
-            userId: event.createdBy,
-            type: 'online_access_issue',
-            title: 'Possível problema no link do evento',
-            body: `Um participante informou dificuldade para acessar "${event.title || 'este evento'}".`,
-            meetingId: eventId,
-            fromUserId: uid,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            read: false,
-        });
-        return true;
-    });
-    if (!created) {
-        console.info('[OnlineAccessIssue] duplicate_report_ignored');
-        return { ok: true, alreadyReported: true };
-    }
-
-    const creatorSnap = await db.collection('users').doc(event.createdBy).get();
-    const token = creatorSnap.data()?.expoPushToken;
-    if (typeof token === 'string') {
-        await sendExpoPushNotification([token], 'Possível problema no link', `Um participante relatou dificuldade em "${event.title || 'seu evento'}".`, {
-            path: `/event/${eventId}`,
-            meetingId: eventId,
-            notificationType: 'online_access_issue',
-        });
-    }
-
-    console.info('[OnlineAccessIssue] report_delivered', { pushSent: typeof token === 'string' });
-    return { ok: true, alreadyReported: false };
 });
 
 export const checkInToEvent = smallFunction.https.onCall(async (data, context) => {
@@ -901,6 +1079,36 @@ function dateInSaoPaulo(daysOffset = 0): string {
     return `${valueFor('year')}-${valueFor('month')}-${valueFor('day')}`;
 }
 
+async function cleanUpOldEventHistory(): Promise<number> {
+    const cutoffDate = dateInSaoPaulo(-90);
+    const oldEvents = await db.collection('meetings')
+        .where('status', 'in', ['completed', 'cancelled'])
+        .where('date', '<', cutoffDate)
+        .orderBy('date', 'asc')
+        .limit(15)
+        .get();
+    if (oldEvents.empty) return 0;
+
+    const eventIds = oldEvents.docs.map((eventDocument) => eventDocument.id);
+    const relatedDocuments: FirebaseFirestore.QueryDocumentSnapshot[] = [];
+    for (let index = 0; index < eventIds.length; index += 10) {
+        const eventIdChunk = eventIds.slice(index, index + 10);
+        const [invitations, notifications] = await Promise.all([
+            db.collection('eventInvitations').where('eventId', 'in', eventIdChunk).get(),
+            db.collection('notifications').where('meetingId', 'in', eventIdChunk).get(),
+        ]);
+        relatedDocuments.push(...invitations.docs, ...notifications.docs);
+    }
+
+    const documentsToDelete = [...oldEvents.docs, ...relatedDocuments];
+    for (let index = 0; index < documentsToDelete.length; index += 400) {
+        const batch = db.batch();
+        documentsToDelete.slice(index, index + 400).forEach((document) => batch.delete(document.ref));
+        await batch.commit();
+    }
+    return oldEvents.size;
+}
+
 // Uma única execução diária: consulta somente eventos ainda ativos de dias anteriores.
 // O limite impede que um volume inesperado transforme a rotina em uma varredura cara.
 export const closeExpiredEventsDaily = smallFunction.pubsub
@@ -924,7 +1132,8 @@ export const closeExpiredEventsDaily = smallFunction.pubsub
                 console.error('[EventAutoClose] completion_failed', { eventId: eventDocument.id });
             }
         }
-        console.info('[EventAutoClose] daily_run_completed', { scanned: expiredEvents.size, completed });
+        const cleaned = expiredEvents.size < 100 ? await cleanUpOldEventHistory() : 0;
+        console.info('[EventAutoClose] daily_run_completed', { scanned: expiredEvents.size, completed, cleaned });
         return null;
     });
 
@@ -934,18 +1143,23 @@ export const cancelEvent = smallFunction.https.onCall(async (data, context) => {
     const eventRef = db.collection('meetings').doc(eventId);
     const userRef = db.collection('users').doc(uid);
 
-    await db.runTransaction(async (transaction) => {
+    const result = await db.runTransaction(async (transaction) => {
         const eventSnap = await transaction.get(eventRef);
         if (!eventSnap.exists) throw new functions.https.HttpsError('not-found', 'Evento não encontrado.');
         const event = eventSnap.data()!;
         if (event.createdBy !== uid) throw new functions.https.HttpsError('permission-denied', 'Apenas o criador pode cancelar.');
-        if (event.status && event.status !== 'active') return;
+        if (event.status && event.status !== 'active') return { penalized: false, alreadyClosed: true };
 
+        const hasOtherAttendees = stringIds(event.attendees).some((attendeeId) => attendeeId !== uid);
         transaction.update(eventRef, { status: 'cancelled' });
-        transaction.update(userRef, { reputation: admin.firestore.FieldValue.increment(-15) });
+        if (hasOtherAttendees) {
+            transaction.update(userRef, { reputation: admin.firestore.FieldValue.increment(-15) });
+        }
+        return { penalized: hasOtherAttendees, alreadyClosed: false };
     });
 
-    return { ok: true };
+    console.info('[EventCancel] completed', { penalized: result.penalized, alreadyClosed: result.alreadyClosed });
+    return { ok: true, ...result };
 });
 
 async function processQueryInBatches(
@@ -964,6 +1178,199 @@ async function processQueryInBatches(
         if (snapshot.size < batchSize) return;
     }
 }
+
+export const removeReportedEvent = smallFunction.https.onCall(async (data, context) => {
+    await requireStaff(context);
+    const eventId = requireEventId(data);
+    const eventRef = db.collection('meetings').doc(eventId);
+    const result = await db.runTransaction(async (transaction) => {
+        const eventSnap = await transaction.get(eventRef);
+        if (!eventSnap.exists) return { removed: false };
+        const event = eventSnap.data()!;
+        if (event.status === 'cancelled') return { removed: false };
+        transaction.update(eventRef, { status: 'cancelled', moderationRemoved: true });
+        return { removed: true };
+    });
+    console.info('[Moderation] reported_event_removed', { removed: result.removed });
+    return { ok: true, ...result };
+});
+
+export const banUser = smallFunction.https.onCall(async (data, context) => {
+    const moderatorId = await requireStaff(context);
+    const targetUserId = requireStringField(data, 'targetUserId');
+    if (targetUserId === moderatorId) {
+        throw new functions.https.HttpsError('failed-precondition', 'VocÃª nÃ£o pode banir sua prÃ³pria conta.');
+    }
+
+    const targetUserRef = db.collection('users').doc(targetUserId);
+    const targetProfile = await targetUserRef.get();
+    if (!targetProfile.exists) throw new functions.https.HttpsError('not-found', 'UsuÃ¡rio nÃ£o encontrado.');
+    const targetRole = targetProfile.data()?.role;
+    if (targetRole === 'admin' || targetRole === 'moderator') {
+        throw new functions.https.HttpsError('permission-denied', 'Contas da moderaÃ§Ã£o nÃ£o podem ser banidas por esta ferramenta.');
+    }
+
+    await Promise.all([
+        admin.auth().updateUser(targetUserId, { disabled: true }),
+        admin.auth().revokeRefreshTokens(targetUserId),
+    ]);
+    await targetUserRef.set({
+        banned: true,
+        bannedAt: admin.firestore.FieldValue.serverTimestamp(),
+        bannedBy: moderatorId,
+    }, { merge: true });
+
+    // A conta continua marcada como banida para impedir nova sessÃ£o; as demais
+    // relaÃ§Ãµes do usuÃ¡rio saem do app por consultas limitadas e sob demanda.
+    const createdEvents = await db.collection('meetings').where('createdBy', '==', targetUserId).limit(200).get();
+    if (!createdEvents.empty) {
+        const batch = db.batch();
+        createdEvents.docs.forEach((eventDocument) => batch.update(eventDocument.ref, { status: 'cancelled', moderationRemoved: true }));
+        await batch.commit();
+    }
+    await processQueryInBatches(
+        db.collection('meetings').where('attendees', 'array-contains', targetUserId),
+        (batch, document) => batch.update(document.ref, {
+            attendees: admin.firestore.FieldValue.arrayRemove(targetUserId),
+            checkedIn: admin.firestore.FieldValue.arrayRemove(targetUserId),
+            pendingCheckIns: pendingCheckIns(document.data().pendingCheckIns).filter((request) => request.userId !== targetUserId),
+        })
+    );
+    await processQueryInBatches(
+        db.collection('conversations').where('participants', 'array-contains', targetUserId),
+        (batch, document) => batch.update(document.ref, {
+            participants: admin.firestore.FieldValue.arrayRemove(targetUserId),
+            deletedBy: admin.firestore.FieldValue.arrayUnion(targetUserId),
+            [`participantNames.${targetUserId}`]: 'UsuÃ¡rio banido',
+            [`unreadCounts.${targetUserId}`]: admin.firestore.FieldValue.delete(),
+        })
+    );
+    await processQueryInBatches(
+        db.collectionGroup('messages').where('senderId', '==', targetUserId),
+        (batch, document) => batch.delete(document.ref)
+    );
+    await processQueryInBatches(
+        db.collection('eventInvitations').where('inviterId', '==', targetUserId),
+        (batch, document) => batch.delete(document.ref)
+    );
+    await processQueryInBatches(
+        db.collection('eventInvitations').where('inviteeId', '==', targetUserId),
+        (batch, document) => batch.delete(document.ref)
+    );
+    await processQueryInBatches(
+        targetUserRef.collection('favoriteEvents'),
+        (batch, document) => batch.delete(document.ref)
+    );
+    await processQueryInBatches(
+        db.collection('places').where('frequenters', 'array-contains', targetUserId),
+        (batch, document) => batch.update(document.ref, {
+            frequenters: admin.firestore.FieldValue.arrayRemove(targetUserId),
+            [`habits.${targetUserId}`]: admin.firestore.FieldValue.delete(),
+            [`habitSchedules.${targetUserId}`]: admin.firestore.FieldValue.delete(),
+        })
+    );
+    await processQueryInBatches(
+        db.collection('users').where('blockedUsers', 'array-contains', targetUserId),
+        (batch, document) => batch.update(document.ref, {
+            blockedUsers: admin.firestore.FieldValue.arrayRemove(targetUserId),
+        })
+    );
+    await admin.storage().bucket().deleteFiles({ prefix: `avatars/${targetUserId}_` }).catch(() => {
+        console.warn('[Moderation] banned_avatar_cleanup_failed');
+    });
+    console.info('[Moderation] user_banned', { cancelledEvents: createdEvents.size });
+    return { ok: true, cancelledEvents: createdEvents.size };
+});
+
+// Limpeza manual e direcionada para casos em que uma conta foi removida do
+// Authentication por fora do app. NÃ£o hÃ¡ varredura agendada: ela sÃ³ roda quando
+// um moderador informa um UID e confirma que a conta Auth realmente nÃ£o existe.
+export const cleanupDeletedAuthUser = smallFunction.https.onCall(async (data, context) => {
+    await requireStaff(context);
+    const targetUserId = requireStringField(data, 'targetUserId');
+
+    let accountStillExists = false;
+    try {
+        await admin.auth().getUser(targetUserId);
+        accountStillExists = true;
+    } catch (error) {
+        if (!isErrorWithCode(error, 'auth/user-not-found')) {
+            console.error('[DeletedAuthCleanup] auth_lookup_failed');
+            throw new functions.https.HttpsError('internal', 'Nao foi possivel conferir a conta no Authentication.');
+        }
+    }
+    if (accountStillExists) {
+        throw new functions.https.HttpsError('failed-precondition', 'A conta ainda existe no Authentication e nao pode ser limpa por esta ferramenta.');
+    }
+
+    const userRef = db.collection('users').doc(targetUserId);
+    console.info('[DeletedAuthCleanup] started');
+    await processQueryInBatches(
+        db.collection('meetings').where('createdBy', '==', targetUserId),
+        (batch, document) => batch.delete(document.ref)
+    );
+    await processQueryInBatches(
+        db.collection('notifications').where('userId', '==', targetUserId),
+        (batch, document) => batch.delete(document.ref)
+    );
+    await processQueryInBatches(
+        db.collection('reports').where('reportedBy', '==', targetUserId),
+        (batch, document) => batch.delete(document.ref)
+    );
+    await processQueryInBatches(
+        db.collection('eventInvitations').where('inviterId', '==', targetUserId),
+        (batch, document) => batch.delete(document.ref)
+    );
+    await processQueryInBatches(
+        db.collection('eventInvitations').where('inviteeId', '==', targetUserId),
+        (batch, document) => batch.delete(document.ref)
+    );
+    await processQueryInBatches(
+        userRef.collection('favoriteEvents'),
+        (batch, document) => batch.delete(document.ref)
+    );
+    await processQueryInBatches(
+        db.collectionGroup('messages').where('senderId', '==', targetUserId),
+        (batch, document) => batch.delete(document.ref)
+    );
+    await processQueryInBatches(
+        db.collection('places').where('frequenters', 'array-contains', targetUserId),
+        (batch, document) => batch.update(document.ref, {
+            frequenters: admin.firestore.FieldValue.arrayRemove(targetUserId),
+            [`habits.${targetUserId}`]: admin.firestore.FieldValue.delete(),
+            [`habitSchedules.${targetUserId}`]: admin.firestore.FieldValue.delete(),
+        })
+    );
+    await processQueryInBatches(
+        db.collection('meetings').where('attendees', 'array-contains', targetUserId),
+        (batch, document) => batch.update(document.ref, {
+            attendees: admin.firestore.FieldValue.arrayRemove(targetUserId),
+            checkedIn: admin.firestore.FieldValue.arrayRemove(targetUserId),
+            pendingCheckIns: pendingCheckIns(document.data().pendingCheckIns).filter((request) => request.userId !== targetUserId),
+        })
+    );
+    await processQueryInBatches(
+        db.collection('conversations').where('participants', 'array-contains', targetUserId),
+        (batch, document) => batch.update(document.ref, {
+            participants: admin.firestore.FieldValue.arrayRemove(targetUserId),
+            deletedBy: admin.firestore.FieldValue.arrayUnion(targetUserId),
+            [`participantNames.${targetUserId}`]: 'UsuÃ¡rio excluÃ­do',
+            [`unreadCounts.${targetUserId}`]: admin.firestore.FieldValue.delete(),
+        })
+    );
+    await processQueryInBatches(
+        db.collection('users').where('blockedUsers', 'array-contains', targetUserId),
+        (batch, document) => batch.update(document.ref, {
+            blockedUsers: admin.firestore.FieldValue.arrayRemove(targetUserId),
+        })
+    );
+    await userRef.delete();
+    await admin.storage().bucket().deleteFiles({ prefix: `avatars/${targetUserId}_` }).catch(() => {
+        console.warn('[DeletedAuthCleanup] avatar_cleanup_failed');
+    });
+    console.info('[DeletedAuthCleanup] completed');
+    return { ok: true };
+});
 
 export const deleteMyAccount = smallFunction.https.onCall(async (_data, context) => {
     const uid = requireAuthenticated(context);
@@ -990,6 +1397,10 @@ export const deleteMyAccount = smallFunction.https.onCall(async (_data, context)
     );
     await processQueryInBatches(
         db.collection('eventInvitations').where('inviteeId', '==', uid),
+        (batch, document) => batch.delete(document.ref)
+    );
+    await processQueryInBatches(
+        userRef.collection('favoriteEvents'),
         (batch, document) => batch.delete(document.ref)
     );
     await processQueryInBatches(

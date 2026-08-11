@@ -9,7 +9,6 @@ import { Notification } from '../../src/types';
 
 const getIconName = (type: string): keyof typeof Ionicons.glyphMap => {
     if (type === 'chat') return 'chatbubble-outline';
-    if (type === 'online_access_issue') return 'link-outline';
     if (type.includes('event')) return 'calendar-outline';
     return 'notifications-outline';
 };

@@ -1,10 +1,12 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, StyleSheet, FlatList, TouchableOpacity, ActivityIndicator, Alert } from 'react-native';
+import { View, Text, StyleSheet, FlatList, TouchableOpacity, ActivityIndicator, Alert, TextInput } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons, MaterialIcons } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import { db } from '../../../src/services/firebaseConfig';
-import { collection, getDocs, query, orderBy, deleteDoc, doc, getDoc, limit } from 'firebase/firestore';
+import { auth, db, functions } from '../../../src/services/firebaseConfig';
+import { collection, getDocs, query, orderBy, deleteDoc, doc, getDoc, limit, onSnapshot } from 'firebase/firestore';
+import { onAuthStateChanged } from 'firebase/auth';
+import { httpsCallable } from 'firebase/functions';
 import { Report, ReportTargetType } from '../../../src/types';
 
 const REPORTS_FETCH_LIMIT = 100;
@@ -30,6 +32,34 @@ export default function ModerationScreen() {
     const [aggregatedEvents, setAggregatedEvents] = useState<AggregatedReport[]>([]);
     const [loading, setLoading] = useState(true);
     const [activeTab, setActiveTab] = useState<'users' | 'events'>('users');
+    const [isStaff, setIsStaff] = useState(false);
+    const [orphanedUserId, setOrphanedUserId] = useState('');
+    const [cleaningOrphanedUser, setCleaningOrphanedUser] = useState(false);
+
+    useEffect(() => {
+        let unsubscribeProfile: (() => void) | undefined;
+        const unsubscribeAuth = onAuthStateChanged(auth, (currentUser) => {
+            if (unsubscribeProfile) {
+                unsubscribeProfile();
+                unsubscribeProfile = undefined;
+            }
+            if (!currentUser) {
+                setIsStaff(false);
+                return;
+            }
+            unsubscribeProfile = onSnapshot(doc(db, 'users', currentUser.uid), (profile) => {
+                const role = profile.data()?.role;
+                setIsStaff(role === 'admin' || role === 'moderator');
+            }, () => {
+                console.warn('[Moderation] staff_check_failed');
+                setIsStaff(false);
+            });
+        });
+        return () => {
+            unsubscribeAuth();
+            if (unsubscribeProfile) unsubscribeProfile();
+        };
+    }, []);
 
     const fetchReports = async () => {
         setLoading(true);
@@ -112,8 +142,9 @@ export default function ModerationScreen() {
     };
 
     useEffect(() => {
+        if (!isStaff) return;
         fetchReports();
-    }, []);
+    }, [isStaff]);
 
     const handleResolveGroup = async (group: AggregatedReport) => {
         Alert.alert(
@@ -149,6 +180,88 @@ export default function ModerationScreen() {
         } else if (type === 'event') {
             router.push(`/event/${targetId}`);
         }
+    };
+
+    const handleRemoveReportedEvent = (group: AggregatedReport) => {
+        Alert.alert(
+            'Remover evento',
+            `Remover "${group.targetName}" do app? Os participantes serão avisados e o evento deixará de aparecer nas telas públicas.`,
+            [
+                { text: 'Cancelar', style: 'cancel' },
+                {
+                    text: 'Remover evento',
+                    style: 'destructive',
+                    onPress: async () => {
+                        try {
+                            const removeEvent = httpsCallable<{ eventId: string }, { ok: boolean }>(functions, 'removeReportedEvent');
+                            await removeEvent({ eventId: group.targetId });
+                            setAggregatedEvents((current) => current.filter((item) => item.targetId !== group.targetId));
+                            Alert.alert('Evento removido', 'O evento foi removido das áreas públicas e os participantes foram avisados.');
+                        } catch (error) {
+                            console.error('[Moderation] remove_reported_event_failed', error);
+                            Alert.alert('Erro', 'Não foi possível remover este evento.');
+                        }
+                    },
+                },
+            ],
+        );
+    };
+
+    const handleBanUser = (group: AggregatedReport) => {
+        Alert.alert(
+            'Banir usuário',
+            `Banir "${group.targetName}"? A conta será desativada, a sessão será encerrada e a participação dela em eventos, conversas, convites e locais será removida.`,
+            [
+                { text: 'Cancelar', style: 'cancel' },
+                {
+                    text: 'Banir usuário',
+                    style: 'destructive',
+                    onPress: async () => {
+                        try {
+                            const banUser = httpsCallable<{ targetUserId: string }, { ok: boolean }>(functions, 'banUser');
+                            await banUser({ targetUserId: group.targetId });
+                            Alert.alert('Usuário banido', 'A conta foi desativada e os dados de participação foram removidos.');
+                        } catch (error) {
+                            console.error('[Moderation] ban_user_failed', error);
+                            Alert.alert('Erro', 'Não foi possível banir este usuário.');
+                        }
+                    },
+                },
+            ],
+        );
+    };
+
+    const handleCleanDeletedAuthUser = () => {
+        const targetUserId = orphanedUserId.trim();
+        if (!targetUserId) {
+            Alert.alert('Informe o UID', 'Cole o UID da conta que ja foi apagada no Firebase Authentication.');
+            return;
+        }
+        Alert.alert(
+            'Limpar dados orfaos',
+            'Isso apagara os dados do Firestore, convites, favoritos, mensagens e avatar vinculados a esse UID somente se a conta nao existir mais no Authentication.',
+            [
+                { text: 'Cancelar', style: 'cancel' },
+                {
+                    text: 'Limpar dados',
+                    style: 'destructive',
+                    onPress: async () => {
+                        setCleaningOrphanedUser(true);
+                        try {
+                            const cleanup = httpsCallable<{ targetUserId: string }, { ok: boolean }>(functions, 'cleanupDeletedAuthUser');
+                            await cleanup({ targetUserId });
+                            setOrphanedUserId('');
+                            Alert.alert('Concluido', 'Os dados orfaos desse usuario foram removidos.');
+                        } catch (error) {
+                            console.error('[Moderation] orphaned_user_cleanup_failed', error);
+                            Alert.alert('Nao foi possivel limpar', 'Confira se o UID esta correto e se a conta ja foi removida do Authentication.');
+                        } finally {
+                            setCleaningOrphanedUser(false);
+                        }
+                    },
+                },
+            ]
+        );
     };
 
     const renderReportGroup = ({ item }: { item: AggregatedReport }) => {
@@ -199,13 +312,17 @@ export default function ModerationScreen() {
                     </TouchableOpacity>
                     
                     <TouchableOpacity 
-                        style={styles.deleteButton}
-                        onPress={() => handleResolveGroup(item)}
+                        style={isUser ? styles.banButton : styles.removeEventButton}
+                        onPress={() => isUser ? handleBanUser(item) : handleRemoveReportedEvent(item)}
                     >
-                        <Ionicons name="checkmark-done-circle-outline" size={20} color="#059669" />
-                        <Text style={styles.deleteButtonText}>Ignorar Denúncia</Text>
+                        <Ionicons name={isUser ? "ban-outline" : "trash-outline"} size={20} color="#fff" />
+                        <Text style={styles.destructiveButtonText}>{isUser ? 'Banir usuário' : 'Remover evento'}</Text>
                     </TouchableOpacity>
                 </View>
+                <TouchableOpacity style={styles.resolveButton} onPress={() => handleResolveGroup(item)}>
+                    <Ionicons name="checkmark-done-circle-outline" size={18} color="#059669" />
+                    <Text style={styles.resolveButtonText}>Ignorar denúncias</Text>
+                </TouchableOpacity>
             </View>
         );
     };
@@ -240,6 +357,32 @@ export default function ModerationScreen() {
                     <Text style={[styles.tabText, activeTab === 'events' && styles.activeTabText]}>Eventos</Text>
                 </TouchableOpacity>
             </View>
+
+            {isStaff && (
+                <View style={styles.cleanupCard}>
+                    <View style={styles.cleanupTitleRow}>
+                        <Ionicons name="trash-bin-outline" size={18} color="#B91C1C" />
+                        <Text style={styles.cleanupTitle}>Limpar conta removida</Text>
+                    </View>
+                    <Text style={styles.cleanupDescription}>Use apenas depois de apagar a conta no Firebase Authentication.</Text>
+                    <TextInput
+                        value={orphanedUserId}
+                        onChangeText={setOrphanedUserId}
+                        placeholder="UID do usuario removido"
+                        placeholderTextColor="#9CA3AF"
+                        autoCapitalize="none"
+                        autoCorrect={false}
+                        style={styles.cleanupInput}
+                    />
+                    <TouchableOpacity
+                        style={[styles.cleanupButton, cleaningOrphanedUser && styles.cleanupButtonDisabled]}
+                        disabled={cleaningOrphanedUser}
+                        onPress={handleCleanDeletedAuthUser}
+                    >
+                        {cleaningOrphanedUser ? <ActivityIndicator color="#fff" /> : <Text style={styles.cleanupButtonText}>Verificar e limpar</Text>}
+                    </TouchableOpacity>
+                </View>
+            )}
 
             {loading ? (
                 <View style={styles.center}>
@@ -290,6 +433,57 @@ const styles = StyleSheet.create({
         paddingBottom: 16,
         borderBottomWidth: 1,
         borderBottomColor: '#e5e7eb',
+    },
+    cleanupCard: {
+        margin: 16,
+        marginBottom: 0,
+        backgroundColor: '#FFF7ED',
+        borderColor: '#FED7AA',
+        borderWidth: 1,
+        borderRadius: 14,
+        padding: 14,
+    },
+    cleanupTitleRow: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 8,
+    },
+    cleanupTitle: {
+        fontSize: 14,
+        fontWeight: '800',
+        color: '#9A3412',
+    },
+    cleanupDescription: {
+        color: '#7C2D12',
+        fontSize: 12,
+        lineHeight: 17,
+        marginTop: 6,
+    },
+    cleanupInput: {
+        backgroundColor: '#fff',
+        borderColor: '#FDBA74',
+        borderWidth: 1,
+        borderRadius: 9,
+        color: '#1F2937',
+        fontSize: 13,
+        marginTop: 12,
+        paddingHorizontal: 11,
+        paddingVertical: 9,
+    },
+    cleanupButton: {
+        alignItems: 'center',
+        backgroundColor: '#C2410C',
+        borderRadius: 9,
+        marginTop: 10,
+        paddingVertical: 10,
+    },
+    cleanupButtonDisabled: {
+        opacity: 0.6,
+    },
+    cleanupButtonText: {
+        color: '#fff',
+        fontSize: 13,
+        fontWeight: '800',
     },
     tab: {
         flex: 1,
@@ -426,22 +620,44 @@ const styles = StyleSheet.create({
         fontWeight: 'bold',
         marginLeft: 8,
     },
-    deleteButton: {
+    banButton: {
         flexDirection: 'row',
         alignItems: 'center',
         justifyContent: 'center',
-        backgroundColor: '#ecfdf5',
+        backgroundColor: '#B91C1C',
         paddingVertical: 10,
         paddingHorizontal: 16,
         borderRadius: 12,
         flex: 1,
         marginLeft: 8,
-        borderWidth: 1,
-        borderColor: '#059669',
     },
-    deleteButtonText: {
-        color: '#059669',
+    removeEventButton: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'center',
+        backgroundColor: '#DC2626',
+        paddingVertical: 10,
+        paddingHorizontal: 16,
+        borderRadius: 12,
+        flex: 1,
+        marginLeft: 8,
+    },
+    destructiveButtonText: {
+        color: '#fff',
         fontWeight: 'bold',
         marginLeft: 8,
+    },
+    resolveButton: {
+        alignItems: 'center',
+        flexDirection: 'row',
+        justifyContent: 'center',
+        marginTop: 10,
+        paddingVertical: 8,
+    },
+    resolveButtonText: {
+        color: '#059669',
+        fontSize: 13,
+        fontWeight: '700',
+        marginLeft: 6,
     },
 });

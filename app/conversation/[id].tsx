@@ -10,6 +10,10 @@ import { Message } from '../../src/types';
 import { ReportReasonModal } from '@/src/components/ReportReasonModal';
 import { markRelatedNotificationsAsRead } from '@/src/services/notificationReadService';
 
+function getErrorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : '';
+}
+
 export default function ChatScreen() {
     const { id, name } = useLocalSearchParams();
     const router = useRouter();
@@ -94,7 +98,15 @@ export default function ChatScreen() {
             setInputText('');
         } catch (error) {
             console.error("Error sending message: ", error);
-            Alert.alert('Mensagem não enviada', 'Não foi possível enviar sua mensagem. Tente novamente.');
+            const message = getErrorMessage(error);
+            Alert.alert(
+                'Mensagem não enviada',
+                message.includes('bloqueou você')
+                    ? 'Esta pessoa bloqueou você e não pode receber suas mensagens.'
+                    : message.includes('Você bloqueou')
+                        ? 'Você bloqueou esta pessoa. Desbloqueie-a no seu perfil para enviar mensagens.'
+                        : 'Não foi possível enviar sua mensagem. Tente novamente.'
+            );
         }
     };
 

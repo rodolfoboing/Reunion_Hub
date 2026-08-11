@@ -6,8 +6,14 @@ service cloud.firestore {
       return request.auth != null;
     }
 
+    function isBanned() {
+      return isAuthenticated()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('banned', false) == true;
+    }
+
     function hasVerifiedEmail() {
-      return isAuthenticated() && request.auth.token.email_verified == true;
+      return isAuthenticated() && !isBanned() && request.auth.token.email_verified == true;
     }
 
     function isOwner(userId) {
@@ -16,7 +22,15 @@ service cloud.firestore {
 
     function isStaff() {
       return isAuthenticated()
-        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ['admin', 'moderator'];
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('role', 'user') in ['admin', 'moderator'];
+    }
+
+    function hasEventTrust() {
+      return isAuthenticated()
+        && !isBanned()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('reputation', 0) > -50;
     }
 
     function editableUserFields() {
@@ -37,14 +51,20 @@ service cloud.firestore {
           'isProfileComplete', 'createdAt', 'interests', 'photoURL', 'bio',
           'shareFrequentedPlaces', 'favorites', 'blockedUsers', 'expoPushToken'
         ]);
-      allow update: if isOwner(userId)
+      allow update: if isOwner(userId) && !isBanned()
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(editableUserFields());
       allow delete: if false;
+
+      match /favoriteEvents/{eventId} {
+        allow read: if isOwner(userId);
+        allow write: if false;
+      }
     }
 
     match /meetings/{meetingId} {
       allow read: if true;
       allow create: if hasVerifiedEmail()
+        && hasEventTrust()
         && request.resource.data.createdBy == request.auth.uid
         && request.resource.data.keys().hasAll(['title', 'date', 'time', 'endTime', 'type', 'createdBy', 'attendees'])
         && request.resource.data.type in ['in-person', 'online']
@@ -58,7 +78,7 @@ service cloud.firestore {
     match /conversations/{conversationId} {
       allow create: if false;
       allow read: if isAuthenticated() && request.auth.uid in resource.data.participants;
-      allow update: if isAuthenticated()
+      allow update: if isAuthenticated() && !isBanned()
         && request.auth.uid in resource.data.participants
         && request.resource.data.participants == resource.data.participants
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
@@ -81,7 +101,7 @@ service cloud.firestore {
 
     match /notifications/{notificationId} {
       allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
-      allow update: if isAuthenticated()
+      allow update: if isAuthenticated() && !isBanned()
         && resource.data.userId == request.auth.uid
         && request.resource.data.userId == resource.data.userId
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read'])
@@ -90,7 +110,7 @@ service cloud.firestore {
     }
 
     match /reports/{reportId} {
-      allow create: if isAuthenticated()
+      allow create: if isAuthenticated() && !isBanned()
         && request.resource.data.reportedBy == request.auth.uid;
       allow read, update, delete: if isStaff();
     }

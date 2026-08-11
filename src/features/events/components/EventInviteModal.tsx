@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { useEffect, useState } from 'react';
-import { ActivityIndicator, Alert, FlatList, Image, Modal, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, Alert, FlatList, Image, KeyboardAvoidingView, Modal, Platform, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { EventInviteCandidate } from '@/src/types';
 import { getEventInviteCandidates, inviteUserToEvent } from '@/src/services/eventInvitationService';
@@ -85,7 +85,8 @@ export function EventInviteModal({ visible, eventId, onClose }: EventInviteModal
 
     return (
         <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
-            <SafeAreaView style={styles.overlay} edges={['bottom']}>
+            <KeyboardAvoidingView style={styles.overlay} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
+                <SafeAreaView style={styles.safeArea} edges={['bottom']}>
                 <View style={styles.sheet}>
                     <View style={styles.header}>
                         <View><Text style={styles.title}>Convidar pessoas</Text><Text style={styles.subtitle}>Envie até 10 convites por evento.</Text></View>
@@ -98,15 +99,17 @@ export function EventInviteModal({ visible, eventId, onClose }: EventInviteModal
                         </TouchableOpacity>
                     </View>
                     <Text style={styles.sectionTitle}>Pessoas de eventos em comum</Text>
-                    {loadingCandidates ? <View style={styles.loading}><ActivityIndicator color="#4F46E5" /></View> : <FlatList data={candidates} renderItem={renderCandidate} keyExtractor={(item) => item.uid} contentContainerStyle={styles.list} ListEmptyComponent={<Text style={styles.empty}>Ainda não há co-participantes recentes disponíveis.</Text>} />}
+                    {loadingCandidates ? <View style={styles.loading}><ActivityIndicator color="#4F46E5" /></View> : <FlatList data={candidates} renderItem={renderCandidate} keyExtractor={(item) => item.uid} keyboardShouldPersistTaps="handled" contentContainerStyle={styles.list} ListEmptyComponent={<Text style={styles.empty}>Ainda não há co-participantes recentes disponíveis.</Text>} />}
                 </View>
-            </SafeAreaView>
+                </SafeAreaView>
+            </KeyboardAvoidingView>
         </Modal>
     );
 }
 
 const styles = StyleSheet.create({
     overlay: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(17,24,39,0.55)' },
+    safeArea: { justifyContent: 'flex-end' },
     sheet: { maxHeight: '85%', minHeight: 360, backgroundColor: '#FFF', borderTopLeftRadius: 28, borderTopRightRadius: 28, padding: 20 },
     header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 18 },
     title: { fontSize: 20, fontWeight: '800', color: '#111827' }, subtitle: { marginTop: 3, fontSize: 13, color: '#6B7280' },

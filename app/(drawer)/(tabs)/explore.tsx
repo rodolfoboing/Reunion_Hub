@@ -21,6 +21,30 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const { width } = Dimensions.get('window');
 
+type StoredMapRegion = { latitude: number; longitude: number; latitudeDelta: number; longitudeDelta: number };
+const LAST_MAP_REGION_KEY = '@reunionhub_last_map_region';
+const DEFAULT_MAP_REGION: StoredMapRegion = { latitude: -23.5505, longitude: -46.6333, latitudeDelta: 0.05, longitudeDelta: 0.05 };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null;
+}
+
+function parseStoredMapRegion(value: string): StoredMapRegion | null {
+    try {
+        const parsed: unknown = JSON.parse(value);
+        if (!isRecord(parsed)) return null;
+        const latitude = typeof parsed.latitude === 'number' ? parsed.latitude : NaN;
+        const longitude = typeof parsed.longitude === 'number' ? parsed.longitude : NaN;
+        const latitudeDelta = typeof parsed.latitudeDelta === 'number' ? parsed.latitudeDelta : NaN;
+        const longitudeDelta = typeof parsed.longitudeDelta === 'number' ? parsed.longitudeDelta : NaN;
+        return [latitude, longitude, latitudeDelta, longitudeDelta].every(Number.isFinite)
+            ? { latitude, longitude, latitudeDelta, longitudeDelta }
+            : null;
+    } catch {
+        return null;
+    }
+}
+
 import { normalizeDate } from '@/src/utils/dateUtils';
 import { isEventInProgress } from '@/src/utils/eventSchedule';
 import { useEventClock } from '@/src/hooks/useEventClock';
@@ -51,10 +75,9 @@ const PulsingMarker = () => {
     );
 };
 
-const hidePoiStyle = [
+const hideGooglePoiStyle = [
     {
         featureType: "poi",
-        elementType: "labels",
         stylers: [{ visibility: "off" }]
     }
 ];
@@ -127,11 +150,13 @@ export default function ExploreScreen() {
 
     const [filtersOpen, setFiltersOpen] = useState(false);
     const [headerHeight, setHeaderHeight] = useState(0);
+    const [mapInitialRegion, setMapInitialRegion] = useState<StoredMapRegion>(DEFAULT_MAP_REGION);
 
     const [showMapOnboarding, setShowMapOnboarding] = useState(false);
     const [modalVisible, setModalVisible] = useState(false);
     const [createdEventIdForInvite, setCreatedEventIdForInvite] = useState<string | null>(null);
     const [repeatCount, setRepeatCount] = useState(0);
+    const [repeatStartDate, setRepeatStartDate] = useState('');
     const [pickingLocation, setPickingLocation] = useState(false);
     const [newMeeting, setNewMeeting] = useState({
         title: '', interests: [] as string[], description: '', locationName: '', date: '', time: '', endTime: '',
@@ -155,6 +180,17 @@ export default function ExploreScreen() {
             placeRequestId.current += 1;
             pendingCreateEventTask.current?.cancel();
         };
+    }, []);
+
+    useEffect(() => {
+        AsyncStorage.getItem(LAST_MAP_REGION_KEY).then((storedRegion) => {
+            if (!storedRegion) return;
+            const region = parseStoredMapRegion(storedRegion);
+            if (region) setMapInitialRegion(region);
+            else {
+                console.warn('[Explore] last_map_region_invalid');
+            }
+        }).catch(() => console.warn('[Explore] last_map_region_load_failed'));
     }, []);
 
     useEffect(() => {
@@ -464,20 +500,22 @@ export default function ExploreScreen() {
                             ref={mapRef}
                             style={styles.map}
                             provider={Platform.OS === 'android' ? PROVIDER_GOOGLE : PROVIDER_DEFAULT}
-                            customMapStyle={mapFilters.googlePoi ? [] : hidePoiStyle}
-                            initialRegion={location ? {
-                                latitude: location.coords.latitude,
-                                longitude: location.coords.longitude,
-                                latitudeDelta: 0.05,
-                                longitudeDelta: 0.05,
-                            } : {
-                                latitude: -23.5505,
-                                longitude: -46.6333,
-                                latitudeDelta: 0.05,
-                                longitudeDelta: 0.05,
-                            }}
+                            key={`${mapInitialRegion.latitude}:${mapInitialRegion.longitude}`}
+                            customMapStyle={mapFilters.googlePoi ? [] : hideGooglePoiStyle}
+                            initialRegion={mapInitialRegion}
                             showsUserLocation={true}
-                            showsPointsOfInterest={mapFilters.googlePoi}
+                            showsPointsOfInterest={Platform.OS === 'android' || mapFilters.googlePoi}
+                            onRegionChangeComplete={(region) => {
+                                const nextRegion: StoredMapRegion = {
+                                    latitude: region.latitude,
+                                    longitude: region.longitude,
+                                    latitudeDelta: region.latitudeDelta,
+                                    longitudeDelta: region.longitudeDelta,
+                                };
+                                AsyncStorage.setItem(LAST_MAP_REGION_KEY, JSON.stringify(nextRegion)).catch(() => {
+                                    console.warn('[Explore] last_map_region_save_failed');
+                                });
+                            }}
                             onPoiClick={(e) => {
                                 const { coordinate, placeId, name } = e.nativeEvent;
                                 const poiPlace: import('@/src/types').Place = {
@@ -572,6 +610,8 @@ export default function ExploreScreen() {
                 onOpenLocationPicker={() => { setModalVisible(false); setPickingLocation(true); }}
                 repeatCount={repeatCount}
                 setRepeatCount={setRepeatCount}
+                repeatStartDate={repeatStartDate}
+                setRepeatStartDate={setRepeatStartDate}
                 selectedPlace={selectedPlace}
                 places={places}
                 onCreated={setCreatedEventIdForInvite}

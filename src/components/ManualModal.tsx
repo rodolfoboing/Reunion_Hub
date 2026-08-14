@@ -12,7 +12,7 @@ export function ManualModal({ visible, onClose }: ManualModalProps) {
       <Text style={styles.intro}>Use o Reunion Hub para sair de casa com mais segurança e encontrar pessoas por interesses em comum.</Text>
       <Step icon="map-outline" title="Explore o mapa" text="Veja eventos e locais comunitários. Use filtros para escolher categorias e alterne entre mapa e lista." />
       <Step icon="calendar-outline" title="Crie ou confirme um evento" text="Informe título, data, horário e localização correta. Confirme presença apenas quando realmente pretender ir." />
-      <Step icon="repeat-outline" title="Marque seus hábitos" text="Em um local, registre períodos em que costuma frequentá-lo. Esses dados ajudam sugestões; a exibição no seu perfil público é opcional." />
+      <Step icon="repeat-outline" title="Marque seus hábitos" text="Em um local, registre um ou mais dias da semana e os períodos de cada dia. Esses dados ajudam a comunidade; a exibição no seu perfil público é opcional." />
       <Step icon="chatbubbles-outline" title="Converse com responsabilidade" text="Abra o perfil da pessoa pelo menu do chat, bloqueie contatos indesejados e denuncie comportamentos ou eventos suspeitos." />
       <Step icon="shield-checkmark-outline" title="Cuide da sua segurança" text="Prefira locais públicos, confirme detalhes antes de sair, não envie dinheiro ou dados pessoais e saia de qualquer situação desconfortável." />
       <Step icon="person-circle-outline" title="Ajuste sua privacidade" text="Em Perfil › Privacidade, escolha se os lugares que você frequenta podem aparecer para outras pessoas." />

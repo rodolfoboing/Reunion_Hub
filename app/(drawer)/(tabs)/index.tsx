@@ -6,12 +6,12 @@ import { router } from 'expo-router';
 import { onAuthStateChanged } from 'firebase/auth';
 import { collection, doc, limit, onSnapshot, query, where, orderBy } from 'firebase/firestore';
 import { useEffect, useRef, useState } from 'react';
-import { Alert, FlatList, Image, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, Alert, FlatList, Image, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { auth, db } from '../../../src/services/firebaseConfig';
 import { Meeting, User } from '../../../src/types';
 import { STRINGS } from '../../../src/constants/strings';
 import { CONFIG } from '../../../src/constants/Config';
-import { normalizeDate, getTodayStr } from '../../../src/utils/dateUtils';
+import { normalizeDate, getTodayStr, getDateAfterDays } from '../../../src/utils/dateUtils';
 import { isEventInProgress, isEventToday } from '../../../src/utils/eventSchedule';
 import { useEventClock } from '../../../src/hooks/useEventClock';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -195,13 +195,16 @@ export default function HomeScreen() {
       });
 
       unsubNotifications = onSnapshot(qNotifications, (snapshot) => {
-        noteCount = snapshot.size;
+        // Mensagens já são contabilizadas por unreadCounts nas conversas.
+        // Ignorar a notificação agregada de chat evita contar a mesma conversa duas vezes no sino.
+        noteCount = snapshot.docs.filter((notification) => notification.data().type !== 'chat').length;
         updateTotal();
       }, (error) => {
         console.warn('[Index] Erro no listener de notificações:', error);
       });
 
       const todayStr = getTodayStr();
+      const maxDiscoveryDate = getDateAfterDays(CONFIG.AGENDA_DISCOVERY_DAYS);
 
       const qMyEvents = query(
         collection(db, 'meetings'),
@@ -226,6 +229,7 @@ export default function HomeScreen() {
       const qHighlights = query(
         collection(db, 'meetings'),
         where('date', '>=', todayStr),
+        where('date', '<=', maxDiscoveryDate),
         orderBy('date'),
         limit(30)
       );
@@ -238,10 +242,18 @@ export default function HomeScreen() {
           if (m.status === 'cancelled' || m.status === 'completed') return false;
           const normalizedDate = normalizeDate(m.date);
           if (!normalizedDate) return false;
-          if (normalizedDate < todayStr) return false;
+          if (normalizedDate < todayStr || normalizedDate > maxDiscoveryDate) return false;
 
           const isOwn = m.createdBy === currentUid || (m.attendees && currentUid ? m.attendees.includes(currentUid) : false);
-          return !isOwn;
+          if (isOwn) return false;
+          if (m.type === 'online') return true;
+          if (!location || !Number.isFinite(Number(m.lat)) || !Number.isFinite(Number(m.lng))) return false;
+          return getDistanceFromLatLonInKm(
+            location.coords.latitude,
+            location.coords.longitude,
+            Number(m.lat),
+            Number(m.lng)
+          ) <= CONFIG.NEARBY_RADIUS_KM;
         });
 
         if (isMounted.current) setAllUpcomingEvents(upcomingHighlights);
@@ -260,14 +272,17 @@ export default function HomeScreen() {
         });
 
         if (isMounted.current) setHighlights(sortedHighlights.slice(0, 5));
-        const popularOutsideInterests = upcomingHighlights
+        const popularEvents = upcomingHighlights
           .filter((meeting) =>
             (meeting.attendees?.length || 0) >= 3
-            && !hasMatchingInterest([...(meeting.interests || []), meeting.theme], userInterests)
+            && (
+              hasMatchingInterest([...(meeting.interests || []), meeting.theme], userInterests)
+              || userProfile?.showPopularOutsideInterests
+            )
           )
           .sort((a, b) => (b.attendees?.length || 0) - (a.attendees?.length || 0));
         if (isMounted.current) {
-          setPopularHighlights(userProfile?.showPopularOutsideInterests ? popularOutsideInterests.slice(0, 5) : []);
+          setPopularHighlights(popularEvents.slice(0, 5));
         }
         if (isMounted.current) {
           setError(false);
@@ -292,7 +307,7 @@ export default function HomeScreen() {
       if (unsubHighlights) unsubHighlights();
       if (unsubMyEvents) unsubMyEvents();
     };
-  }, [userProfile?.interests?.join(','), userProfile?.showPopularOutsideInterests]);
+  }, [userProfile?.interests?.join(','), userProfile?.showPopularOutsideInterests, location?.coords.latitude, location?.coords.longitude]);
 
   const renderEventCard = ({ item, showPopularLabel = false }: { item: Meeting; showPopularLabel?: boolean }) => (
     <TouchableOpacity style={styles.eventCard} onPress={() => router.push(`/event/${item.id}` as never)}>
@@ -361,7 +376,12 @@ export default function HomeScreen() {
         </View>
       </LinearGradient>
 
-      {error ? (
+      {loading ? (
+        <View style={styles.loadingState}>
+          <ActivityIndicator size="large" color="#6366F1" />
+          <Text style={styles.loadingText}>Buscando eventos para você...</Text>
+        </View>
+      ) : error ? (
         <View style={{ marginTop: 40, marginBottom: 40 }}>
           <ErrorState title="Sem conexão" message="Não foi possível buscar seus eventos recentes." />
         </View>
@@ -385,6 +405,13 @@ export default function HomeScreen() {
               keyExtractor={item => item.id}
               showsHorizontalScrollIndicator={false}
               contentContainerStyle={styles.horizontalList}
+              ListEmptyComponent={
+                <Text style={styles.emptyText}>
+                  {userProfile?.interests?.length
+                    ? 'Nenhum evento das suas tags foi encontrado nos próximos dias.'
+                    : 'Adicione interesses ao perfil para receber recomendações personalizadas.'}
+                </Text>
+              }
             />
           </View>
 
@@ -393,7 +420,7 @@ export default function HomeScreen() {
               <View style={styles.sectionHeader}>
                 <Text style={styles.sectionTitle}>Eventos populares</Text>
               </View>
-              <Text style={styles.interestTag}>Sugeridos pela quantidade de participantes, fora das suas tags.</Text>
+              <Text style={styles.interestTag}>Eventos próximos com 3 ou mais participantes, com ou sem correspondência às suas tags.</Text>
               <FlatList
                 horizontal
                 data={popularHighlights}
@@ -506,6 +533,8 @@ export default function HomeScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#f9fafb' },
+  loadingState: { alignItems: 'center', justifyContent: 'center', paddingVertical: 56, gap: 12 },
+  loadingText: { color: '#64748B', fontSize: 14, fontWeight: '600' },
   scrollContent: { paddingBottom: 40 },
   // Header Styles
   headerWrapper: {

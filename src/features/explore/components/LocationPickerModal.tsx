@@ -1,9 +1,10 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { View, Text, TouchableOpacity, Modal, StyleSheet, Platform } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
-import MapView, { Marker, PROVIDER_GOOGLE, PROVIDER_DEFAULT } from '@/src/components/MapView';
+import MapView, { PROVIDER_GOOGLE, PROVIDER_DEFAULT } from '@/src/components/MapView';
 import * as Location from 'expo-location';
+import type { Region } from 'react-native-maps';
 
 interface LocationPickerModalProps {
     visible: boolean;
@@ -22,15 +23,32 @@ export function LocationPickerModal({
     currentLng,
     onLocationChange
 }: LocationPickerModalProps) {
+    const fallbackLatitude = currentLat || location?.coords.latitude || -23.5505;
+    const fallbackLongitude = currentLng || location?.coords.longitude || -46.6333;
+    const [pendingCoordinate, setPendingCoordinate] = useState({ latitude: fallbackLatitude, longitude: fallbackLongitude });
+
+    useEffect(() => {
+        if (!visible) return;
+        setPendingCoordinate({
+            latitude: currentLat || location?.coords.latitude || -23.5505,
+            longitude: currentLng || location?.coords.longitude || -46.6333,
+        });
+    }, [visible, currentLat, currentLng, location?.coords.latitude, location?.coords.longitude]);
+
+    const confirmLocation = () => {
+        onLocationChange(pendingCoordinate.latitude, pendingCoordinate.longitude);
+        onClose();
+    };
+
     return (
-        <Modal visible={visible} animationType="fade">
+        <Modal visible={visible} animationType="fade" onRequestClose={onClose}>
             <SafeAreaView style={{ flex: 1 }} edges={['top', 'bottom']}>
                 <View style={styles.mapPickerHeader}>
                     <TouchableOpacity onPress={onClose}>
                         <Ionicons name="arrow-back" size={24} color="#111827" />
                     </TouchableOpacity>
                     <Text style={styles.mapPickerTitle}>Arraste o marcador até o local</Text>
-                    <TouchableOpacity onPress={onClose} style={styles.confirmPin}>
+                    <TouchableOpacity onPress={confirmLocation} style={styles.confirmPin}>
                         <Text style={styles.confirmPinText}>Confirmar</Text>
                     </TouchableOpacity>
                 </View>
@@ -39,13 +57,13 @@ export function LocationPickerModal({
                         style={{ ...StyleSheet.absoluteFillObject }}
                         provider={Platform.OS === 'android' ? PROVIDER_GOOGLE : PROVIDER_DEFAULT}
                         initialRegion={{
-                            latitude: currentLat || (location?.coords.latitude || -23.5505),
-                            longitude: currentLng || (location?.coords.longitude || -46.6333),
+                            latitude: pendingCoordinate.latitude,
+                            longitude: pendingCoordinate.longitude,
                             latitudeDelta: 0.005,
                             longitudeDelta: 0.005,
                         }}
-                        onRegionChangeComplete={(region: any) => {
-                            onLocationChange(region.latitude, region.longitude);
+                        onRegionChangeComplete={(region: Region) => {
+                            setPendingCoordinate({ latitude: region.latitude, longitude: region.longitude });
                         }}
                         showsUserLocation
                     />

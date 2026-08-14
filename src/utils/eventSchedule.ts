@@ -1,5 +1,5 @@
 import type { Meeting } from '@/src/types';
-import { normalizeDate } from '@/src/utils/dateUtils';
+import { getTodayStr, normalizeDate } from '@/src/utils/dateUtils';
 
 type EventSchedule = Pick<Meeting, 'date' | 'time' | 'endTime'>;
 
@@ -21,18 +21,14 @@ function parseTime(time: string | undefined): number | null {
     return (hours * 60) + minutes;
 }
 
-function getLocalDateTime(date: string | undefined, time: string | undefined): Date | null {
+export function getEventDateTime(date: string | undefined, time: string | undefined): Date | null {
     const normalizedDate = normalizeDate(date);
     const minutesSinceMidnight = parseTime(time);
     if (!normalizedDate || minutesSinceMidnight === null) return null;
 
-    const [yearText, monthText, dayText] = normalizedDate.split('-');
-    const year = Number(yearText);
-    const month = Number(monthText);
-    const day = Number(dayText);
-    const hours = Math.floor(minutesSinceMidnight / 60);
-    const minutes = minutesSinceMidnight % 60;
-    const value = new Date(year, month - 1, day, hours, minutes, 0, 0);
+    const hours = String(Math.floor(minutesSinceMidnight / 60)).padStart(2, '0');
+    const minutes = String(minutesSinceMidnight % 60).padStart(2, '0');
+    const value = new Date(`${normalizedDate}T${hours}:${minutes}:00-03:00`);
 
     return Number.isNaN(value.getTime()) ? null : value;
 }
@@ -49,20 +45,22 @@ export function formatEventTimeRange(event: EventSchedule): string {
 }
 
 export function isEventToday(event: EventSchedule, now = new Date()): boolean {
-    const eventStart = getLocalDateTime(event.date, event.time);
-    return !!eventStart
-        && eventStart.getFullYear() === now.getFullYear()
-        && eventStart.getMonth() === now.getMonth()
-        && eventStart.getDate() === now.getDate();
+    const normalizedDate = normalizeDate(event.date);
+    return normalizedDate !== null && normalizedDate === getTodayStr(now);
 }
 
 export function isEventInProgress(event: EventSchedule, now = new Date()): boolean {
-    const eventStart = getLocalDateTime(event.date, event.time);
+    const eventStart = getEventDateTime(event.date, event.time);
     if (!eventStart || eventStart > now) return false;
 
     const eventEnd = event.endTime
-        ? getLocalDateTime(event.date, event.endTime)
+        ? getEventDateTime(event.date, event.endTime)
         : new Date(eventStart.getTime() + (LEGACY_EVENT_DURATION_MINUTES * 60 * 1000));
 
     return !!eventEnd && now < eventEnd;
+}
+
+export function isEventRegistrationOpen(event: EventSchedule, now = new Date()): boolean {
+    const eventStart = getEventDateTime(event.date, event.time);
+    return !!eventStart && now < eventStart;
 }

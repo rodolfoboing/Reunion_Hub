@@ -10,7 +10,7 @@ import {
     Image,
 } from 'react-native';
 import { useEffect, useState } from 'react';
-import { addDoc, collection, doc, getDoc, limit, query, serverTimestamp, where, getDocs } from 'firebase/firestore';
+import { collection, doc, getDoc, limit, query, where, getDocs } from 'firebase/firestore';
 import { db, auth, functions } from '../../src/services/firebaseConfig';
 import { httpsCallable } from 'firebase/functions';
 import { FontAwesome } from '@expo/vector-icons';
@@ -22,6 +22,7 @@ import { Place, User } from '@/src/types';
 import { CONFIG } from '@/src/constants/Config';
 import { toUserProfile } from '@/src/utils/userProfile';
 import { ReportReasonModal } from '@/src/components/ReportReasonModal';
+import { submitReport } from '@/src/services/reportService';
 
 function publicProfileLog(event: string, context: Record<string, boolean | number> = {}) {
     if (__DEV__) console.info(`[PublicProfile] ${event}`, context);
@@ -73,17 +74,30 @@ export default function UserProfileScreen() {
                     return;
                 }
 
-                const placesQuery = query(
-                    collection(db, 'places'),
-                    where('frequenters', 'array-contains', profileId),
-                    limit(CONFIG.PROFILE_PLACES_LIMIT)
-                );
+                const placesQuery = isOwnProfile
+                    ? query(collection(db, 'users', profileId, 'placeHabits'), limit(CONFIG.PROFILE_PLACES_LIMIT))
+                    : query(
+                        collection(db, 'places'),
+                        where('frequenters', 'array-contains', profileId),
+                        limit(CONFIG.PROFILE_PLACES_LIMIT)
+                    );
                 const placesSnap = await getDocs(placesQuery);
                 if (!cancelled) {
-                    setFrequentedPlaces(placesSnap.docs.map((place) => ({
-                        id: place.id,
-                        ...(place.data() as Omit<Place, 'id'>),
-                    })));
+                    setFrequentedPlaces(placesSnap.docs.flatMap((placeDocument): Place[] => {
+                        const data = placeDocument.data();
+                        const latitude = Number(data.latitude);
+                        const longitude = Number(data.longitude);
+                        if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return [];
+                        return [{
+                            id: placeDocument.id,
+                            name: typeof data.name === 'string' ? data.name : 'Local de encontro',
+                            latitude,
+                            longitude,
+                            vocations: Array.isArray(data.vocations)
+                                ? data.vocations.filter((vocation): vocation is string => typeof vocation === 'string')
+                                : [],
+                        }];
+                    }));
                 }
             } catch (error) {
                 console.error('[PublicProfile] profile_load_failed');
@@ -127,15 +141,11 @@ export default function UserProfileScreen() {
     const submitUserReport = async (reason: string) => {
         if (!auth.currentUser || !profileId || isOwnProfile) return;
         try {
-            await addDoc(collection(db, 'reports'), {
-                type: 'user',
-                targetId: profileId,
-                reportedBy: auth.currentUser.uid,
-                reason,
-                createdAt: serverTimestamp(),
-            });
+            const result = await submitReport({ type: 'user', targetId: profileId, reason });
             setShowReportReasonModal(false);
-            Alert.alert('Denúncia enviada', 'Obrigado. A denúncia será analisada pela moderação.');
+            Alert.alert(result.alreadyReported ? 'Denúncia já registrada' : 'Denúncia enviada', result.alreadyReported
+                ? 'Você já denunciou este usuário.'
+                : 'Obrigado. A denúncia será analisada pela moderação.');
         } catch {
             console.error('[PublicProfile] report_submit_failed');
             Alert.alert('Não foi possível enviar', 'Tente novamente em instantes.');

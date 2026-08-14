@@ -56,6 +56,8 @@ firebase-debug.log
 *.pem
 credentials.json
 GoogleService-Info.plist
+*firebase-adminsdk*.json
+service-account*.json
 
 # ignore firebase config if it contains keys (optional, but safer to use .env)
 # firebaseConfig.js

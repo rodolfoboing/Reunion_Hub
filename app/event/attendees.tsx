@@ -1,4 +1,4 @@
-import { useLocalSearchParams, router } from 'expo-router';
+import { useLocalSearchParams, router, Stack } from 'expo-router';
 import {
     View,
     Text,
@@ -7,9 +7,10 @@ import {
     TouchableOpacity,
     ActivityIndicator,
     Image,
+    Alert,
 } from 'react-native';
-import { useEffect, useState } from 'react';
-import { doc, getDoc } from 'firebase/firestore';
+import { useEffect, useRef, useState } from 'react';
+import { collection, doc, documentId, getDoc, getDocs, query, where } from 'firebase/firestore';
 import { db } from '../../src/services/firebaseConfig';
 import { FontAwesome } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -24,58 +25,99 @@ interface Attendee {
     reputation?: number;
 }
 
+const ATTENDEES_PAGE_SIZE = 20;
+
+function attendeeFromData(id: string, data: Record<string, unknown> | undefined): Attendee {
+    const displayName = typeof data?.nick === 'string' && data.nick
+        ? data.nick
+        : typeof data?.displayName === 'string' && data.displayName
+            ? data.displayName
+            : 'Usuário';
+    return {
+        id,
+        displayName,
+        nick: typeof data?.nick === 'string' ? data.nick : undefined,
+        photoURL: typeof data?.photoURL === 'string' ? data.photoURL : undefined,
+        bio: typeof data?.bio === 'string' ? data.bio : undefined,
+        reputation: typeof data?.reputation === 'number' && Number.isFinite(data.reputation) ? data.reputation : 0,
+    };
+}
+
 export default function AttendeesScreen() {
-    const { meetingId, meetingTitle } = useLocalSearchParams();
+    const { meetingId, meetingTitle } = useLocalSearchParams<{ meetingId?: string; meetingTitle?: string }>();
     const [attendees, setAttendees] = useState<Attendee[]>([]);
+    const [attendeeIds, setAttendeeIds] = useState<string[]>([]);
     const [loading, setLoading] = useState(true);
+    const [refreshing, setRefreshing] = useState(false);
+    const [loadingMore, setLoadingMore] = useState(false);
+    const [error, setError] = useState(false);
+    const [loadMoreError, setLoadMoreError] = useState(false);
+    const requestVersion = useRef(0);
 
     useEffect(() => {
-        fetchAttendees();
+        fetchAttendees(false);
+        return () => { requestVersion.current += 1; };
     }, [meetingId]);
 
-    const fetchAttendees = async () => {
-        try {
-            // Buscar dados do meeting para obter IDs dos attendees
-            const meetingRef = doc(db, 'meetings', meetingId as string);
-            const meetingSnap = await getDoc(meetingRef);
+    const fetchProfiles = async (ids: string[]): Promise<Attendee[]> => {
+        if (ids.length === 0) return [];
+        const snapshot = await getDocs(query(collection(db, 'users'), where(documentId(), 'in', ids)));
+        const profiles = new Map(snapshot.docs.map((profile) => [profile.id, profile.data()]));
+        return ids.map((id) => attendeeFromData(id, profiles.get(id)));
+    };
 
-            if (!meetingSnap.exists()) {
-                setLoading(false);
-                return;
-            }
+    const fetchAttendees = async (isRefresh: boolean) => {
+        const eventId = typeof meetingId === 'string' ? meetingId : '';
+        const requestId = requestVersion.current + 1;
+        requestVersion.current = requestId;
+        if (!eventId) {
+            setError(true);
+            setLoading(false);
+            return;
+        }
+        if (isRefresh) setRefreshing(true);
+        else setLoading(true);
+        setLoadingMore(false);
+        setLoadMoreError(false);
+        setError(false);
+        try {
+            const meetingRef = doc(db, 'meetings', eventId);
+            const meetingSnap = await getDoc(meetingRef);
+            if (requestVersion.current !== requestId) return;
+            if (!meetingSnap.exists()) throw new Error('meeting-not-found');
 
             const meetingData = meetingSnap.data();
-            const attendeeIds: string[] = meetingData.attendees || [];
-
-            // Buscar dados de todos os participantes em paralelo para maior performance
-            const attendeesData = await Promise.all(attendeeIds.map(async (uid) => {
-                try {
-                    const userRef = doc(db, 'users', uid);
-                    const userSnap = await getDoc(userRef);
-
-                    if (userSnap.exists()) {
-                        const userData = userSnap.data();
-                        return {
-                            id: uid,
-                            displayName: userData.displayName || userData.nick || 'Usuário',
-                            nick: userData.nick,
-                            photoURL: userData.photoURL,
-                            bio: userData.bio,
-                            reputation: userData.reputation || 0,
-                        };
-                    }
-                    return { id: uid, displayName: 'Usuário', reputation: 0 };
-                } catch (e) {
-                    console.log('Error fetching user:', uid, e);
-                    return { id: uid, displayName: 'Usuário', reputation: 0 };
-                }
-            }));
-
-            setAttendees(attendeesData as Attendee[]);
-        } catch (error) {
-            console.error('Error fetching attendees:', error);
+            const ids = Array.isArray(meetingData.attendees)
+                ? [...new Set(meetingData.attendees.filter((id): id is string => typeof id === 'string' && id.length > 0))]
+                : [];
+            const firstPage = await fetchProfiles(ids.slice(0, ATTENDEES_PAGE_SIZE));
+            if (requestVersion.current !== requestId) return;
+            setAttendeeIds(ids);
+            setAttendees(firstPage);
+            setLoadMoreError(false);
+        } catch {
+            if (requestVersion.current === requestId) setError(true);
         } finally {
-            setLoading(false);
+            if (requestVersion.current === requestId) {
+                setLoading(false);
+                setRefreshing(false);
+            }
+        }
+    };
+
+    const loadMore = async () => {
+        if (loadingMore || attendees.length >= attendeeIds.length) return;
+        setLoadingMore(true);
+        setLoadMoreError(false);
+        const requestId = requestVersion.current;
+        try {
+            const nextIds = attendeeIds.slice(attendees.length, attendees.length + ATTENDEES_PAGE_SIZE);
+            const nextProfiles = await fetchProfiles(nextIds);
+            if (requestVersion.current === requestId) setAttendees((current) => [...current, ...nextProfiles]);
+        } catch {
+            if (requestVersion.current === requestId) setLoadMoreError(true);
+        } finally {
+            if (requestVersion.current === requestId) setLoadingMore(false);
         }
     };
 
@@ -137,8 +179,24 @@ export default function AttendeesScreen() {
         );
     }
 
+    if (error) {
+        return (
+            <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
+                <Stack.Screen options={{ headerShown: false }} />
+                <View style={styles.center}>
+                    <FontAwesome name="exclamation-circle" size={44} color="#DC2626" />
+                    <Text style={styles.emptyText}>Não foi possível carregar os participantes</Text>
+                    <TouchableOpacity style={styles.retryButton} onPress={() => fetchAttendees(false)}>
+                        <Text style={styles.retryButtonText}>Tentar novamente</Text>
+                    </TouchableOpacity>
+                </View>
+            </SafeAreaView>
+        );
+    }
+
     return (
         <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
+            <Stack.Screen options={{ headerShown: false }} />
             {/* Header */}
             <View style={styles.header}>
                 <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}>
@@ -153,7 +211,7 @@ export default function AttendeesScreen() {
                     )}
                 </View>
                 <View style={styles.countBadge}>
-                    <Text style={styles.countText}>{attendees.length}</Text>
+                    <Text style={styles.countText}>{attendeeIds.length}</Text>
                 </View>
             </View>
 
@@ -174,6 +232,15 @@ export default function AttendeesScreen() {
                     contentContainerStyle={styles.listContent}
                     showsVerticalScrollIndicator={false}
                     ItemSeparatorComponent={() => <View style={styles.separator} />}
+                    refreshing={refreshing}
+                    onRefresh={() => fetchAttendees(true)}
+                    onEndReached={loadMore}
+                    onEndReachedThreshold={0.4}
+                    ListFooterComponent={loadingMore
+                        ? <ActivityIndicator style={styles.footerLoader} color="#6366f1" />
+                        : loadMoreError
+                            ? <TouchableOpacity style={styles.loadMoreButton} onPress={loadMore}><Text style={styles.loadMoreText}>Tentar carregar mais</Text></TouchableOpacity>
+                            : null}
                 />
             )}
         </SafeAreaView>
@@ -200,7 +267,7 @@ const styles = StyleSheet.create({
         flexDirection: 'row',
         alignItems: 'center',
         paddingHorizontal: 16,
-        paddingTop: 48,
+        paddingTop: 8,
         paddingBottom: 16,
         backgroundColor: '#fff',
         borderBottomWidth: 1,
@@ -318,4 +385,9 @@ const styles = StyleSheet.create({
         marginTop: 8,
         textAlign: 'center',
     },
+    retryButton: { marginTop: 18, borderRadius: 12, backgroundColor: '#6366F1', paddingHorizontal: 18, paddingVertical: 12 },
+    retryButtonText: { color: '#FFF', fontWeight: '800' },
+    footerLoader: { marginVertical: 18 },
+    loadMoreButton: { alignItems: 'center', paddingVertical: 16 },
+    loadMoreText: { color: '#4F46E5', fontWeight: '700' },
 });

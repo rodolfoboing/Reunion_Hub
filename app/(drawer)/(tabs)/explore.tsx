@@ -1,9 +1,10 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, Animated, Image, FlatList, Dimensions, ActivityIndicator, Platform, ScrollView, Switch, Pressable, Modal, Alert, InteractionManager } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, Image, FlatList, Dimensions, ActivityIndicator, Platform, ScrollView, Switch, Pressable, Modal, Alert, InteractionManager } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons, FontAwesome } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import { router } from 'expo-router';
+import { useIsFocused } from '@react-navigation/native';
 import MapView, { Marker, PROVIDER_GOOGLE, PROVIDER_DEFAULT } from '../../../src/components/MapView';
 
 import { useExploreData } from '@/src/features/explore/hooks/useExploreData';
@@ -11,8 +12,8 @@ import { CreateEventModal } from '@/src/features/explore/components/CreateEventM
 import { PlaceModal } from '@/src/features/explore/components/PlaceModal';
 import { LocationPickerModal } from '@/src/features/explore/components/LocationPickerModal';
 import { EventInviteModal } from '@/src/features/events/components/EventInviteModal';
-import { Place, User } from '../../../src/types';
-import { doc, getDoc, collection, query, where, getDocs, setDoc, updateDoc, arrayUnion } from 'firebase/firestore';
+import { CreateMeetingDraft, HabitSchedule, HabitWeekday, Meeting, Place, User } from '../../../src/types';
+import { doc, getDoc, collection, query, where, getDocs } from 'firebase/firestore';
 import { db, auth } from '../../../src/services/firebaseConfig';
 import { functions } from '../../../src/services/firebaseConfig';
 import { httpsCallable } from 'firebase/functions';
@@ -25,8 +26,27 @@ type StoredMapRegion = { latitude: number; longitude: number; latitudeDelta: num
 const LAST_MAP_REGION_KEY = '@reunionhub_last_map_region';
 const DEFAULT_MAP_REGION: StoredMapRegion = { latitude: -23.5505, longitude: -46.6333, latitudeDelta: 0.05, longitudeDelta: 0.05 };
 
+function regionSearchKey(region: StoredMapRegion): string {
+    return `${region.latitude.toFixed(2)}:${region.longitude.toFixed(2)}:${region.latitudeDelta.toFixed(2)}:${region.longitudeDelta.toFixed(2)}`;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === 'object' && value !== null;
+}
+
+const HABIT_WEEKDAYS: HabitWeekday[] = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
+
+function parseHabitSchedule(value: unknown): HabitSchedule | undefined {
+    if (!isRecord(value)) return undefined;
+    const schedule: HabitSchedule = {};
+    HABIT_WEEKDAYS.forEach((weekday) => {
+        const periods = value[weekday];
+        if (Array.isArray(periods)) {
+            const validPeriods = periods.filter((period): period is string => typeof period === 'string');
+            if (validPeriods.length > 0) schedule[weekday] = validPeriods;
+        }
+    });
+    return Object.keys(schedule).length > 0 ? schedule : undefined;
 }
 
 function parseStoredMapRegion(value: string): StoredMapRegion | null {
@@ -45,34 +65,111 @@ function parseStoredMapRegion(value: string): StoredMapRegion | null {
     }
 }
 
-import { normalizeDate } from '@/src/utils/dateUtils';
+import { getDateAfterDays, getTodayStr, normalizeDate } from '@/src/utils/dateUtils';
 import { isEventInProgress } from '@/src/utils/eventSchedule';
 import { useEventClock } from '@/src/hooks/useEventClock';
+import { CONFIG } from '@/src/constants/Config';
+import { getDistanceFromLatLonInKm } from '@/src/utils/distance';
+import { ErrorState } from '@/src/components/ErrorState';
 
 const isEventLive = (date?: string, time?: string, endTime?: string, now?: Date) => isEventInProgress({ date, time, endTime }, now);
 
-const PulsingMarker = () => {
-    const scaleAnim = useRef(new Animated.Value(1)).current;
-    const opacityAnim = useRef(new Animated.Value(1)).current;
+// PNGs locais sÃ£o renderizados nativamente pelo mapa. NÃ£o use componentes React
+// como filhos de Marker: no Android + Fabric eles podem ser fotografados antes
+// de terminar a mediÃ§Ã£o, gerando pontos minÃºsculos ou imagens recortadas.
+const MAP_MARKER_IMAGES = {
+    events: {
+        general: {
+            normal: require('../../../assets/map-markers/event-general.png'),
+            liveOn: require('../../../assets/map-markers/event-general-live-on.png'),
+            liveOff: require('../../../assets/map-markers/event-general-live-off.png'),
+            popularOn: require('../../../assets/map-markers/event-general-popular-on.png'),
+            popularOff: require('../../../assets/map-markers/event-general-popular-off.png'),
+        },
+        social: {
+            normal: require('../../../assets/map-markers/event-social.png'),
+            liveOn: require('../../../assets/map-markers/event-social-live-on.png'),
+            liveOff: require('../../../assets/map-markers/event-social-live-off.png'),
+            popularOn: require('../../../assets/map-markers/event-social-popular-on.png'),
+            popularOff: require('../../../assets/map-markers/event-social-popular-off.png'),
+        },
+        sports: {
+            normal: require('../../../assets/map-markers/event-sports.png'),
+            liveOn: require('../../../assets/map-markers/event-sports-live-on.png'),
+            liveOff: require('../../../assets/map-markers/event-sports-live-off.png'),
+            popularOn: require('../../../assets/map-markers/event-sports-popular-on.png'),
+            popularOff: require('../../../assets/map-markers/event-sports-popular-off.png'),
+        },
+        games: {
+            normal: require('../../../assets/map-markers/event-games.png'),
+            liveOn: require('../../../assets/map-markers/event-games-live-on.png'),
+            liveOff: require('../../../assets/map-markers/event-games-live-off.png'),
+            popularOn: require('../../../assets/map-markers/event-games-popular-on.png'),
+            popularOff: require('../../../assets/map-markers/event-games-popular-off.png'),
+        },
+        study: {
+            normal: require('../../../assets/map-markers/event-study.png'),
+            liveOn: require('../../../assets/map-markers/event-study-live-on.png'),
+            liveOff: require('../../../assets/map-markers/event-study-live-off.png'),
+            popularOn: require('../../../assets/map-markers/event-study-popular-on.png'),
+            popularOff: require('../../../assets/map-markers/event-study-popular-off.png'),
+        },
+        culture: {
+            normal: require('../../../assets/map-markers/event-culture.png'),
+            liveOn: require('../../../assets/map-markers/event-culture-live-on.png'),
+            liveOff: require('../../../assets/map-markers/event-culture-live-off.png'),
+            popularOn: require('../../../assets/map-markers/event-culture-popular-on.png'),
+            popularOff: require('../../../assets/map-markers/event-culture-popular-off.png'),
+        },
+        technology: {
+            normal: require('../../../assets/map-markers/event-technology.png'),
+            liveOn: require('../../../assets/map-markers/event-technology-live-on.png'),
+            liveOff: require('../../../assets/map-markers/event-technology-live-off.png'),
+            popularOn: require('../../../assets/map-markers/event-technology-popular-on.png'),
+            popularOff: require('../../../assets/map-markers/event-technology-popular-off.png'),
+        },
+        nature: {
+            normal: require('../../../assets/map-markers/event-nature.png'),
+            liveOn: require('../../../assets/map-markers/event-nature-live-on.png'),
+            liveOff: require('../../../assets/map-markers/event-nature-live-off.png'),
+            popularOn: require('../../../assets/map-markers/event-nature-popular-on.png'),
+            popularOff: require('../../../assets/map-markers/event-nature-popular-off.png'),
+        },
+    },
+    place: require('../../../assets/map-markers/place.png'),
+    community: require('../../../assets/map-markers/place-community.png'),
+    discovered: require('../../../assets/map-markers/place-discovered.png'),
+    osm: require('../../../assets/map-markers/place-osm.png'),
+} as const;
 
-    useEffect(() => {
-        Animated.loop(
-            Animated.parallel([
-                Animated.timing(scaleAnim, { toValue: 2, duration: 1500, useNativeDriver: true }),
-                Animated.timing(opacityAnim, { toValue: 0, duration: 1500, useNativeDriver: true })
-            ])
-        ).start();
-    }, []);
+type EventMarkerCategory = keyof typeof MAP_MARKER_IMAGES.events;
 
-    return (
-        <View style={styles.markerContainer}>
-            <Animated.View style={[styles.pulseRing, { transform: [{ scale: scaleAnim }], opacity: opacityAnim }]} />
-            <View style={styles.markerBubble}>
-                <Ionicons name="flame" size={16} color="#EF4444" />
-            </View>
-            <View style={[styles.markerArrow, { borderTopColor: '#EF4444' }]} />
-        </View>
-    );
+const normalizeMarkerText = (value: string) => value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLocaleLowerCase('pt-BR');
+
+const getEventMarkerCategory = (meeting: Pick<Meeting, 'theme' | 'interests'>): EventMarkerCategory => {
+    const eventText = normalizeMarkerText([meeting.theme, ...(meeting.interests || [])].filter(Boolean).join(' '));
+
+    const categoryKeywords: Array<[EventMarkerCategory, string[]]> = [
+        ['sports', ['esporte', 'futebol', 'volei', 'basquete', 'corrida', 'ciclismo', 'bike', 'academia', 'exercicio']],
+        ['games', ['jogo', 'games', 'gamer', 'videogame', 'tabuleiro', 'xadrez', 'rpg']],
+        ['study', ['estudo', 'aprender', 'idioma', 'leitura', 'livro', 'faculdade', 'escola']],
+        ['culture', ['cultura', 'musica', 'cinema', 'filme', 'arte', 'teatro', 'danca', 'fotografia']],
+        ['technology', ['tecnologia', 'programacao', 'dev', 'software', 'ciencia']],
+        ['nature', ['natureza', 'parque', 'trilha', 'caminhada', 'ambiental']],
+        ['social', ['social', 'conversa', 'amizade', 'encontro', 'cafe', 'comunidade']],
+    ];
+
+    return categoryKeywords.find(([, keywords]) => keywords.some((keyword) => eventText.includes(keyword)))?.[0] || 'general';
+};
+
+const getEventMarkerImage = (meeting: Pick<Meeting, 'theme' | 'interests'>, isLive: boolean, isPopular: boolean, blinkOn: boolean) => {
+    const categoryImages = MAP_MARKER_IMAGES.events[getEventMarkerCategory(meeting)];
+    if (isLive) return blinkOn ? categoryImages.liveOn : categoryImages.liveOff;
+    if (isPopular) return blinkOn ? categoryImages.popularOn : categoryImages.popularOff;
+    return categoryImages.normal;
 };
 
 const hideGooglePoiStyle = [
@@ -90,7 +187,7 @@ const CATEGORY_PALETTE = [
     { bg: '#EFF6FF', text: '#3B82F6' }, // azul
     { bg: '#ECFDF5', text: '#10B981' }, // esmeralda
     { bg: '#FFF7ED', text: '#F97316' }, // laranja
-    { bg: '#FFFBEB', text: '#D97706' }, // âmbar
+    { bg: '#FFFBEB', text: '#D97706' }, // Ã¢mbar
     { bg: '#F0FDFA', text: '#14B8A6' }, // teal
     { bg: '#FFF1F2', text: '#F43F5E' }, // rosa-avermelhado
 ];
@@ -103,24 +200,13 @@ const getCategoryColor = (name: string) => {
     return CATEGORY_PALETTE[Math.abs(hash) % CATEGORY_PALETTE.length];
 };
 
-const getPlaceIconName = (vocations?: string[]): keyof typeof Ionicons.glyphMap => {
-    if (!vocations || vocations.length === 0) return 'pin';
-    if (vocations.includes('natureza')) return 'leaf';
-    if (vocations.includes('esporte')) return 'football';
-    if (vocations.includes('exercício')) return 'barbell';
-    if (vocations.includes('cultura')) return 'book';
-    if (vocations.includes('social')) return 'beer';
-    if (vocations.includes('Ponto de Interesse')) return 'location';
-    return 'pin';
-};
-
-const isEventAtPlace = (place: Place, meetings: import('@/src/types').Meeting[]) => meetings.some((meeting) => {
+const isMeetingAtPlace = (place: Place, meeting: Meeting) => {
     if (meeting.type !== 'in-person' || meeting.lat == null || meeting.lng == null) return false;
     if (meeting.placeId === place.id) return true;
 
     return Math.abs(Number(meeting.lat) - place.latitude) < 0.0001
         && Math.abs(Number(meeting.lng) - place.longitude) < 0.0001;
-});
+};
 
 const FILTER_CONFIG: { key: 'events' | 'communityPlaces' | 'osmPlaces' | 'googlePoi'; label: string; icon: any; color: string }[] = [
     { key: 'events', label: 'Eventos', icon: 'calendar', color: '#F59E0B' },
@@ -131,6 +217,7 @@ const FILTER_CONFIG: { key: 'events' | 'communityPlaces' | 'osmPlaces' | 'google
 
 export default function ExploreScreen() {
     const eventClock = useEventClock();
+    const isFocused = useIsFocused();
     const [eventType, setEventType] = useState<'in-person' | 'online'>('in-person');
     const [viewMode, setViewMode] = useState<'map' | 'list'>('map');
     const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
@@ -142,7 +229,22 @@ export default function ExploreScreen() {
         osmPlaces: false,
         googlePoi: false
     });
-    const { location, meetings, places, loading } = useExploreData(mapFilters.osmPlaces);
+    const [mapInitialRegion, setMapInitialRegion] = useState<StoredMapRegion>(DEFAULT_MAP_REGION);
+    const [searchRegion, setSearchRegion] = useState<StoredMapRegion>(DEFAULT_MAP_REGION);
+    const mapActive = isFocused && eventType === 'in-person' && viewMode === 'map';
+    const {
+        location,
+        locationStatus,
+        meetings,
+        places,
+        loading,
+        error,
+        placesError,
+        osmError,
+        osmLoading,
+        retry,
+        refreshPlace,
+    } = useExploreData(mapFilters.osmPlaces, mapFilters.communityPlaces, isFocused, mapActive, searchRegion);
     const toggleMapFilter = (key: keyof typeof mapFilters) => {
         setMapFilters(prev => ({ ...prev, [key]: !prev[key] }));
     };
@@ -150,7 +252,6 @@ export default function ExploreScreen() {
 
     const [filtersOpen, setFiltersOpen] = useState(false);
     const [headerHeight, setHeaderHeight] = useState(0);
-    const [mapInitialRegion, setMapInitialRegion] = useState<StoredMapRegion>(DEFAULT_MAP_REGION);
 
     const [showMapOnboarding, setShowMapOnboarding] = useState(false);
     const [modalVisible, setModalVisible] = useState(false);
@@ -158,7 +259,7 @@ export default function ExploreScreen() {
     const [repeatCount, setRepeatCount] = useState(0);
     const [repeatStartDate, setRepeatStartDate] = useState('');
     const [pickingLocation, setPickingLocation] = useState(false);
-    const [newMeeting, setNewMeeting] = useState({
+    const [newMeeting, setNewMeeting] = useState<CreateMeetingDraft>({
         title: '', interests: [] as string[], description: '', locationName: '', date: '', time: '', endTime: '',
         lat: 0, lng: 0, type: 'in-person', meetingLink: '', placeId: '',
     });
@@ -172,6 +273,7 @@ export default function ExploreScreen() {
     const placeRequestId = useRef(0);
     const isExploreMounted = useRef(true);
     const pendingCreateEventTask = useRef<ReturnType<typeof InteractionManager.runAfterInteractions> | null>(null);
+    const regionSearchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     useEffect(() => {
         isExploreMounted.current = true;
@@ -179,6 +281,7 @@ export default function ExploreScreen() {
             isExploreMounted.current = false;
             placeRequestId.current += 1;
             pendingCreateEventTask.current?.cancel();
+            if (regionSearchTimer.current) clearTimeout(regionSearchTimer.current);
         };
     }, []);
 
@@ -186,18 +289,26 @@ export default function ExploreScreen() {
         AsyncStorage.getItem(LAST_MAP_REGION_KEY).then((storedRegion) => {
             if (!storedRegion) return;
             const region = parseStoredMapRegion(storedRegion);
-            if (region) setMapInitialRegion(region);
+            if (region) {
+                setMapInitialRegion(region);
+                setSearchRegion(region);
+            }
             else {
                 console.warn('[Explore] last_map_region_invalid');
             }
         }).catch(() => console.warn('[Explore] last_map_region_load_failed'));
     }, []);
 
-    useEffect(() => {
-        if (location && newMeeting.lat === 0) {
-            setNewMeeting(prev => ({ ...prev, lat: location.coords.latitude, lng: location.coords.longitude }));
-        }
-    }, [location]);
+    const handleMapRegionChange = (region: StoredMapRegion) => {
+        AsyncStorage.setItem(LAST_MAP_REGION_KEY, JSON.stringify(region)).catch(() => {
+            console.warn('[Explore] last_map_region_save_failed');
+        });
+        if (regionSearchTimer.current) clearTimeout(regionSearchTimer.current);
+        regionSearchTimer.current = setTimeout(() => {
+            setSearchRegion((currentRegion) => regionSearchKey(currentRegion) === regionSearchKey(region) ? currentRegion : region);
+            regionSearchTimer.current = null;
+        }, 700);
+    };
 
     useEffect(() => {
         setFiltersOpen(false);
@@ -240,6 +351,12 @@ export default function ExploreScreen() {
                         founderName = founderDoc.data()?.nick || founderDoc.data()?.displayName;
                     }
 
+                    let discovererName = place.discovererName;
+                    if (place.discovererId && !discovererName) {
+                        const discovererDoc = await getDoc(doc(db, 'users', place.discovererId));
+                        discovererName = discovererDoc.data()?.nick || discovererDoc.data()?.displayName;
+                    }
+
                     let profiles: User[] = [];
                     if (place.frequenters && place.frequenters.length > 0) {
                         const chunks: string[][] = [];
@@ -249,13 +366,39 @@ export default function ExploreScreen() {
                         for (const chunk of chunks) {
                             const profilesQuery = query(collection(db, 'users'), where('__name__', 'in', chunk));
                             const profilesSnapshot = await getDocs(profilesQuery);
-                            profiles = [...profiles, ...profilesSnapshot.docs.map((profile) => ({ uid: profile.id, ...profile.data() } as User))];
+                            profiles = [
+                                ...profiles,
+                                ...profilesSnapshot.docs
+                                    .filter((profile) => profile.data().shareFrequentedPlaces === true)
+                                    .map((profile) => ({ uid: profile.id, ...profile.data() } as User)),
+                            ];
                         }
                     }
 
+                    let currentUserHabitSchedule: HabitSchedule | undefined;
+                    const currentUserId = auth.currentUser?.uid;
+                    if (currentUserId) {
+                        const privateHabit = await getDoc(doc(db, 'users', currentUserId, 'placeHabits', place.id));
+                        currentUserHabitSchedule = privateHabit.exists()
+                            ? parseHabitSchedule(privateHabit.data()?.schedule)
+                            : undefined;
+                    }
+
                     if (!isExploreMounted.current || requestId !== placeRequestId.current) return;
-                    if (founderName) {
-                        setSelectedPlace((currentPlace) => currentPlace?.id === place.id ? { ...currentPlace, founderName } : currentPlace);
+                    if (founderName || discovererName) {
+                        setSelectedPlace((currentPlace) => currentPlace?.id === place.id
+                            ? {
+                                ...currentPlace,
+                                founderName,
+                                discovererName,
+                                currentUserHabitSchedule,
+                                isCurrentUserFrequenting: Boolean(currentUserHabitSchedule),
+                            }
+                            : currentPlace);
+                    } else if (currentUserHabitSchedule) {
+                        setSelectedPlace((currentPlace) => currentPlace?.id === place.id
+                            ? { ...currentPlace, currentUserHabitSchedule, isCurrentUserFrequenting: true }
+                            : currentPlace);
                     }
                     setFrequentersProfiles(profiles);
                 } catch (error) {
@@ -295,7 +438,7 @@ export default function ExploreScreen() {
 
 
 
-    const handleSavePlaceHabit = async (weekday: import('@/src/types').HabitWeekday, periods: string[]) => {
+    const handleSavePlaceHabit = async (schedule: import('@/src/types').HabitSchedule) => {
         if (!selectedPlace || !auth.currentUser) return;
         try {
             await httpsCallable(functions, 'savePlaceHabit')({
@@ -304,14 +447,39 @@ export default function ExploreScreen() {
                 latitude: selectedPlace.latitude,
                 longitude: selectedPlace.longitude,
                 vocations: selectedPlace.vocations || [],
-                weekday,
-                periods,
+                schedule,
+            });
+            const refreshedPlace = await refreshPlace(selectedPlace.id);
+            if (refreshedPlace) setSelectedPlace({
+                ...refreshedPlace,
+                currentUserHabitSchedule: schedule,
+                isCurrentUserFrequenting: true,
             });
             Alert.alert("Sucesso", "Sua rotina foi salva neste local!");
-            setShowPlaceModal(false);
         } catch (error) {
             console.error(error);
-            Alert.alert("Erro", "Não foi possível salvar a rotina.");
+            Alert.alert("Erro", "NÃ£o foi possÃ­vel salvar a rotina.");
+            throw error;
+        }
+    };
+
+    const handleRemovePlaceHabit = async () => {
+        if (!selectedPlace || !auth.currentUser) return;
+        try {
+            await httpsCallable<{ placeId: string }, { ok: boolean }>(functions, 'removePlaceHabit')({
+                placeId: selectedPlace.id,
+            });
+            const refreshedPlace = await refreshPlace(selectedPlace.id);
+            if (refreshedPlace) setSelectedPlace({
+                ...refreshedPlace,
+                currentUserHabitSchedule: undefined,
+                isCurrentUserFrequenting: false,
+            });
+            Alert.alert('Rotina removida', 'VocÃª nÃ£o aparece mais como frequentador deste local.');
+        } catch (error) {
+            console.error('[Explore] place_habit_remove_failed', error);
+            Alert.alert('Erro', 'NÃ£o foi possÃ­vel remover sua rotina deste local.');
+            throw error;
         }
     };
 
@@ -328,11 +496,53 @@ export default function ExploreScreen() {
         return true;
     }), [places, mapFilters.communityPlaces, mapFilters.osmPlaces]);
 
+    const isPopularNearbyMeeting = (meeting: Meeting) => {
+        if ((meeting.attendees?.length || 0) < CONFIG.POPULAR_ATTENDEES_COUNT || meeting.type !== 'in-person' || !location) return false;
+        const normalizedDate = normalizeDate(meeting.date);
+        if (!normalizedDate || normalizedDate < getTodayStr() || normalizedDate > getDateAfterDays(CONFIG.AGENDA_DISCOVERY_DAYS)) return false;
+        if (!Number.isFinite(Number(meeting.lat)) || !Number.isFinite(Number(meeting.lng))) return false;
+        return getDistanceFromLatLonInKm(
+            location.coords.latitude,
+            location.coords.longitude,
+            Number(meeting.lat),
+            Number(meeting.lng)
+        ) <= CONFIG.NEARBY_RADIUS_KM;
+    };
+
+    const markerMeetingForPlace = (place: Place) => {
+        if (!mapFilters.events) return undefined;
+        const eventsAtPlace = filteredMeetings.filter((meeting) => isMeetingAtPlace(place, meeting));
+        return eventsAtPlace.find((meeting) => isEventLive(meeting.date, meeting.time, meeting.endTime, eventClock))
+            || eventsAtPlace.find(isPopularNearbyMeeting)
+            || eventsAtPlace[0];
+    };
+
+    // Um Ãºnico relÃ³gio alterna os PNGs dos eventos destacados. Isso mantÃ©m o
+    // efeito de piscar sem criar Animated.Value, loop ou View dentro de cada Marker.
+    const hasBlinkingMapEvent = mapFilters.events && filteredMeetings.some((meeting) =>
+        isEventLive(meeting.date, meeting.time, meeting.endTime, eventClock)
+        || isPopularNearbyMeeting(meeting)
+    );
+    const [markerBlinkOn, setMarkerBlinkOn] = useState(true);
+
+    useEffect(() => {
+        if (viewMode !== 'map' || !hasBlinkingMapEvent) {
+            setMarkerBlinkOn(true);
+            return;
+        }
+
+        const blinkTimer = setInterval(() => {
+            setMarkerBlinkOn((current) => !current);
+        }, 750);
+
+        return () => clearInterval(blinkTimer);
+    }, [hasBlinkingMapEvent, viewMode]);
+
     const renderMeetingCard = ({ item }: { item: any }) => (
         <TouchableOpacity style={styles.card} onPress={() => router.push(`/event/${item.id}` as any)}>
             <View style={styles.cardHeader}>
                 <View style={styles.tagContainer}><Text style={styles.tagText}>{item.theme || 'Evento'}</Text></View>
-                <Text style={styles.dateText}>{item.date ? item.date.split('-').reverse().join('/') : ''} • {item.time}</Text>
+                <Text style={styles.dateText}>{item.date ? item.date.split('-').reverse().join('/') : ''} â€¢ {item.time}</Text>
             </View>
             <Text style={styles.cardTitle} numberOfLines={1}>{item.title}</Text>
             <View style={styles.cardFooter}>
@@ -480,7 +690,13 @@ export default function ExploreScreen() {
             )}
 
             <View style={styles.content}>
-                {eventType === 'online' || viewMode === 'list' ? (
+                {eventType === 'online' || viewMode === 'list' ? error ? (
+                    <ErrorState
+                        title="NÃ£o foi possÃ­vel carregar os eventos"
+                        message="Confira sua conexÃ£o e tente novamente."
+                        onRetry={retry}
+                    />
+                ) : (
                     <FlatList
                         data={filteredMeetings}
                         keyExtractor={(item) => item.id}
@@ -512,9 +728,7 @@ export default function ExploreScreen() {
                                     latitudeDelta: region.latitudeDelta,
                                     longitudeDelta: region.longitudeDelta,
                                 };
-                                AsyncStorage.setItem(LAST_MAP_REGION_KEY, JSON.stringify(nextRegion)).catch(() => {
-                                    console.warn('[Explore] last_map_region_save_failed');
-                                });
+                                handleMapRegionChange(nextRegion);
                             }}
                             onPoiClick={(e) => {
                                 const { coordinate, placeId, name } = e.nativeEvent;
@@ -530,45 +744,88 @@ export default function ExploreScreen() {
                             }}
                         >
                             {visiblePlaces.map((place) => {
-                                const hasActiveEvent = isEventAtPlace(place, meetings);
+                                const markerMeeting = markerMeetingForPlace(place);
+                                const hasActiveEvent = Boolean(markerMeeting);
+                                const isLive = markerMeeting ? isEventLive(markerMeeting.date, markerMeeting.time, markerMeeting.endTime, eventClock) : false;
+                                const isPopularNearby = markerMeeting ? isPopularNearbyMeeting(markerMeeting) : false;
+                                const hasFrequenters = (place.frequenters?.length || 0) > 0;
+                                const isDiscovered = Boolean(place.discovererId || place.discovererName);
                                 const isOsmPlace = place.id.startsWith('osm_');
-                                const markerColor = hasActiveEvent ? '#2563EB' : (isOsmPlace ? '#10B981' : '#8B5CF6');
-                                const markerIcon = hasActiveEvent ? 'calendar' : getPlaceIconName(place.vocations);
+                                const markerImage = markerMeeting
+                                    ? getEventMarkerImage(markerMeeting, isLive, isPopularNearby, markerBlinkOn)
+                                    : hasFrequenters
+                                        ? MAP_MARKER_IMAGES.community
+                                        : isDiscovered
+                                            ? MAP_MARKER_IMAGES.discovered
+                                            : isOsmPlace
+                                                ? MAP_MARKER_IMAGES.osm
+                                                : MAP_MARKER_IMAGES.place;
                                 return (
                                 <Marker
                                     key={place.id}
                                     coordinate={{ latitude: Number(place.latitude), longitude: Number(place.longitude) }}
                                     onPress={() => handleOpenPlaceModal(place)}
                                     title={place.name}
-                                >
-                                    <View style={styles.markerContainer}>
-                                        <View style={[styles.markerBubble, { borderColor: markerColor }]}>
-                                            <Ionicons name={markerIcon} size={16} color={markerColor} />
-                                        </View>
-                                        <View style={[styles.markerArrow, { borderTopColor: markerColor }]} />
-                                    </View>
-                                </Marker>
+                                    image={markerImage}
+                                    anchor={{ x: 0.5, y: 0.5 }}
+                                    zIndex={isLive ? 100 : isPopularNearby ? 80 : hasActiveEvent ? 40 : hasFrequenters ? 30 : 10}
+                                />
                                 );
                             })}
-                            {mapFilters.events && filteredMeetings.filter((m) => m.lat != null && m.lng != null && !isNaN(Number(m.lat)) && !isNaN(Number(m.lng))).map((meeting) => (
+                            {mapFilters.events && filteredMeetings.filter((meeting) =>
+                                meeting.lat != null
+                                && meeting.lng != null
+                                && !isNaN(Number(meeting.lat))
+                                && !isNaN(Number(meeting.lng))
+                                && !visiblePlaces.some((place) => isMeetingAtPlace(place, meeting))
+                            ).map((meeting) => {
+                                const isLive = isEventLive(meeting.date, meeting.time, meeting.endTime, eventClock);
+                                const isPopularNearby = isPopularNearbyMeeting(meeting);
+                                return (
                                 <Marker
                                     key={meeting.id}
                                     coordinate={{ latitude: Number(meeting.lat), longitude: Number(meeting.lng) }}
                                     onPress={() => router.push(`/event/${meeting.id}` as any)}
                                     title={meeting.title}
-                                    zIndex={isEventLive(meeting.date, meeting.time, meeting.endTime, eventClock) ? 100 : 1}
-                                >
-                                    {isEventLive(meeting.date, meeting.time, meeting.endTime, eventClock) ? <PulsingMarker /> : (
-                                        <View style={styles.markerContainer}>
-                                            <View style={[styles.markerBubble, { borderColor: '#6366F1' }]}>
-                                                <Ionicons name="people" size={16} color="#6366F1" />
-                                            </View>
-                                            <View style={[styles.markerArrow, { borderTopColor: '#6366F1' }]} />
-                                        </View>
-                                    )}
-                                </Marker>
-                            ))}
+                                    image={getEventMarkerImage(meeting, isLive, isPopularNearby, markerBlinkOn)}
+                                    anchor={{ x: 0.5, y: 0.5 }}
+                                    zIndex={isLive ? 100 : isPopularNearby ? 80 : 1}
+                                />
+                                );
+                            })}
                         </MapView>
+                        <View style={styles.mapStatusContainer} pointerEvents="box-none">
+                            {(locationStatus === 'denied' || locationStatus === 'error') && (
+                                <View style={styles.mapStatusWarning}>
+                                    <Ionicons name="location-outline" size={15} color="#92400E" />
+                                    <Text style={styles.mapStatusWarningText}>LocalizaÃ§Ã£o indisponÃ­vel. O mapa e a regiÃ£o salva continuam funcionando.</Text>
+                                </View>
+                            )}
+                            {mapFilters.events && error && (
+                                <TouchableOpacity style={styles.mapStatusError} onPress={retry}>
+                                    <Ionicons name="refresh" size={15} color="#B91C1C" />
+                                    <Text style={styles.mapStatusErrorText}>Falha ao carregar eventos. Tentar novamente</Text>
+                                </TouchableOpacity>
+                            )}
+                            {mapFilters.communityPlaces && placesError && (
+                                <TouchableOpacity style={styles.mapStatusError} onPress={retry}>
+                                    <Ionicons name="refresh" size={15} color="#B91C1C" />
+                                    <Text style={styles.mapStatusErrorText}>Falha nos locais da comunidade. Tentar novamente</Text>
+                                </TouchableOpacity>
+                            )}
+                            {mapFilters.osmPlaces && osmLoading && (
+                                <View style={styles.mapStatusInfo}>
+                                    <ActivityIndicator size="small" color="#047857" />
+                                    <Text style={styles.mapStatusInfoText}>Buscando locais OSM nesta Ã¡rea...</Text>
+                                </View>
+                            )}
+                            {mapFilters.osmPlaces && osmError && !osmLoading && (
+                                <TouchableOpacity style={styles.mapStatusError} onPress={retry}>
+                                    <Ionicons name="refresh" size={15} color="#B91C1C" />
+                                    <Text style={styles.mapStatusErrorText}>Overpass indisponÃ­vel. Tentar novamente</Text>
+                                </TouchableOpacity>
+                            )}
+                        </View>
                         <View style={styles.mapActions}>
                             <TouchableOpacity style={styles.fab} onPress={() => {
                                 if (location && mapRef.current) {
@@ -588,7 +845,17 @@ export default function ExploreScreen() {
             </View>
 
             <View style={styles.actions}>
-                <TouchableOpacity style={styles.createButton} onPress={() => setModalVisible(true)} activeOpacity={0.85}>
+                <TouchableOpacity style={styles.createButton} onPress={() => {
+                    setSelectedPlace(null);
+                    setNewMeeting((current) => ({
+                        ...current,
+                        locationName: '',
+                        placeId: '',
+                        lat: 0,
+                        lng: 0,
+                    }));
+                    setModalVisible(true);
+                }} activeOpacity={0.85}>
                     <LinearGradient
                         colors={['#6366F1', '#8B5CF6']}
                         start={{ x: 0, y: 0 }}
@@ -612,8 +879,6 @@ export default function ExploreScreen() {
                 setRepeatCount={setRepeatCount}
                 repeatStartDate={repeatStartDate}
                 setRepeatStartDate={setRepeatStartDate}
-                selectedPlace={selectedPlace}
-                places={places}
                 onCreated={setCreatedEventIdForInvite}
             />
 
@@ -628,6 +893,7 @@ export default function ExploreScreen() {
                     (Math.abs(Number(m.lat) - selectedPlace.latitude) < 0.0001 && Math.abs(Number(m.lng) - selectedPlace.longitude) < 0.0001)
                 ) : []}
                 onSaveHabit={handleSavePlaceHabit}
+                onRemoveHabit={handleRemovePlaceHabit}
                 onCreateEventPress={handleCreateEventAtSelectedPlace}
             />
             {createdEventIdForInvite && (
@@ -647,7 +913,10 @@ export default function ExploreScreen() {
                 location={location}
                 currentLat={newMeeting.lat}
                 currentLng={newMeeting.lng}
-                onLocationChange={(lat, lng) => setNewMeeting({...newMeeting, lat, lng})}
+                onLocationChange={(lat, lng) => {
+                    setSelectedPlace(null);
+                    setNewMeeting((current) => ({ ...current, lat, lng, placeId: '' }));
+                }}
             />
 
             <Modal visible={showMapOnboarding} transparent={true} animationType="fade">
@@ -660,7 +929,7 @@ export default function ExploreScreen() {
                             Explorar Eventos e Locais
                         </Text>
                         <Text style={{ fontSize: 14, color: '#4b5563', textAlign: 'center', lineHeight: 22, marginBottom: 20 }}>
-                            Use os filtros acima para ver eventos da comunidade ou ative as marcações de Locais Vagos (banco do Google Maps e Overpass) para conhecer novos lugares!
+                            Use os filtros acima para ver eventos da comunidade ou ative as marcaÃ§Ãµes de Locais Vagos (banco do Google Maps e Overpass) para conhecer novos lugares!
                         </Text>
                         <TouchableOpacity 
                             onPress={handleCloseMapOnboarding} 
@@ -751,6 +1020,13 @@ const styles = StyleSheet.create({
     content: { flex: 1, backgroundColor: '#F9FAFB' },
     mapContainer: { flex: 1, width: '100%', height: '100%' },
     map: { width: '100%', height: '100%' },
+    mapStatusContainer: { position: 'absolute', top: 12, left: 12, right: 12, gap: 7 },
+    mapStatusWarning: { flexDirection: 'row', alignItems: 'center', gap: 7, borderRadius: 10, paddingHorizontal: 11, paddingVertical: 9, backgroundColor: 'rgba(255,251,235,0.96)', borderWidth: 1, borderColor: '#FDE68A' },
+    mapStatusWarningText: { flex: 1, color: '#92400E', fontSize: 12, fontWeight: '600' },
+    mapStatusError: { flexDirection: 'row', alignItems: 'center', gap: 7, borderRadius: 10, paddingHorizontal: 11, paddingVertical: 9, backgroundColor: 'rgba(254,242,242,0.96)', borderWidth: 1, borderColor: '#FECACA' },
+    mapStatusErrorText: { flex: 1, color: '#B91C1C', fontSize: 12, fontWeight: '700' },
+    mapStatusInfo: { flexDirection: 'row', alignItems: 'center', gap: 8, borderRadius: 10, paddingHorizontal: 11, paddingVertical: 9, backgroundColor: 'rgba(236,253,245,0.96)', borderWidth: 1, borderColor: '#A7F3D0' },
+    mapStatusInfoText: { flex: 1, color: '#047857', fontSize: 12, fontWeight: '600' },
     mapActions: { position: 'absolute', bottom: 100, right: 20, alignItems: 'center' },
     fab: { backgroundColor: '#fff', width: 46, height: 46, borderRadius: 23, justifyContent: 'center', alignItems: 'center', marginBottom: 16, shadowColor: "#000", shadowOpacity: 0.15, shadowRadius: 6, elevation: 4 },
     listContent: { padding: 20, paddingBottom: 110 },
@@ -774,10 +1050,6 @@ const styles = StyleSheet.create({
     createButton: { borderRadius: 30, shadowColor: "#6366F1", shadowOffset: { width: 0, height: 6 }, shadowOpacity: 0.35, shadowRadius: 12, elevation: 8 },
     gradientButton: { flexDirection: 'row', alignItems: 'center', paddingVertical: 13, paddingHorizontal: 20, borderRadius: 30 },
     createButtonText: { color: '#fff', fontWeight: 'bold', fontSize: 15, marginLeft: 8 },
-    markerContainer: { alignItems: 'center', justifyContent: 'center' },
-    markerBubble: { backgroundColor: '#fff', padding: 6, borderRadius: 20, borderWidth: 2, alignItems: 'center', justifyContent: 'center', zIndex: 2 },
-    markerArrow: { backgroundColor: 'transparent', borderColor: 'transparent', borderWidth: 6, alignSelf: 'center', marginTop: -2, zIndex: 2 },
-    pulseRing: { position: 'absolute', width: 36, height: 36, borderRadius: 18, backgroundColor: 'rgba(239, 68, 68, 0.4)', borderWidth: 2, borderColor: 'rgba(239, 68, 68, 0.8)', top: 0, zIndex: 1 },
     emptyContainer: { alignItems: 'center', justifyContent: 'center', paddingTop: 60, gap: 10 },
     emptyText: { color: '#9CA3AF' }
 });

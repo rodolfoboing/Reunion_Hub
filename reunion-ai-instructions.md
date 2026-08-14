@@ -171,7 +171,7 @@ Se o usuário autorizar explicitamente a implementação, apresente o plano e pr
 - Não mantenha código morto, imports inutilizados ou grandes blocos comentados “para o futuro”.
 - Sugira a exclusão de código obsoleto e explique o impacto antes de removê-lo quando houver possibilidade de uso externo ou indireto.
 - Não adicione dependências sem justificar necessidade, manutenção, tamanho e compatibilidade com Expo.
-- Não faça atualização, busca, commit, push, pull, merge, rebase ou qualquer outra operação Git/GitHub sem autorização explícita do usuário.
+- Não faça atualização, busca, commit, push, pull, merge, rebase ou qualquer outra operação Git/GitHub sem autorização explícita do usuário, e quando for subir, nunca suba as apikey do usuario, ou qualquer dados sensiveis.
 - Nunca descarte ou sobrescreva alterações existentes do usuário.
 - Preservação de funcionalidades e análise de regressão:
 Antes de alterar código para corrigir um problema, identifique os componentes, hooks, services, tipos, rotas e fluxos que interagem com a parte modificada. Verifique se a mudança pode quebrar comportamentos já funcionais, inclusive fora do arquivo editado.
@@ -221,6 +221,14 @@ Ao concluir, informe de forma objetiva:
 - testes manuais recomendados, quando necessários.
 
 Nunca declare que algo está “funcionando”, “sem erros” ou “otimizado” sem evidência compatível.
+
+### Cloud Functions e custo
+
+Não crie Cloud Functions sem necessidade real. Use-as apenas para regras críticas que não podem ser confiadas ao app, sabendo que o app não ficará sempre rodando no celular do usuario.
+
+Antes de criar uma, explique seu gatilho, frequência esperada e leituras/escritas que ela fará. Evite funções disparadas em toda alteração do Firestore, loops e execuções duplicadas.
+
+Toda Function deve ser idempotente: rodar duas vezes não pode duplicar pontos, notificações ou operações.
 
 ## 14. Checklist crítico interno
 

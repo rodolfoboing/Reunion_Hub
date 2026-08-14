@@ -1,12 +1,14 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, StyleSheet, FlatList, TouchableOpacity, Modal, TextInput, Alert, ActivityIndicator, Linking } from 'react-native';
+import { View, Text, StyleSheet, FlatList, TouchableOpacity, Modal, TextInput, Alert, ActivityIndicator, KeyboardAvoidingView, Platform } from 'react-native';
 import { FontAwesome, Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import { auth, db, functions } from '../../../src/services/firebaseConfig';
 import { httpsCallable } from 'firebase/functions';
-import { collection, query, where, onSnapshot, doc, getDoc, setDoc, serverTimestamp, getDocs, orderBy, deleteDoc, updateDoc, arrayUnion, addDoc, limit } from 'firebase/firestore';
+import { collection, query, where, onSnapshot, doc, getDocs, orderBy, updateDoc, arrayUnion, limit } from 'firebase/firestore';
 import { LinearGradient } from 'expo-linear-gradient';
 import { ReportReasonModal } from '@/src/components/ReportReasonModal';
+import { ErrorState } from '@/src/components/ErrorState';
+import { submitReport } from '@/src/services/reportService';
 
 function getErrorMessage(error: unknown): string {
     return error instanceof Error ? error.message : '';
@@ -15,6 +17,8 @@ function getErrorMessage(error: unknown): string {
 export default function MessagesScreen() {
     const [conversations, setConversations] = useState<any[]>([]);
     const [loading, setLoading] = useState(true);
+    const [loadError, setLoadError] = useState(false);
+    const [listenerRetryKey, setListenerRetryKey] = useState(0);
     const [userProfile, setUserProfile] = useState<any>(null);
 
     const [showNewChatModal, setShowNewChatModal] = useState(false);
@@ -41,11 +45,12 @@ export default function MessagesScreen() {
 
         const unsubscribe = onSnapshot(q, (snapshot) => {
             const convs = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
-            console.log(`[MessagesScreen] Encontradas ${convs.length} conversas.`);
             setConversations(convs);
+            setLoadError(false);
             setLoading(false);
         }, (error) => {
             console.error("[MessagesScreen] Erro ao buscar conversas:", error);
+            setLoadError(true);
             setLoading(false);
         });
 
@@ -53,7 +58,7 @@ export default function MessagesScreen() {
             unsubUser();
             unsubscribe();
         };
-    }, []);
+    }, [listenerRetryKey]);
 
     const blocked = userProfile?.blockedUsers || [];
     const visibleConversations = conversations.filter(c => {
@@ -73,7 +78,7 @@ export default function MessagesScreen() {
 
         try {
             const usersRef = collection(db, 'users');
-            const qUsers = query(usersRef, where('searchName', '==', trimmedNick));
+            const qUsers = query(usersRef, where('searchName', '==', trimmedNick), limit(1));
             const querySnapshot = await getDocs(qUsers);
 
             if (querySnapshot.empty) {
@@ -190,14 +195,10 @@ export default function MessagesScreen() {
 
         setShowReportReasonModal(false);
         try {
-            await addDoc(collection(db, 'reports'), {
-                type: 'user',
-                targetId: otherUid,
-                reportedBy: reporterId,
-                reason,
-                createdAt: serverTimestamp()
-            });
-            Alert.alert('Denúncia recebida', 'Nossa equipe de moderação analisará este usuário em breve.');
+            const result = await submitReport({ type: 'user', targetId: otherUid, reason });
+            Alert.alert(result.alreadyReported ? 'Denúncia já registrada' : 'Denúncia recebida', result.alreadyReported
+                ? 'Você já denunciou este usuário.'
+                : 'Nossa equipe de moderação analisará este usuário em breve.');
         } catch (error) {
             console.error('[MessagesScreen] Erro ao enviar denúncia:', error);
             Alert.alert('Erro', 'Não foi possível enviar a denúncia. Tente novamente.');
@@ -299,6 +300,18 @@ export default function MessagesScreen() {
                 <View style={styles.center}>
                     <ActivityIndicator size="large" color="#6366f1" />
                 </View>
+            ) : loadError ? (
+                <View style={styles.center}>
+                    <ErrorState
+                        title="Não foi possível carregar as conversas"
+                        message="Confira sua conexão e tente novamente."
+                        onRetry={() => {
+                            setLoading(true);
+                            setLoadError(false);
+                            setListenerRetryKey((current) => current + 1);
+                        }}
+                    />
+                </View>
             ) : (
                 <FlatList
                     data={visibleConversations}
@@ -326,6 +339,10 @@ export default function MessagesScreen() {
                 onRequestClose={() => setShowNewChatModal(false)}
             >
                 <View style={styles.modalOverlay}>
+                    <KeyboardAvoidingView
+                        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+                        style={styles.keyboardModalContainer}
+                    >
                     <View style={styles.modalContent}>
                         <View style={styles.modalHeader}>
                             <Text style={styles.modalTitle}>Nova Mensagem</Text>
@@ -359,6 +376,7 @@ export default function MessagesScreen() {
                             </TouchableOpacity>
                         </View>
                     </View>
+                    </KeyboardAvoidingView>
                 </View>
             </Modal>
 
@@ -606,6 +624,12 @@ const styles = StyleSheet.create({
         backgroundColor: 'rgba(0,0,0,0.4)',
         justifyContent: 'center',
         alignItems: 'center'
+    },
+    keyboardModalContainer: {
+        flex: 1,
+        width: '100%',
+        justifyContent: 'center',
+        alignItems: 'center',
     },
     modalContent: {
         width: '85%',

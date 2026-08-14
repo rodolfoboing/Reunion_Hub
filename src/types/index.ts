@@ -37,7 +37,7 @@ export interface Meeting {
     placeId?: string;
     createdBy?: string;
     creatorName?: string;
-    createdAt?: string;
+    createdAt?: string | Timestamp | null;
     isRepeated?: boolean;
     seriesId?: string | null;
     attendees?: string[];
@@ -71,11 +71,31 @@ export interface Place {
     vocations?: string[];
     founderId?: string;
     founderName?: string;
+    discovererId?: string;
+    discovererName?: string;
+    discoveredAt?: Timestamp | null;
     frequenters?: string[];
     habitSchedules?: Record<string, HabitSchedule>;
     habits?: Record<string, string[]>;
     isCommunity?: boolean;
+    currentUserHabitSchedule?: HabitSchedule;
+    isCurrentUserFrequenting?: boolean;
 }
+
+export type CreateMeetingDraft = {
+    title: string;
+    interests: string[];
+    description: string;
+    locationName: string;
+    date: string;
+    time: string;
+    endTime: string;
+    lat: number;
+    lng: number;
+    type: 'in-person' | 'online';
+    meetingLink: string;
+    placeId: string;
+};
 
 export interface Message {
     id: string;
@@ -103,6 +123,7 @@ export interface EventInviteCandidate {
     nick?: string;
     photoURL?: string;
     sharedEventsCount: number;
+    previousParticipant: boolean;
 }
 
 export interface EventInviteResult {

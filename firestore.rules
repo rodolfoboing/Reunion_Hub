@@ -33,10 +33,28 @@ service cloud.firestore {
         && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('reputation', 0) > -50;
     }
 
+    function isValidReportReason(type, reason) {
+      return (type == 'event' && reason in [
+        'Informação enganosa ou incorreta',
+        'Local, data ou link inadequado',
+        'Fraude ou pedido de dinheiro',
+        'Risco à segurança ou atividade ilegal',
+        'Conteúdo ofensivo ou discriminatório',
+        'Outro motivo'
+      ]) || (type == 'user' && reason in [
+        'Assédio, ameaça ou perseguição',
+        'Discurso de ódio ou discriminação',
+        'Fraude ou pedido de dinheiro',
+        'Conteúdo sexual ou inadequado',
+        'Spam ou publicidade não solicitada',
+        'Outro motivo'
+      ]);
+    }
+
     function editableUserFields() {
       return [
         'displayName', 'nick', 'searchName', 'bio', 'interests', 'photoURL',
-        'shareFrequentedPlaces', 'showPopularOutsideInterests', 'favorites',
+        'showPopularOutsideInterests', 'favorites',
         'blockedUsers', 'isProfileComplete', 'expoPushToken'
       ];
     }
@@ -59,6 +77,11 @@ service cloud.firestore {
         allow read: if isOwner(userId);
         allow write: if false;
       }
+
+      match /placeHabits/{placeId} {
+        allow read: if isOwner(userId);
+        allow write: if false;
+      }
     }
 
     match /meetings/{meetingId} {
@@ -66,8 +89,45 @@ service cloud.firestore {
       allow create: if hasVerifiedEmail()
         && hasEventTrust()
         && request.resource.data.createdBy == request.auth.uid
-        && request.resource.data.keys().hasAll(['title', 'date', 'time', 'endTime', 'type', 'createdBy', 'attendees'])
+        && request.resource.data.keys().hasAll([
+          'title', 'description', 'locationName', 'interests', 'date', 'time',
+          'endTime', 'type', 'createdBy', 'attendees'
+        ])
+        && request.resource.data.title is string
+        && request.resource.data.title.size() >= 3
+        && request.resource.data.title.size() <= 100
+        && request.resource.data.date is string
+        && request.resource.data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && request.resource.data.date >= '1900-01-01'
+        && request.resource.data.time is string
+        && request.resource.data.time.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$')
+        && request.resource.data.endTime is string
+        && request.resource.data.endTime.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$')
+        && request.resource.data.endTime > request.resource.data.time
+        && request.resource.data.get('description', '') is string
+        && request.resource.data.get('description', '').size() >= 1
+        && request.resource.data.get('description', '').size() <= 2000
+        && request.resource.data.get('locationName', '') is string
+        && request.resource.data.get('locationName', '').size() >= 1
+        && request.resource.data.get('locationName', '').size() <= 150
+        && request.resource.data.get('interests', []) is list
+        && request.resource.data.get('interests', []).size() >= 1
+        && request.resource.data.get('interests', []).size() <= 10
         && request.resource.data.type in ['in-person', 'online']
+        && (request.resource.data.type != 'in-person' || (
+          request.resource.data.lat is number
+          && request.resource.data.lng is number
+          && request.resource.data.lat >= -90
+          && request.resource.data.lat <= 90
+          && request.resource.data.lng >= -180
+          && request.resource.data.lng <= 180
+        ))
+        && (request.resource.data.type != 'online' || (
+          request.resource.data.meetingLink is string
+          && request.resource.data.meetingLink.matches('^https://.+')
+          && request.resource.data.meetingLink.size() <= 500
+        ))
+        && request.resource.data.attendees is list
         && request.resource.data.attendees.size() == 1
         && request.resource.data.attendees[0] == request.auth.uid
         && !request.resource.data.keys().hasAny(['checkedIn'])
@@ -111,8 +171,29 @@ service cloud.firestore {
 
     match /reports/{reportId} {
       allow create: if isAuthenticated() && !isBanned()
-        && request.resource.data.reportedBy == request.auth.uid;
-      allow read, update, delete: if isStaff();
+        && request.resource.data.keys().hasOnly([
+          'type', 'targetId', 'reportedBy', 'reason', 'conversationId', 'createdAt'
+        ])
+        && request.resource.data.type in ['event', 'user']
+        && request.resource.data.targetId is string
+        && request.resource.data.targetId.size() > 0
+        && request.resource.data.targetId.size() <= 200
+        && request.resource.data.reportedBy == request.auth.uid
+        && reportId == request.resource.data.type + '_' + request.resource.data.targetId + '_' + request.auth.uid
+        && request.resource.data.reason is string
+        && request.resource.data.reason.size() > 0
+        && request.resource.data.reason.size() <= 120
+        && isValidReportReason(request.resource.data.type, request.resource.data.reason)
+        && request.resource.data.createdAt == request.time
+        && (!request.resource.data.keys().hasAny(['conversationId'])
+          || (request.resource.data.conversationId is string && request.resource.data.conversationId.size() <= 200))
+        && ((request.resource.data.type == 'event'
+          && exists(/databases/$(database)/documents/meetings/$(request.resource.data.targetId)))
+          || (request.resource.data.type == 'user'
+            && request.resource.data.targetId != request.auth.uid
+            && exists(/databases/$(database)/documents/users/$(request.resource.data.targetId))));
+      allow read: if isStaff() || (isAuthenticated() && resource.data.reportedBy == request.auth.uid);
+      allow update, delete: if isStaff();
     }
 
     match /{document=**} {

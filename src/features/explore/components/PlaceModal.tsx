@@ -1,9 +1,10 @@
 import React from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, Modal, ActivityIndicator, Image, ScrollView } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, Modal, ActivityIndicator, Image, ScrollView, Alert } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import { HabitWeekday, Place, User, Meeting } from '@/src/types';
+import type { HabitSchedule, HabitWeekday, Place, User, Meeting } from '@/src/types';
+import { auth } from '@/src/services/firebaseConfig';
 
 const WEEKDAYS: { key: HabitWeekday; label: string }[] = [
     { key: 'monday', label: 'Seg' },
@@ -20,6 +21,10 @@ function currentWeekday(): HabitWeekday {
     return days[new Date().getDay()];
 }
 
+function configuredDayCount(schedule: HabitSchedule): number {
+    return WEEKDAYS.filter(({ key }) => (schedule[key]?.length || 0) > 0).length;
+}
+
 interface PlaceModalProps {
     visible: boolean;
     onClose: () => void;
@@ -27,7 +32,8 @@ interface PlaceModalProps {
     loadingProfiles: boolean;
     frequentersProfiles: User[];
     placeEvents?: Meeting[];
-    onSaveHabit?: (weekday: HabitWeekday, periods: string[]) => void;
+    onSaveHabit?: (schedule: HabitSchedule) => Promise<void>;
+    onRemoveHabit?: () => Promise<void>;
     onCreateEventPress: () => void;
 }
 
@@ -39,18 +45,66 @@ export function PlaceModal({
     frequentersProfiles,
     placeEvents = [],
     onSaveHabit,
+    onRemoveHabit,
     onCreateEventPress
 }: PlaceModalProps) {
     const [isPickingHabit, setIsPickingHabit] = React.useState(false);
-    const [selectedPeriods, setSelectedPeriods] = React.useState<string[]>([]);
     const [selectedWeekday, setSelectedWeekday] = React.useState<HabitWeekday>(currentWeekday);
+    const [selectedSchedule, setSelectedSchedule] = React.useState<HabitSchedule>({});
+    const [savingHabit, setSavingHabit] = React.useState(false);
+
+    const ownSchedule = place?.currentUserHabitSchedule
+        || (auth.currentUser?.uid ? place?.habitSchedules?.[auth.currentUser.uid] : undefined)
+        || {};
+    const isCurrentUserFrequenting = place?.isCurrentUserFrequenting === true || configuredDayCount(ownSchedule) > 0;
     
     // Reset state when modal opens/closes
     React.useEffect(() => {
         setIsPickingHabit(false);
-        setSelectedPeriods([]);
-        setSelectedWeekday(currentWeekday());
-    }, [visible, place]);
+        setSelectedSchedule(ownSchedule);
+        setSelectedWeekday(WEEKDAYS.find(({ key }) => (ownSchedule[key]?.length || 0) > 0)?.key || currentWeekday());
+    }, [visible, place?.id]);
+
+    const cancelHabitEditing = () => {
+        setSelectedSchedule(ownSchedule);
+        setIsPickingHabit(false);
+    };
+
+    const saveHabit = async () => {
+        if (!onSaveHabit || configuredDayCount(selectedSchedule) === 0) return;
+        setSavingHabit(true);
+        try {
+            await onSaveHabit(selectedSchedule);
+            setIsPickingHabit(false);
+        } catch {
+            // O chamador apresenta a mensagem específica e mantém o editor aberto.
+        } finally {
+            setSavingHabit(false);
+        }
+    };
+
+    const confirmRemoveHabit = () => {
+        if (!onRemoveHabit || savingHabit) return;
+        Alert.alert('Deixar de frequentar', 'Remover seus dias e horários deste local? O reconhecimento de descobridor ou fundador será mantido.', [
+            { text: 'Cancelar', style: 'cancel' },
+            {
+                text: 'Remover rotina',
+                style: 'destructive',
+                onPress: async () => {
+                    setSavingHabit(true);
+                    try {
+                        await onRemoveHabit();
+                        setSelectedSchedule({});
+                        setIsPickingHabit(false);
+                    } catch {
+                        // O chamador apresenta a mensagem específica e preserva a rotina atual.
+                    } finally {
+                        setSavingHabit(false);
+                    }
+                },
+            },
+        ]);
+    };
 
     if (!place) return null;
 
@@ -85,6 +139,15 @@ export function PlaceModal({
                         </View>
                     )}
 
+                    {(place.discovererId || place.discovererName) && (
+                        <View style={styles.discovererBanner}>
+                            <Ionicons name="compass" size={20} color="#4338CA" style={{ marginRight: 8 }} />
+                            <Text style={styles.discovererText}>
+                                Descoberto no Reunion Hub por {place.discovererName || 'um Pioneiro'}
+                            </Text>
+                        </View>
+                    )}
+
                     {loadingProfiles ? (
                         <ActivityIndicator size="small" color="#4F46E5" style={{ marginBottom: 20 }} />
                     ) : frequentersProfiles.length > 0 ? (
@@ -108,6 +171,25 @@ export function PlaceModal({
                                     </TouchableOpacity>
                                 ))}
                             </View>
+                            {frequentersProfiles.map((profile) => {
+                                const schedule = place.habitSchedules?.[profile.uid];
+                                const legacyPeriods = place.habits?.[profile.uid] || [];
+                                const configuredDays = WEEKDAYS.filter(({ key }) => (schedule?.[key]?.length || 0) > 0);
+                                if (configuredDays.length === 0 && legacyPeriods.length === 0) return null;
+                                return (
+                                    <View key={`schedule_${profile.uid}`} style={styles.frequentScheduleCard}>
+                                        <Text style={styles.frequentScheduleName}>{profile.nick || profile.displayName || 'Usuário'}</Text>
+                                        {configuredDays.map(({ key, label }) => (
+                                            <Text key={key} style={styles.frequentScheduleText}>
+                                                {label}: {schedule?.[key]?.join(', ')}
+                                            </Text>
+                                        ))}
+                                        {configuredDays.length === 0 && legacyPeriods.length > 0 && (
+                                            <Text style={styles.frequentScheduleText}>Período: {legacyPeriods.join(', ')}</Text>
+                                        )}
+                                    </View>
+                                );
+                            })}
                         </View>
                     ) : (
                         <View style={{ backgroundColor: '#F3F4F6', padding: 16, borderRadius: 12, marginBottom: 20, alignItems: 'center' }}>
@@ -124,19 +206,25 @@ export function PlaceModal({
                             style={{ backgroundColor: '#DCFCE7', paddingVertical: 12, borderRadius: 12, alignItems: 'center', marginBottom: 20 }}
                             onPress={() => setIsPickingHabit(true)}
                         >
-                            <Text style={{ color: '#166534', fontWeight: 'bold' }}>Eu costumo frequentar este lugar</Text>
+                            <Text style={{ color: '#166534', fontWeight: 'bold' }}>{isCurrentUserFrequenting ? 'Editar minha rotina neste lugar' : 'Eu costumo frequentar este lugar'}</Text>
                         </TouchableOpacity>
                     ) : (
                         <View style={{ backgroundColor: '#F0FDF4', padding: 16, borderRadius: 12, borderWidth: 1, borderColor: '#BBF7D0', marginBottom: 20 }}>
-                            <Text style={{ color: '#15803D', fontWeight: 'bold', marginBottom: 8 }}>Em qual dia e período você costuma vir?</Text>
+                            <Text style={{ color: '#15803D', fontWeight: 'bold', marginBottom: 4 }}>Em quais dias e períodos você costuma vir?</Text>
+                            <Text style={styles.habitHelper}>Escolha um dia, marque os períodos e repita nos demais dias.</Text>
                             <View style={styles.weekdayContainer}>
                                 {WEEKDAYS.map(({ key, label }) => (
                                     <TouchableOpacity
                                         key={key}
-                                        style={[styles.weekdayChip, selectedWeekday === key && styles.weekdayChipSelected]}
+                                        style={[
+                                            styles.weekdayChip,
+                                            (selectedSchedule[key]?.length || 0) > 0 && styles.weekdayChipConfigured,
+                                            selectedWeekday === key && styles.weekdayChipSelected,
+                                        ]}
                                         onPress={() => setSelectedWeekday(key)}
                                     >
                                         <Text style={[styles.weekdayText, selectedWeekday === key && styles.weekdayTextSelected]}>{label}</Text>
+                                        {(selectedSchedule[key]?.length || 0) > 0 && <View style={styles.weekdayConfiguredDot} />}
                                     </TouchableOpacity>
                                 ))}
                             </View>
@@ -144,36 +232,49 @@ export function PlaceModal({
                                 {['Manhã', 'Tarde', 'Noite'].map(period => (
                                     <TouchableOpacity 
                                         key={period} 
-                                        style={[styles.periodChip, selectedPeriods.includes(period) && styles.periodChipSelected]}
+                                        style={[styles.periodChip, selectedSchedule[selectedWeekday]?.includes(period) && styles.periodChipSelected]}
                                         onPress={() => {
-                                            setSelectedPeriods(prev => 
-                                                prev.includes(period) ? prev.filter(p => p !== period) : [...prev, period]
-                                            );
+                                            setSelectedSchedule((currentSchedule) => {
+                                                const currentPeriods = currentSchedule[selectedWeekday] || [];
+                                                const nextPeriods = currentPeriods.includes(period)
+                                                    ? currentPeriods.filter((currentPeriod) => currentPeriod !== period)
+                                                    : [...currentPeriods, period];
+                                                const nextSchedule = { ...currentSchedule };
+                                                if (nextPeriods.length > 0) nextSchedule[selectedWeekday] = nextPeriods;
+                                                else delete nextSchedule[selectedWeekday];
+                                                return nextSchedule;
+                                            });
                                         }}
                                     >
-                                        <Text style={[styles.periodText, selectedPeriods.includes(period) && styles.periodTextSelected]}>{period}</Text>
+                                        <Text style={[styles.periodText, selectedSchedule[selectedWeekday]?.includes(period) && styles.periodTextSelected]}>{period}</Text>
                                     </TouchableOpacity>
                                 ))}
                             </View>
+                            <Text style={styles.configuredDaysText}>{configuredDayCount(selectedSchedule)} dia(s) configurado(s)</Text>
                             <View style={{ flexDirection: 'row', gap: 8 }}>
                                 <TouchableOpacity 
                                     style={{ flex: 1, padding: 10, alignItems: 'center' }}
-                                    onPress={() => setIsPickingHabit(false)}
+                                    onPress={cancelHabitEditing}
+                                    disabled={savingHabit}
                                 >
                                     <Text style={{ color: '#6B7280', fontWeight: 'bold' }}>Cancelar</Text>
                                 </TouchableOpacity>
                                 <TouchableOpacity 
-                                    style={{ flex: 1, backgroundColor: '#16A34A', padding: 10, borderRadius: 8, alignItems: 'center', opacity: selectedPeriods.length > 0 ? 1 : 0.5 }}
-                                    disabled={selectedPeriods.length === 0}
-                                    onPress={() => {
-                                        if (onSaveHabit) onSaveHabit(selectedWeekday, selectedPeriods);
-                                        setIsPickingHabit(false);
-                                    }}
+                                    style={{ flex: 1, backgroundColor: '#16A34A', padding: 10, borderRadius: 8, alignItems: 'center', opacity: configuredDayCount(selectedSchedule) > 0 ? 1 : 0.5 }}
+                                    onPress={saveHabit}
+                                    disabled={configuredDayCount(selectedSchedule) === 0 || savingHabit}
                                 >
-                                    <Text style={{ color: '#fff', fontWeight: 'bold' }}>Salvar Rotina</Text>
+                                    {savingHabit ? <ActivityIndicator size="small" color="#FFF" /> : <Text style={{ color: '#fff', fontWeight: 'bold' }}>Salvar Rotina</Text>}
                                 </TouchableOpacity>
                             </View>
                         </View>
+                    )}
+
+                    {isCurrentUserFrequenting && !isPickingHabit && (
+                        <TouchableOpacity style={styles.removeHabitButton} onPress={confirmRemoveHabit} disabled={savingHabit}>
+                            <Ionicons name="close-circle-outline" size={18} color="#B91C1C" />
+                            <Text style={styles.removeHabitText}>Deixar de frequentar este local</Text>
+                        </TouchableOpacity>
                     )}
 
                     {/* Eventos Futuros Neste Local */}
@@ -216,6 +317,15 @@ const styles = StyleSheet.create({
     modalContentInner: { padding: 24, paddingBottom: 28 },
     modalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 },
     modalTitle: { fontSize: 20, fontWeight: 'bold', color: '#111827' },
+    discovererBanner: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#EEF2FF', padding: 12, borderRadius: 8, marginBottom: 16 },
+    discovererText: { flex: 1, color: '#3730A3', fontWeight: 'bold' },
+    frequentScheduleCard: { marginTop: 10, padding: 10, borderRadius: 10, backgroundColor: '#F8FAFC', borderWidth: 1, borderColor: '#E2E8F0' },
+    frequentScheduleName: { color: '#334155', fontSize: 13, fontWeight: '800', marginBottom: 3 },
+    frequentScheduleText: { color: '#64748B', fontSize: 12, lineHeight: 18 },
+    habitHelper: { color: '#4B7C5C', fontSize: 12, lineHeight: 17, marginBottom: 10 },
+    configuredDaysText: { color: '#15803D', fontSize: 12, fontWeight: '700', marginBottom: 10 },
+    removeHabitButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7, marginTop: -10, marginBottom: 20, paddingVertical: 10 },
+    removeHabitText: { color: '#B91C1C', fontSize: 13, fontWeight: '700' },
     eventItem: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#F9FAFB', padding: 12, borderRadius: 12, marginBottom: 8 },
     eventDateBox: { backgroundColor: '#EEF2FF', width: 44, height: 44, borderRadius: 8, justifyContent: 'center', alignItems: 'center', marginRight: 12 },
     eventDay: { fontSize: 16, fontWeight: 'bold', color: '#4F46E5', lineHeight: 18 },
@@ -228,7 +338,9 @@ const styles = StyleSheet.create({
     periodTextSelected: { color: '#fff', fontWeight: 'bold' },
     weekdayContainer: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 12 },
     weekdayChip: { minWidth: 44, paddingVertical: 8, paddingHorizontal: 8, borderRadius: 8, backgroundColor: '#fff', borderWidth: 1, borderColor: '#86EFAC', alignItems: 'center' },
+    weekdayChipConfigured: { backgroundColor: '#DCFCE7', borderColor: '#22C55E' },
     weekdayChipSelected: { backgroundColor: '#16A34A', borderColor: '#16A34A' },
     weekdayText: { fontSize: 13, color: '#166534' },
     weekdayTextSelected: { color: '#fff', fontWeight: 'bold' },
+    weekdayConfiguredDot: { position: 'absolute', top: 3, right: 3, width: 5, height: 5, borderRadius: 3, backgroundColor: '#FDE047' },
 });

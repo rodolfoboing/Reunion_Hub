@@ -1,21 +1,23 @@
 import { useLocalSearchParams, router, Stack } from 'expo-router';
 import { View, Text, StyleSheet, ScrollView, Alert, ActivityIndicator, TouchableOpacity, Linking } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useEffect, useState, useRef } from 'react';
-import { doc, getDoc, addDoc, collection, serverTimestamp } from 'firebase/firestore';
+import { useCallback, useEffect, useState } from 'react';
+import { doc, getDoc, onSnapshot } from 'firebase/firestore';
 import { httpsCallable } from 'firebase/functions';
+import { useFocusEffect } from '@react-navigation/native';
 import { db, auth, functions } from '../../src/services/firebaseConfig';
 import { CheckInRequest, Meeting } from '../../src/types';
 import { StyledButton } from '@/src/components/StyledButton';
 import { ErrorState } from '@/src/components/ErrorState';
 import { FontAwesome } from '@expo/vector-icons';
 import { normalizeDate } from '../../src/utils/dateUtils';
-import { formatEventTimeRange, isEventInProgress, isEventToday } from '../../src/utils/eventSchedule';
+import { formatEventTimeRange, isEventInProgress, isEventRegistrationOpen, isEventToday } from '../../src/utils/eventSchedule';
 import { useEventClock } from '@/src/hooks/useEventClock';
 import { scheduleEventReminder, cancelEventReminder } from '../../src/utils/Notifications';
 import { ReportReasonModal } from '@/src/components/ReportReasonModal';
 import { markRelatedNotificationsAsRead } from '@/src/services/notificationReadService';
 import { EventInviteModal } from '@/src/features/events/components/EventInviteModal';
+import { submitReport } from '@/src/services/reportService';
 
 // Helper para verificar se hoje é o dia do evento
 // Formata a data para exibição amigável
@@ -36,6 +38,7 @@ const formatDateDisplay = (dateString: string | undefined): string => {
 export default function MeetingDetailsScreen() {
     const eventClock = useEventClock();
     const { id } = useLocalSearchParams<{ id?: string }>();
+    const eventId = typeof id === 'string' ? id : null;
     const [meeting, setMeeting] = useState<Meeting | null>(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(false);
@@ -45,16 +48,46 @@ export default function MeetingDetailsScreen() {
     const [showReportReasonModal, setShowReportReasonModal] = useState(false);
     const [showInviteModal, setShowInviteModal] = useState(false);
     const [favoriteLoading, setFavoriteLoading] = useState(false);
+    const [linkIssueLoading, setLinkIssueLoading] = useState(false);
+    const [isFavorited, setIsFavorited] = useState(false);
     const [creatorName, setCreatorName] = useState('Usuário');
-    const isMounted = useRef(true);
+    const [retryKey, setRetryKey] = useState(0);
 
-    useEffect(() => {
-        isMounted.current = true;
-        fetchMeeting();
-        return () => {
-            isMounted.current = false;
-        };
-    }, [id]);
+    useFocusEffect(useCallback(() => {
+        if (!eventId) {
+            setMeeting(null);
+            setError(true);
+            setLoading(false);
+            return;
+        }
+        setLoading(true);
+        setError(false);
+        const unsubscribe = onSnapshot(doc(db, 'meetings', eventId), (snapshot) => {
+            if (!snapshot.exists()) {
+                setMeeting(null);
+                setError(true);
+            } else {
+                setMeeting({ id: snapshot.id, ...snapshot.data() } as Meeting);
+                setError(false);
+            }
+            setLoading(false);
+        }, () => {
+            setError(true);
+            setLoading(false);
+        });
+        return unsubscribe;
+    }, [eventId, retryKey]));
+
+    useFocusEffect(useCallback(() => {
+        const uid = auth.currentUser?.uid;
+        if (!uid || !eventId) {
+            setIsFavorited(false);
+            return;
+        }
+        return onSnapshot(doc(db, 'users', uid, 'favoriteEvents', eventId), (snapshot) => {
+            setIsFavorited(snapshot.exists());
+        }, () => setIsFavorited(false));
+    }, [eventId]));
 
     useEffect(() => {
         if (!meeting?.createdBy) return;
@@ -75,35 +108,41 @@ export default function MeetingDetailsScreen() {
         return () => { active = false; };
     }, [meeting?.createdBy, meeting?.creatorName, meeting?.id]);
 
-    const fetchMeeting = async () => {
-        if (!isMounted.current) return;
-        setLoading(true);
-        setError(false);
-        try {
-            const docRef = doc(db, 'meetings', id as string);
-            const docSnap = await getDoc(docRef);
-            
-            if (!isMounted.current) return;
-
-            if (docSnap.exists()) {
-                setMeeting({ id: docSnap.id, ...docSnap.data() } as Meeting);
-            } else {
-                setError(true);
-            }
-        } catch (error) {
-            console.error(error);
-            if (isMounted.current) {
-                setError(true);
-            }
-        } finally {
-            if (isMounted.current) {
-                setLoading(false);
-            }
-        }
+    const handleReportLinkIssue = () => {
+        if (!eventId || !meeting || !auth.currentUser || meeting.createdBy === auth.currentUser.uid) return;
+        Alert.alert(
+            'Avisar sobre o link?',
+            'Alguns links de reunião só ficam disponíveis perto do horário. Envie o aviso se o link realmente parecer incorreto ou indisponível.',
+            [
+                { text: 'Cancelar', style: 'cancel' },
+                {
+                    text: 'Avisar criador',
+                    onPress: async () => {
+                        setLinkIssueLoading(true);
+                        try {
+                            const reportLinkIssue = httpsCallable<{ eventId: string }, { sent: boolean; alreadyReported: boolean }>(functions, 'reportEventLinkIssue');
+                            const result = await reportLinkIssue({ eventId });
+                            Alert.alert(
+                                result.data.alreadyReported ? 'Aviso já enviado' : 'Criador avisado',
+                                result.data.alreadyReported
+                                    ? 'Você já avisou sobre este mesmo link. Evitamos enviar notificações repetidas.'
+                                    : 'O criador recebeu um aviso para conferir o link.'
+                            );
+                        } catch {
+                            console.error('[Event] link_issue_report_failed');
+                            Alert.alert('Não foi possível avisar', 'Confira sua conexão e tente novamente.');
+                        } finally {
+                            setLinkIssueLoading(false);
+                        }
+                    },
+                },
+            ]
+        );
     };
 
     const handleRSVP = async () => {
-        if (!auth.currentUser || !meeting) {
+        const currentUser = auth.currentUser;
+        if (!currentUser || !meeting || !eventId) {
             Alert.alert('Erro', 'Faça login para confirmar presença.');
             return;
         }
@@ -117,26 +156,14 @@ export default function MeetingDetailsScreen() {
                     onPress: async () => {
                         setRsvpLoading(true);
                         try {
-                            // VERIFICAR REPUTAÇÃO DO USUÁRIO (Prevenção de Tóxicos)
-                            const userRef = doc(db, 'users', auth.currentUser!.uid);
-                            const userSnap = await getDoc(userRef);
-                            if (userSnap.exists()) {
-                                const rep = userSnap.data().reputation || 0;
-                                if (rep <= -50) {
-                                    Alert.alert('Bloqueado', 'Você tem muitas faltas (No-Show). Sua reputação está muito baixa para confirmar presença em novos eventos.');
-                                    setRsvpLoading(false);
-                                    return;
-                                }
-                            }
-
-                            await httpsCallable(functions, 'rsvpToEvent')({ eventId: id });
-                            await scheduleEventReminder({ id: id as string, title: meeting.title, date: meeting.date, time: meeting.time });
+                            await httpsCallable(functions, 'rsvpToEvent')({ eventId });
+                            scheduleEventReminder({ id: eventId, title: meeting.title, date: meeting.date, time: meeting.time }, currentUser.uid)
+                                .catch(() => console.warn('[Event] local_reminder_schedule_failed'));
 
                             Alert.alert('Sucesso', 'Presença confirmada! Lembre-se das dicas de segurança e não esqueça de fazer check-in no dia do evento.');
-                            fetchMeeting(); // Refresh UI
                         } catch (error) {
-                            console.error(error);
-                            Alert.alert('Erro', 'Falha ao confirmar presença.');
+                            console.error('[Event] rsvp_failed');
+                            Alert.alert('Não foi possível confirmar', 'As confirmações encerram no início do evento. Confira também sua conexão e tente novamente.');
                         } finally {
                             setRsvpLoading(false);
                         }
@@ -147,7 +174,8 @@ export default function MeetingDetailsScreen() {
     };
 
     const handleCancelAttendance = () => {
-        if (!auth.currentUser || !meeting || !id) return;
+        const currentUser = auth.currentUser;
+        if (!currentUser || !meeting || !eventId) return;
         Alert.alert(
             'Cancelar presença',
             `Deseja cancelar sua presença em "${meeting.title}"? O organizador será avisado.`,
@@ -160,10 +188,10 @@ export default function MeetingDetailsScreen() {
                         setRsvpLoading(true);
                         try {
                             const leaveEvent = httpsCallable<{ eventId: string }, { ok: boolean }>(functions, 'leaveEvent');
-                            await leaveEvent({ eventId: id as string });
-                            await cancelEventReminder(id as string);
+                            await leaveEvent({ eventId });
+                            cancelEventReminder(eventId, currentUser.uid)
+                                .catch(() => console.warn('[Event] local_reminder_cancel_failed'));
                             Alert.alert('Presença cancelada', 'Você saiu do evento e o organizador foi avisado.');
-                            await fetchMeeting();
                         } catch {
                             console.error('[Event] attendance_cancellation_failed');
                             Alert.alert('Não foi possível cancelar', 'Confira sua conexão e tente novamente.');
@@ -177,7 +205,7 @@ export default function MeetingDetailsScreen() {
     };
 
     const handleCheckIn = async () => {
-        if (!auth.currentUser || !meeting) {
+        if (!auth.currentUser || !meeting || !eventId) {
             Alert.alert('Erro', 'Faça login para fazer check-in.');
             return;
         }
@@ -193,7 +221,7 @@ export default function MeetingDetailsScreen() {
         setCheckInLoading(true);
         try {
             const requestCheckIn = httpsCallable<{ eventId: string }, { requested: boolean; alreadyConfirmed: boolean }>(functions, 'checkInToEvent');
-            const result = await requestCheckIn({ eventId: id as string });
+            const result = await requestCheckIn({ eventId });
             Alert.alert(
                 result.data.alreadyConfirmed ? 'Check-in já confirmado' : 'Solicitação enviada',
                 result.data.alreadyConfirmed
@@ -201,7 +229,6 @@ export default function MeetingDetailsScreen() {
                     : 'Aguarde a confirmação do organizador ou de outro participante. Os +10 pontos serão adicionados após a confirmação.'
             );
 
-            fetchMeeting(); // Refresh UI
         } catch (error) {
             console.error('Check-in error:', error);
             Alert.alert('Erro', 'Falha ao fazer check-in. Tente novamente.');
@@ -211,16 +238,15 @@ export default function MeetingDetailsScreen() {
     };
 
     const handleConfirmCheckIn = async (request: CheckInRequest) => {
-        if (!meeting || !id) return;
+        if (!meeting || !eventId) return;
         setConfirmingCheckInUserId(request.userId);
         try {
             const confirmCheckIn = httpsCallable<{ eventId: string; targetUserId: string }, { confirmed: boolean }>(functions, 'confirmEventCheckIn');
-            const result = await confirmCheckIn({ eventId: id as string, targetUserId: request.userId });
+            const result = await confirmCheckIn({ eventId, targetUserId: request.userId });
             Alert.alert(
                 result.data.confirmed ? 'Presença confirmada' : 'Check-in já confirmado',
                 result.data.confirmed ? `${request.displayName} recebeu os pontos de participação.` : 'Esta solicitação já foi processada.'
             );
-            fetchMeeting();
         } catch (error) {
             console.error('[Event] checkin_confirmation_failed');
             Alert.alert('Não foi possível confirmar', 'Verifique se o evento ainda está em andamento e tente novamente.');
@@ -232,25 +258,27 @@ export default function MeetingDetailsScreen() {
     const handleEndEvent = async () => {
         Alert.alert(
             'Encerrar Evento',
-            'Deseja encerrar definitivamente este evento? Isso punirá com -20 de reputação todos que confirmaram presença e não fizeram check-in (No-Show).',
+            'Deseja encerrar definitivamente este evento? Se houve check-in, quem faltou perde 20 pontos. Se ninguém fez check-in, cada inscrito perde somente 1 ponto.',
             [
                 { text: 'Cancelar', style: 'cancel' },
                 {
                     text: 'Encerrar',
                     style: 'destructive',
                     onPress: async () => {
+                        if (!eventId) return;
                         setLoading(true);
                         try {
-                            const completeEvent = httpsCallable<{ eventId: string }, { noShows: number; becameFounder: boolean; alreadyCompleted: boolean }>(functions, 'completeEvent');
-                            const result = await completeEvent({ eventId: id as string });
+                            const completeEvent = httpsCallable<{ eventId: string }, { noShows: number; becameFounder: boolean; alreadyCompleted: boolean; noCheckIns: boolean }>(functions, 'completeEvent');
+                            const result = await completeEvent({ eventId });
                             if (result.data.alreadyCompleted) {
                                 Alert.alert('Evento já encerrado', 'Este evento já havia sido finalizado.');
+                            } else if (result.data.noCheckIns) {
+                                Alert.alert('Evento encerrado', 'Ninguém registrou check-in. Como ninguém foi prejudicado, cada inscrito perdeu somente 1 ponto.');
                             } else if (result.data.becameFounder) {
                                 Alert.alert('🌟 Você é um Fundador!', 'Parabéns! Você realizou o primeiro evento neste local e agora tem o título de Fundador Oficial deste espaço!');
                             } else {
                                 Alert.alert('Concluído', `Evento encerrado! ${result.data.noShows} faltoso(s) foram penalizados.`);
                             }
-                            fetchMeeting();
                         } catch (error) {
                             Alert.alert('Erro', 'Falha ao encerrar evento.');
                         } finally {
@@ -263,7 +291,7 @@ export default function MeetingDetailsScreen() {
     };
 
     const handleCancelEvent = async () => {
-        if (!meeting) return;
+        if (!meeting || !eventId) return;
         Alert.alert(
             'Cancelar Evento',
             'Os participantes serão avisados. A penalidade de -15 pontos só será aplicada se outra pessoa já tiver confirmado presença. Deseja realmente cancelar?',
@@ -276,13 +304,13 @@ export default function MeetingDetailsScreen() {
                         setLoading(true);
                         try {
                             const cancelEvent = httpsCallable<{ eventId: string }, { penalized: boolean }>(functions, 'cancelEvent');
-                            const result = await cancelEvent({ eventId: id as string });
-                            await cancelEventReminder(id as string);
+                            const result = await cancelEvent({ eventId });
+                            const uid = auth.currentUser?.uid;
+                            if (uid) cancelEventReminder(eventId, uid).catch(() => console.warn('[Event] local_reminder_cancel_failed'));
                             
                             Alert.alert('Cancelado', result.data.penalized
                                 ? 'O evento foi cancelado, os participantes foram avisados e sua reputação foi atualizada.'
                                 : 'O evento foi cancelado. Como não havia outros participantes, sua reputação não foi alterada.');
-                            fetchMeeting();
                         } catch (e) {
                             Alert.alert('Erro', 'Falha ao cancelar evento.');
                         } finally {
@@ -299,11 +327,12 @@ export default function MeetingDetailsScreen() {
     };
 
     const handleFavoriteCompletedEvent = async () => {
-        if (!id) return;
+        if (!eventId) return;
         setFavoriteLoading(true);
         try {
             const toggleFavorite = httpsCallable<{ eventId: string }, { favorited: boolean }>(functions, 'toggleEventFavorite');
-            const result = await toggleFavorite({ eventId: id as string });
+            const result = await toggleFavorite({ eventId });
+            setIsFavorited(result.data.favorited);
             Alert.alert(result.data.favorited ? 'Adicionado aos favoritos' : 'Removido dos favoritos', result.data.favorited
                 ? 'Este evento ficará disponível na sua aba Favoritos, mesmo quando o histórico comum for limpo.'
                 : 'O evento foi removido da sua aba Favoritos.');
@@ -315,18 +344,13 @@ export default function MeetingDetailsScreen() {
     };
 
     const submitEventReport = async (reason: string) => {
-        const reporterId = auth.currentUser?.uid;
-        if (!reporterId || !id) return;
+        if (!auth.currentUser || !eventId) return;
         setShowReportReasonModal(false);
         try {
-            await addDoc(collection(db, 'reports'), {
-                type: 'event',
-                targetId: id,
-                reportedBy: reporterId,
-                reason,
-                createdAt: serverTimestamp()
-            });
-            Alert.alert('Denúncia recebida', 'Nossa equipe analisará este evento em breve. Obrigado.');
+            const result = await submitReport({ type: 'event', targetId: eventId, reason });
+            Alert.alert(result.alreadyReported ? 'Denúncia já registrada' : 'Denúncia recebida', result.alreadyReported
+                ? 'Você já denunciou este evento. A equipe de moderação poderá analisá-lo.'
+                : 'Nossa equipe analisará este evento em breve. Obrigado.');
         } catch (error) {
             console.error('[Event] Erro ao enviar denúncia:', error);
             Alert.alert('Erro', 'Não foi possível enviar a denúncia.');
@@ -334,6 +358,15 @@ export default function MeetingDetailsScreen() {
     };
 
     if (loading) return <View style={styles.center}><ActivityIndicator size="large" /></View>;
+    if (error) return (
+        <SafeAreaView style={styles.container} edges={['bottom']}>
+            <ErrorState
+                title="Não foi possível carregar o evento"
+                message="O evento pode não existir mais ou sua conexão está indisponível."
+                onRetry={() => setRetryKey((current) => current + 1)}
+            />
+        </SafeAreaView>
+    );
     if (!meeting) return null;
 
     const currentUid = auth.currentUser?.uid;
@@ -346,6 +379,7 @@ export default function MeetingDetailsScreen() {
         : [];
     const isToday = isEventToday(meeting, eventClock);
     const isInProgress = isEventInProgress(meeting, eventClock);
+    const isRegistrationOpen = isEventRegistrationOpen(meeting, eventClock);
     const isCreator = currentUid ? meeting.createdBy === currentUid : false;
     const isCompleted = meeting.status === 'completed';
 
@@ -411,7 +445,7 @@ export default function MeetingDetailsScreen() {
                 style={styles.participantsSection}
                 onPress={() => router.push({
                     pathname: '/event/attendees',
-                    params: { meetingId: id as string, meetingTitle: meeting.title }
+                    params: { meetingId: eventId || '', meetingTitle: meeting.title }
                 } as never)}
                 activeOpacity={0.7}
             >
@@ -490,20 +524,26 @@ export default function MeetingDetailsScreen() {
                         </View>
                         {hasCheckedIn && (
                             <TouchableOpacity style={styles.favoriteButton} onPress={handleFavoriteCompletedEvent} disabled={favoriteLoading}>
-                                {favoriteLoading ? <ActivityIndicator size="small" color="#BE123C" /> : <FontAwesome name="heart-o" size={16} color="#BE123C" />}
-                                <Text style={styles.favoriteButtonText}>Gerenciar favorito</Text>
+                                {favoriteLoading ? <ActivityIndicator size="small" color="#BE123C" /> : <FontAwesome name={isFavorited ? 'heart' : 'heart-o'} size={16} color="#BE123C" />}
+                                <Text style={styles.favoriteButtonText}>{isFavorited ? 'Remover dos favoritos' : 'Adicionar aos favoritos'}</Text>
                             </TouchableOpacity>
                         )}
                     </>
                 ) : (
                     <>
                         {/* Botão de RSVP / Presença (escondido para o criador) */}
-                        {!isAttending && !isCreator ? (
+                        {!isAttending && !isCreator && isRegistrationOpen ? (
                             <StyledButton
                                 title="Confirmar Presença"
                                 onPress={handleRSVP}
                                 isLoading={rsvpLoading}
                             />
+                        ) : !isAttending && !isCreator ? (
+                            <View style={styles.waitingCheckIn}>
+                                <FontAwesome name="lock" size={20} color="#6b7280" />
+                                <Text style={styles.waitingText}>Confirmações encerradas</Text>
+                                <Text style={styles.waitingSubtext}>Não é mais possível entrar neste evento após o horário de início.</Text>
+                            </View>
                         ) : hasCheckedIn ? (
                             <View style={styles.checkedInContainer}>
                                 <FontAwesome name="check-circle" size={24} color="#10b981" />
@@ -533,7 +573,7 @@ export default function MeetingDetailsScreen() {
                             </View>
                         )}
 
-                        {isAttending && !isCreator && !hasCheckedIn && (
+                        {isAttending && !isCreator && !hasCheckedIn && isRegistrationOpen && (
                             <TouchableOpacity
                                 style={styles.cancelAttendanceButton}
                                 onPress={handleCancelAttendance}
@@ -561,6 +601,18 @@ export default function MeetingDetailsScreen() {
                                     }}
                                     colors={['#3b82f6', '#60a5fa']}
                                 />
+                                {!isCreator && currentUid ? (
+                                    <TouchableOpacity
+                                        style={styles.linkIssueButton}
+                                        onPress={handleReportLinkIssue}
+                                        disabled={linkIssueLoading}
+                                    >
+                                        {linkIssueLoading
+                                            ? <ActivityIndicator size="small" color="#B45309" />
+                                            : <FontAwesome name="exclamation-triangle" size={15} color="#B45309" />}
+                                        <Text style={styles.linkIssueButtonText}>Avisar que o link pode estar com problema</Text>
+                                    </TouchableOpacity>
+                                ) : null}
                             </>
                         ) : null}
 
@@ -760,6 +812,8 @@ const styles = StyleSheet.create({
     confirmCheckInButtonText: { color: '#fff', fontSize: 13, fontWeight: '800' },
     cancelAttendanceButton: { minHeight: 46, marginTop: 12, borderRadius: 12, borderWidth: 1, borderColor: '#FECACA', backgroundColor: '#FEF2F2', alignItems: 'center', justifyContent: 'center', flexDirection: 'row', gap: 8 },
     cancelAttendanceButtonText: { color: '#B91C1C', fontSize: 14, fontWeight: '800' },
+    linkIssueButton: { minHeight: 44, marginTop: 10, borderRadius: 12, borderWidth: 1, borderColor: '#FDE68A', backgroundColor: '#FFFBEB', alignItems: 'center', justifyContent: 'center', flexDirection: 'row', gap: 8, paddingHorizontal: 12 },
+    linkIssueButtonText: { color: '#92400E', fontSize: 13, fontWeight: '700', textAlign: 'center' },
     favoriteButton: { minHeight: 48, marginTop: 12, borderRadius: 12, borderWidth: 1, borderColor: '#FECDD3', backgroundColor: '#FFF1F2', alignItems: 'center', justifyContent: 'center', flexDirection: 'row', gap: 8 },
     favoriteButtonText: { color: '#BE123C', fontSize: 14, fontWeight: '800' },
 });

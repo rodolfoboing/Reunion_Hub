@@ -5,25 +5,50 @@ import { useLocalSearchParams, useRouter, Stack } from 'expo-router';
 import { FontAwesome, Ionicons } from '@expo/vector-icons';
 import { auth, db, functions } from '../../src/services/firebaseConfig';
 import { httpsCallable } from 'firebase/functions';
-import { collection, addDoc, query, orderBy, onSnapshot, serverTimestamp, doc, updateDoc, limit, increment, arrayUnion } from 'firebase/firestore';
+import { collection, query, orderBy, onSnapshot, doc, updateDoc, limit, arrayUnion } from 'firebase/firestore';
 import { Message } from '../../src/types';
 import { ReportReasonModal } from '@/src/components/ReportReasonModal';
 import { markRelatedNotificationsAsRead } from '@/src/services/notificationReadService';
+import { submitReport } from '@/src/services/reportService';
 
 function getErrorMessage(error: unknown): string {
     return error instanceof Error ? error.message : '';
 }
 
+type ConversationData = {
+    participants: string[];
+    participantNames: Record<string, string>;
+    unreadCounts: Record<string, number>;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null;
+}
+
+function parseConversationData(value: unknown): ConversationData | null {
+    if (!isRecord(value) || !Array.isArray(value.participants)) return null;
+    const participants = value.participants.filter((participant): participant is string => typeof participant === 'string');
+    const participantNames = isRecord(value.participantNames)
+        ? Object.fromEntries(Object.entries(value.participantNames).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
+        : {};
+    const unreadCounts = isRecord(value.unreadCounts)
+        ? Object.fromEntries(Object.entries(value.unreadCounts).filter((entry): entry is [string, number] => typeof entry[1] === 'number'))
+        : {};
+    return { participants, participantNames, unreadCounts };
+}
+
 export default function ChatScreen() {
-    const { id, name } = useLocalSearchParams();
+    const { id, name } = useLocalSearchParams<{ id?: string; name?: string }>();
     const router = useRouter();
     const [messages, setMessages] = useState<Message[]>([]);
     const [inputText, setInputText] = useState('');
     const [loading, setLoading] = useState(true);
+    const [sendingMessage, setSendingMessage] = useState(false);
     const flatListRef = useRef<FlatList>(null);
+    const pendingMessageRef = useRef<{ text: string; messageId: string } | null>(null);
     
     // Novas dependências para opções e lidas/não-lidas
-    const [conversationData, setConversationData] = useState<any>(null);
+    const [conversationData, setConversationData] = useState<ConversationData | null>(null);
     const [showOptionsModal, setShowOptionsModal] = useState(false);
     const [showReportReasonModal, setShowReportReasonModal] = useState(false);
     const [otherUserExists, setOtherUserExists] = useState(true);
@@ -31,12 +56,12 @@ export default function ChatScreen() {
     useEffect(() => {
         if (!id || !auth.currentUser) return;
 
-        markRelatedNotificationsAsRead({ conversationId: id as string }).catch((error) => {
+        markRelatedNotificationsAsRead({ conversationId: id }).catch((error) => {
             console.error('[Conversation] Erro ao marcar notificações como lidas:', error);
         });
 
         // Assinar mensagens
-        const messagesRef = collection(db, 'conversations', id as string, 'messages');
+        const messagesRef = collection(db, 'conversations', id, 'messages');
         const q = query(messagesRef, orderBy('createdAt', 'desc'), limit(50));
 
         const unsubscribeMsgs = onSnapshot(q, (snapshot) => {
@@ -51,14 +76,16 @@ export default function ChatScreen() {
         });
 
         // Assinar conversa para ler status e resetar unreadCount
-        const convRef = doc(db, 'conversations', id as string);
+        const convRef = doc(db, 'conversations', id);
         const unsubscribeConv = onSnapshot(convRef, (docSnap) => {
             if (docSnap.exists()) {
-                const data = docSnap.data();
+                const data = parseConversationData(docSnap.data());
+                if (!data) return;
                 setConversationData(data);
 
                 // Se eu tiver mensagens não lidas, zero-as imediatamente porque estou com o chat aberto
-                const myUid = auth.currentUser!.uid;
+                const myUid = auth.currentUser?.uid;
+                if (!myUid) return;
                 if (data.unreadCounts && data.unreadCounts[myUid] > 0) {
                     updateDoc(convRef, {
                         [`unreadCounts.${myUid}`]: 0
@@ -75,7 +102,7 @@ export default function ChatScreen() {
 
     useEffect(() => {
         if (!conversationData?.participants || !auth.currentUser) return;
-        const otherUid = conversationData.participants.find((p: string) => p !== auth.currentUser?.uid);
+        const otherUid = conversationData.participants.find((participant) => participant !== auth.currentUser?.uid);
         if (!otherUid) return;
 
         const unsubscribeOtherUser = onSnapshot(doc(db, 'users', otherUid), (userSnap) => {
@@ -86,15 +113,25 @@ export default function ChatScreen() {
     }, [conversationData?.participants]);
 
     const sendMessage = async () => {
-        if (!inputText.trim() || !auth.currentUser || !id) return;
+        if (!inputText.trim() || !auth.currentUser || !id || sendingMessage) return;
 
         const text = inputText.trim();
+        const pendingMessage = pendingMessageRef.current?.text === text
+            ? pendingMessageRef.current
+            : {
+                text,
+                messageId: doc(collection(db, 'conversations', id, 'messages')).id,
+            };
+        pendingMessageRef.current = pendingMessage;
+        setSendingMessage(true);
 
         try {
-            await httpsCallable<{ conversationId: string; text: string }, { ok: boolean }>(functions, 'sendChatMessage')({
-                conversationId: id as string,
+            await httpsCallable<{ conversationId: string; text: string; messageId: string }, { ok: boolean; alreadySent: boolean; messageId: string }>(functions, 'sendChatMessage')({
+                conversationId: id,
                 text,
+                messageId: pendingMessage.messageId,
             });
+            pendingMessageRef.current = null;
             setInputText('');
         } catch (error) {
             console.error("Error sending message: ", error);
@@ -107,6 +144,8 @@ export default function ChatScreen() {
                         ? 'Você bloqueou esta pessoa. Desbloqueie-a no seu perfil para enviar mensagens.'
                         : 'Não foi possível enviar sua mensagem. Tente novamente.'
             );
+        } finally {
+            setSendingMessage(false);
         }
     };
 
@@ -128,7 +167,7 @@ export default function ChatScreen() {
     };
 
     const handleViewProfile = () => {
-        const otherUid = conversationData?.participants?.find((participant: string) => participant !== auth.currentUser?.uid);
+        const otherUid = conversationData?.participants.find((participant) => participant !== auth.currentUser?.uid);
         if (!otherUid) return;
         setShowOptionsModal(false);
         router.push(`/public-profile/${otherUid}` as never);
@@ -136,7 +175,8 @@ export default function ChatScreen() {
 
     const handleBlockUser = () => {
         if (!conversationData || !auth.currentUser) return;
-        const otherUid = conversationData.participants.find((p: string) => p !== auth.currentUser?.uid);
+        const otherUid = conversationData.participants.find((participant) => participant !== auth.currentUser?.uid);
+        if (!otherUid) return;
         const otherName = conversationData.participantNames?.[otherUid] || 'Usuário';
 
         Alert.alert('Bloquear Usuário', `Tem certeza que deseja bloquear ${otherName}?`, [
@@ -163,19 +203,19 @@ export default function ChatScreen() {
 
     const submitUserReport = async (reason: string) => {
         const reporterId = auth.currentUser?.uid;
-        const otherUid = conversationData?.participants?.find((participant: string) => participant !== reporterId);
+        const otherUid = conversationData?.participants.find((participant) => participant !== reporterId);
         if (!reporterId || !otherUid) return;
         setShowReportReasonModal(false);
         try {
-            await addDoc(collection(db, 'reports'), {
+            const result = await submitReport({
                 type: 'user',
                 targetId: otherUid,
-                reportedBy: reporterId,
                 reason,
-                conversationId: id,
-                createdAt: serverTimestamp()
+                conversationId: typeof id === 'string' ? id : undefined,
             });
-            Alert.alert('Denúncia recebida', 'Nossa equipe de moderação analisará este usuário em breve.');
+            Alert.alert(result.alreadyReported ? 'Denúncia já registrada' : 'Denúncia recebida', result.alreadyReported
+                ? 'Você já denunciou este usuário.'
+                : 'Nossa equipe de moderação analisará este usuário em breve.');
         } catch (error) {
             console.error('[Conversation] Erro ao enviar denúncia:', error);
             Alert.alert('Erro', 'Não foi possível enviar a denúncia. Tente novamente.');
@@ -194,7 +234,7 @@ export default function ChatScreen() {
         // Determinar status de leitura para a última mensagem enviada por mim
         let isRead = false;
         if (isMe && isLastMessage && conversationData) {
-            const otherUid = conversationData.participants?.find((p: string) => p !== auth.currentUser?.uid);
+            const otherUid = conversationData.participants.find((participant) => participant !== auth.currentUser?.uid);
             if (otherUid && conversationData.unreadCounts?.[otherUid] === 0) {
                 isRead = true; // Se o outro tem 0 não-lidas, ele já leu!
             }
@@ -288,10 +328,12 @@ export default function ChatScreen() {
                         />
                         <TouchableOpacity 
                             onPress={sendMessage} 
-                            style={[styles.sendButton, (!inputText.trim() || !otherUserExists) && styles.sendButtonDisabled]} 
-                            disabled={!inputText.trim() || !otherUserExists}
+                            style={[styles.sendButton, (!inputText.trim() || !otherUserExists || sendingMessage) && styles.sendButtonDisabled]}
+                            disabled={!inputText.trim() || !otherUserExists || sendingMessage}
                         >
-                            <Ionicons name="send" size={20} color="#fff" />
+                            {sendingMessage
+                                ? <ActivityIndicator size="small" color="#fff" />
+                                : <Ionicons name="send" size={20} color="#fff" />}
                         </TouchableOpacity>
                     </View>
                 </View>

@@ -8,6 +8,13 @@ export type NotificationTarget = {
   meetingId?: string;
 };
 
+export type EventReminder = {
+  id: string;
+  title: string;
+  date?: string;
+  time?: string;
+};
+
 export function getNotificationTarget(data: unknown): NotificationTarget | null {
   if (!data || typeof data !== 'object') return null;
   const payload = data as { eventId?: unknown; meetingId?: unknown; conversationId?: unknown };
@@ -29,10 +36,33 @@ export function getNotificationRoute(data: unknown): string | null {
 }
 
 export async function setupNotifications(): Promise<PushRegistration> {
-  console.log('Notifications mocked for web.');
   return { granted: false, token: null };
 }
 
-export async function sendLocalNotification(title: string, body: string, seconds = 0) {
-  console.log('Local notification requested on web:', title, body);
+export async function getExpoPushToken(): Promise<string | null> {
+  return null;
+}
+
+export async function sendLocalNotification(_title: string, _body: string, _seconds = 0): Promise<void> {
+  return;
+}
+
+export async function scheduleEventReminders(_events: EventReminder[], _userId: string): Promise<void> {
+  return;
+}
+
+export async function syncEventReminders(_events: EventReminder[], _userId: string): Promise<void> {
+  return;
+}
+
+export async function scheduleEventReminder(_event: EventReminder, _userId: string): Promise<void> {
+  return;
+}
+
+export async function cancelEventReminder(_eventId: string, _userId: string): Promise<void> {
+  return;
+}
+
+export async function activateNotificationUser(_userId: string | null): Promise<void> {
+  return;
 }

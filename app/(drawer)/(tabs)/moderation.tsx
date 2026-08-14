@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, StyleSheet, FlatList, TouchableOpacity, ActivityIndicator, Alert, TextInput } from 'react-native';
+import { View, Text, StyleSheet, FlatList, TouchableOpacity, ActivityIndicator, Alert } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons, MaterialIcons } from '@expo/vector-icons';
 import { router } from 'expo-router';
@@ -33,8 +33,7 @@ export default function ModerationScreen() {
     const [loading, setLoading] = useState(true);
     const [activeTab, setActiveTab] = useState<'users' | 'events'>('users');
     const [isStaff, setIsStaff] = useState(false);
-    const [orphanedUserId, setOrphanedUserId] = useState('');
-    const [cleaningOrphanedUser, setCleaningOrphanedUser] = useState(false);
+    const [checkingAccess, setCheckingAccess] = useState(true);
 
     useEffect(() => {
         let unsubscribeProfile: (() => void) | undefined;
@@ -45,14 +44,20 @@ export default function ModerationScreen() {
             }
             if (!currentUser) {
                 setIsStaff(false);
+                setCheckingAccess(false);
+                setLoading(false);
                 return;
             }
             unsubscribeProfile = onSnapshot(doc(db, 'users', currentUser.uid), (profile) => {
                 const role = profile.data()?.role;
                 setIsStaff(role === 'admin' || role === 'moderator');
+                setCheckingAccess(false);
+                if (role !== 'admin' && role !== 'moderator') setLoading(false);
             }, () => {
                 console.warn('[Moderation] staff_check_failed');
                 setIsStaff(false);
+                setCheckingAccess(false);
+                setLoading(false);
             });
         });
         return () => {
@@ -220,6 +225,7 @@ export default function ModerationScreen() {
                         try {
                             const banUser = httpsCallable<{ targetUserId: string }, { ok: boolean }>(functions, 'banUser');
                             await banUser({ targetUserId: group.targetId });
+                            setAggregatedUsers((current) => current.filter((item) => item.targetId !== group.targetId));
                             Alert.alert('Usuário banido', 'A conta foi desativada e os dados de participação foram removidos.');
                         } catch (error) {
                             console.error('[Moderation] ban_user_failed', error);
@@ -228,39 +234,6 @@ export default function ModerationScreen() {
                     },
                 },
             ],
-        );
-    };
-
-    const handleCleanDeletedAuthUser = () => {
-        const targetUserId = orphanedUserId.trim();
-        if (!targetUserId) {
-            Alert.alert('Informe o UID', 'Cole o UID da conta que ja foi apagada no Firebase Authentication.');
-            return;
-        }
-        Alert.alert(
-            'Limpar dados orfaos',
-            'Isso apagara os dados do Firestore, convites, favoritos, mensagens e avatar vinculados a esse UID somente se a conta nao existir mais no Authentication.',
-            [
-                { text: 'Cancelar', style: 'cancel' },
-                {
-                    text: 'Limpar dados',
-                    style: 'destructive',
-                    onPress: async () => {
-                        setCleaningOrphanedUser(true);
-                        try {
-                            const cleanup = httpsCallable<{ targetUserId: string }, { ok: boolean }>(functions, 'cleanupDeletedAuthUser');
-                            await cleanup({ targetUserId });
-                            setOrphanedUserId('');
-                            Alert.alert('Concluido', 'Os dados orfaos desse usuario foram removidos.');
-                        } catch (error) {
-                            console.error('[Moderation] orphaned_user_cleanup_failed', error);
-                            Alert.alert('Nao foi possivel limpar', 'Confira se o UID esta correto e se a conta ja foi removida do Authentication.');
-                        } finally {
-                            setCleaningOrphanedUser(false);
-                        }
-                    },
-                },
-            ]
         );
     };
 
@@ -336,9 +309,11 @@ export default function ModerationScreen() {
                     <Ionicons name="arrow-back" size={24} color="#1f2937" />
                 </TouchableOpacity>
                 <Text style={styles.headerTitle}>Central de Moderação</Text>
-                <TouchableOpacity onPress={fetchReports}>
-                    <Ionicons name="refresh" size={24} color="#4f46e5" />
-                </TouchableOpacity>
+                {isStaff ? (
+                    <TouchableOpacity onPress={fetchReports} disabled={loading}>
+                        <Ionicons name="refresh" size={24} color={loading ? '#A5B4FC' : '#4f46e5'} />
+                    </TouchableOpacity>
+                ) : <View style={styles.headerActionPlaceholder} />}
             </View>
 
             <View style={styles.tabsContainer}>
@@ -358,35 +333,15 @@ export default function ModerationScreen() {
                 </TouchableOpacity>
             </View>
 
-            {isStaff && (
-                <View style={styles.cleanupCard}>
-                    <View style={styles.cleanupTitleRow}>
-                        <Ionicons name="trash-bin-outline" size={18} color="#B91C1C" />
-                        <Text style={styles.cleanupTitle}>Limpar conta removida</Text>
-                    </View>
-                    <Text style={styles.cleanupDescription}>Use apenas depois de apagar a conta no Firebase Authentication.</Text>
-                    <TextInput
-                        value={orphanedUserId}
-                        onChangeText={setOrphanedUserId}
-                        placeholder="UID do usuario removido"
-                        placeholderTextColor="#9CA3AF"
-                        autoCapitalize="none"
-                        autoCorrect={false}
-                        style={styles.cleanupInput}
-                    />
-                    <TouchableOpacity
-                        style={[styles.cleanupButton, cleaningOrphanedUser && styles.cleanupButtonDisabled]}
-                        disabled={cleaningOrphanedUser}
-                        onPress={handleCleanDeletedAuthUser}
-                    >
-                        {cleaningOrphanedUser ? <ActivityIndicator color="#fff" /> : <Text style={styles.cleanupButtonText}>Verificar e limpar</Text>}
-                    </TouchableOpacity>
-                </View>
-            )}
-
-            {loading ? (
+            {checkingAccess || loading ? (
                 <View style={styles.center}>
                     <ActivityIndicator size="large" color="#4f46e5" />
+                </View>
+            ) : !isStaff ? (
+                <View style={styles.center}>
+                    <MaterialIcons name="lock-outline" size={64} color="#d1d5db" />
+                    <Text style={styles.emptyText}>Acesso restrito</Text>
+                    <Text style={styles.emptySubtext}>Esta área está disponível somente para a equipe de moderação.</Text>
                 </View>
             ) : currentData.length === 0 ? (
                 <View style={styles.center}>
@@ -421,6 +376,9 @@ const styles = StyleSheet.create({
     backButton: {
         padding: 4,
     },
+    headerActionPlaceholder: {
+        width: 32,
+    },
     headerTitle: {
         fontSize: 20,
         fontWeight: 'bold',
@@ -433,57 +391,6 @@ const styles = StyleSheet.create({
         paddingBottom: 16,
         borderBottomWidth: 1,
         borderBottomColor: '#e5e7eb',
-    },
-    cleanupCard: {
-        margin: 16,
-        marginBottom: 0,
-        backgroundColor: '#FFF7ED',
-        borderColor: '#FED7AA',
-        borderWidth: 1,
-        borderRadius: 14,
-        padding: 14,
-    },
-    cleanupTitleRow: {
-        flexDirection: 'row',
-        alignItems: 'center',
-        gap: 8,
-    },
-    cleanupTitle: {
-        fontSize: 14,
-        fontWeight: '800',
-        color: '#9A3412',
-    },
-    cleanupDescription: {
-        color: '#7C2D12',
-        fontSize: 12,
-        lineHeight: 17,
-        marginTop: 6,
-    },
-    cleanupInput: {
-        backgroundColor: '#fff',
-        borderColor: '#FDBA74',
-        borderWidth: 1,
-        borderRadius: 9,
-        color: '#1F2937',
-        fontSize: 13,
-        marginTop: 12,
-        paddingHorizontal: 11,
-        paddingVertical: 9,
-    },
-    cleanupButton: {
-        alignItems: 'center',
-        backgroundColor: '#C2410C',
-        borderRadius: 9,
-        marginTop: 10,
-        paddingVertical: 10,
-    },
-    cleanupButtonDisabled: {
-        opacity: 0.6,
-    },
-    cleanupButtonText: {
-        color: '#fff',
-        fontSize: 13,
-        fontWeight: '800',
     },
     tab: {
         flex: 1,

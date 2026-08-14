@@ -7,11 +7,12 @@ import React, { useEffect, useRef, useState } from 'react';
 import { View, Text } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import * as Notifications from 'expo-notifications';
+import type { User as FirebaseUser } from 'firebase/auth';
 import 'react-native-reanimated';
 import { auth, db } from '../src/services/firebaseConfig'; // Import auth
 import { doc, onSnapshot, setDoc } from 'firebase/firestore';
 import { useColorScheme } from '@/src/components/useColorScheme';
-import { getNotificationRoute, setupNotifications } from '../src/utils/Notifications';
+import { activateNotificationUser, getExpoPushToken, getNotificationRoute, setupNotifications } from '../src/utils/Notifications';
 import { getNotificationTarget } from '../src/utils/Notifications';
 import { markRelatedNotificationsAsRead } from '../src/services/notificationReadService';
 import { ErrorBoundary as CustomErrorBoundary } from '../src/components/ErrorBoundary';
@@ -36,7 +37,7 @@ export default function RootLayout() {
   });
 
   const [authInitialized, setAuthInitialized] = useState(false);
-  const [user, setUser] = useState<any>(null);
+  const [user, setUser] = useState<FirebaseUser | null>(null);
   const lastProfileRoute = useRef<string | null>(null);
 
   // Expo Router uses Error Boundaries to catch errors in the navigation tree.
@@ -108,31 +109,38 @@ export default function RootLayout() {
 
   // Inicializa notificações e salva o push token
   useEffect(() => {
+    if (!authInitialized) return;
     const savePushToken = async (token: string) => {
       if (!user) return;
       try {
         await setDoc(doc(db, 'users', user.uid), { expoPushToken: token }, { merge: true });
-        console.log('[ReunionHub Debug] Push Token salvo no Firestore para o usuário:', user.uid);
+        if (__DEV__) console.info('[Notifications] expo_token_saved');
       } catch (error) {
         console.error('[ReunionHub Debug] Erro ao salvar push token', error);
       }
     };
+
+    activateNotificationUser(user?.uid ?? null).catch(() => {
+      console.warn('[Notifications] reminder_owner_sync_failed');
+    });
 
     setupNotifications().then(async (result) => {
       console.log('[ReunionHub Debug] Permissões de notificação:', result.granted ? 'Concedidas' : 'Negadas');
       if (result.granted && result.token && user) {
         await savePushToken(result.token);
       }
-    });
+    }).catch(() => console.error('[Notifications] setup_failed'));
 
-    const tokenSubscription = Notifications.addPushTokenListener(({ data: token }) => {
-      savePushToken(token).catch((error) => {
-        console.error('[ReunionHub Debug] Erro ao atualizar push token', error);
+    const tokenSubscription = Notifications.addPushTokenListener((deviceToken) => {
+      getExpoPushToken(deviceToken).then((expoToken) => {
+        if (expoToken) return savePushToken(expoToken);
+      }).catch(() => {
+        console.error('[Notifications] expo_token_refresh_failed');
       });
     });
 
     return () => tokenSubscription.remove();
-  }, [user]);
+  }, [authInitialized, user]);
 
   useEffect(() => {
     if (!loaded || !authInitialized) return;

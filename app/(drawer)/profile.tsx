@@ -178,12 +178,15 @@ export default function ProfileScreen() {
 
             const normalizedInterests = normalizeInterests(editInterests);
 
+            await httpsCallable<{ enabled: boolean }, { ok: boolean }>(functions, 'setFrequentedPlacesPrivacy')({
+                enabled: shareFrequentedPlaces,
+            });
+
             const docRef = doc(db, 'users', auth.currentUser.uid);
             await setDoc(docRef, {
                 nick: editNick.trim(),
                 bio: editBio,
                 interests: normalizedInterests,
-                shareFrequentedPlaces,
                 showPopularOutsideInterests,
                 searchName: searchName,
                 displayName: editNick.trim(),

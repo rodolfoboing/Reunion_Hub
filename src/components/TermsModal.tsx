@@ -22,7 +22,7 @@ export function TermsModal({ visible, onClose }: TermsModalProps) {
             <TouchableOpacity onPress={onClose} accessibilityLabel="Fechar termos"><Ionicons name="close" size={26} color="#6B7280" /></TouchableOpacity>
           </View>
           <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.content}>
-            <Text style={styles.updated}>Última atualização: julho de 2026</Text>
+            <Text style={styles.updated}>Última atualização: agosto de 2026</Text>
             <Section title="1. Finalidade do Reunion Hub">
               O Reunion Hub ajuda pessoas adultas a descobrir eventos, locais comunitários e interesses em comum. O aplicativo facilita conexões; não garante a identidade, conduta, segurança, qualidade ou comparecimento de qualquer usuário, evento ou estabelecimento.
             </Section>
@@ -42,7 +42,7 @@ export function TermsModal({ visible, onClose }: TermsModalProps) {
               Ao marcar que frequenta um local, você compartilha essa informação com o app para formar comunidades e sugestões. A exibição no perfil público é opcional e fica desativada por padrão; você pode ativá-la ou ocultá-la em Perfil › Privacidade. Não publique endereço residencial, rotina detalhada ou dados de terceiros.
             </Section>
             <Section title="7. Reputação e presença">
-              Check-ins, cancelamentos e faltas podem afetar indicadores de reputação. Tentativas de manipular presença, reputação, eventos ou locais podem resultar em reversão, bloqueio de recursos ou suspensão de conta.
+              Check-ins, cancelamentos e faltas podem afetar a reputação. Quando existe ao menos um check-in confirmado, inscritos ausentes podem perder 20 pontos. Se ninguém fizer check-in, cada inscrito perde somente 1 ponto, pois o encontro não foi comprovado. Tentativas de manipular presença, reputação, eventos ou locais podem resultar em reversão, bloqueio de recursos ou suspensão de conta.
             </Section>
             <Section title="8. Dados e exclusão de conta">
               Tratamos dados de conta, perfil, interesses, eventos, mensagens, localização quando autorizada e preferências necessárias ao funcionamento. Você pode solicitar exclusão no app; a exclusão remove sua conta e dados pessoais diretos, preservando apenas registros que precisem ser anonimizados para proteger outros participantes ou cumprir obrigações legais.

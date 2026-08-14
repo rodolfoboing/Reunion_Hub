@@ -1,27 +1,38 @@
-import React, { useState } from 'react';
+import React, { Dispatch, SetStateAction, useState } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, Modal, TextInput, ScrollView, KeyboardAvoidingView, Platform, ActivityIndicator, Alert } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import DateTimePicker from '@react-native-community/datetimepicker';
-import { collection, addDoc, doc, setDoc, updateDoc, arrayUnion, writeBatch, getDoc } from 'firebase/firestore';
+import { collection, doc, writeBatch, getDoc, serverTimestamp } from 'firebase/firestore';
 import { db, auth } from '@/src/services/firebaseConfig';
 import { INTERESTS_OPTIONS, normalizeInterests } from '@/src/constants/Interests';
 import { CONFIG } from '@/src/constants/Config';
 import { isEndTimeAfterStart } from '@/src/utils/eventSchedule';
+import { scheduleEventReminders } from '@/src/utils/Notifications';
+import type { EventReminder } from '@/src/utils/Notifications';
+import type { CreateMeetingDraft } from '@/src/types';
+import { getCurrentTimeStr, getTodayStr } from '@/src/utils/dateUtils';
+
+const TITLE_MAX_LENGTH = 100;
+const LOCATION_MAX_LENGTH = 150;
+const DESCRIPTION_MAX_LENGTH = 2000;
+const LINK_MAX_LENGTH = 500;
+
+function isValidHttpsUrl(value: string): boolean {
+    return /^https:\/\/[^\s.]+(?:\.[^\s.]+)+(?:[/?#][^\s]*)?$/i.test(value);
+}
 
 interface CreateEventModalProps {
     visible: boolean;
     onClose: () => void;
     eventType: 'in-person' | 'online';
-    newMeeting: any;
-    setNewMeeting: (meeting: any) => void;
+    newMeeting: CreateMeetingDraft;
+    setNewMeeting: Dispatch<SetStateAction<CreateMeetingDraft>>;
     onOpenLocationPicker: () => void;
     repeatCount: number;
     setRepeatCount: (count: number) => void;
     repeatStartDate: string;
     setRepeatStartDate: (date: string) => void;
-    selectedPlace?: any;
-    places?: any[];
     onCreated?: (eventId: string) => void;
 }
 
@@ -36,8 +47,6 @@ export function CreateEventModal({
     setRepeatCount,
     repeatStartDate,
     setRepeatStartDate,
-    selectedPlace,
-    places,
     onCreated,
 }: CreateEventModalProps) {
     const [submitting, setSubmitting] = useState(false);
@@ -48,7 +57,11 @@ export function CreateEventModal({
     const [inviteAfterCreate, setInviteAfterCreate] = useState(false);
 
     const toggleInterest = (interest: string) => {
-        setNewMeeting((prev: any) => {
+        if (!newMeeting.interests.includes(interest) && newMeeting.interests.length >= 10) {
+            Alert.alert('Limite de interesses', 'Escolha no máximo 10 interesses por evento.');
+            return;
+        }
+        setNewMeeting((prev) => {
             const interests = prev.interests.includes(interest)
                 ? prev.interests.filter((i: string) => i !== interest)
                 : [...prev.interests, interest];
@@ -83,24 +96,41 @@ export function CreateEventModal({
             return;
         }
 
-        const isFieldsMissing = !newMeeting.title.trim() || newMeeting.interests.length === 0 || !newMeeting.locationName.trim() || !newMeeting.description.trim() || !newMeeting.date || !newMeeting.time || !newMeeting.endTime;
+        const title = newMeeting.title.trim();
+        const description = newMeeting.description.trim();
+        const locationName = newMeeting.locationName.trim();
+        const meetingLink = newMeeting.meetingLink.trim();
+        const isFieldsMissing = !title || newMeeting.interests.length === 0 || !locationName || !description || !newMeeting.date || !newMeeting.time || !newMeeting.endTime;
         if (isFieldsMissing) {
             Alert.alert('Atenção', 'Por favor, preencha todos os campos obrigatórios.');
+            return;
+        }
+        if (title.length < 3) {
+            Alert.alert('Nome muito curto', 'Use pelo menos 3 caracteres no nome do evento.');
             return;
         }
         if (!isEndTimeAfterStart(newMeeting.time, newMeeting.endTime)) {
             Alert.alert('Horário inválido', 'O horário de término deve ser posterior ao horário de início no mesmo dia.');
             return;
         }
+        if (title.length > TITLE_MAX_LENGTH || locationName.length > LOCATION_MAX_LENGTH || description.length > DESCRIPTION_MAX_LENGTH) {
+            Alert.alert('Texto muito longo', `Use até ${TITLE_MAX_LENGTH} caracteres no nome, ${LOCATION_MAX_LENGTH} no local e ${DESCRIPTION_MAX_LENGTH} na descrição.`);
+            return;
+        }
+        const today = getTodayStr();
+        if (newMeeting.date < today || (newMeeting.date === today && newMeeting.time <= getCurrentTimeStr())) {
+            Alert.alert('Data inválida', 'Escolha uma data e horário futuros para o evento.');
+            return;
+        }
         if (repeatCount > 0 && (!repeatStartDate || repeatStartDate <= newMeeting.date)) {
             Alert.alert('Data de repetição inválida', 'Escolha uma data posterior à primeira edição para a próxima repetição.');
             return;
         }
-        if (eventType === 'online' && !newMeeting.meetingLink.trim()) {
-            Alert.alert('Atenção', 'Para eventos online, o Link da Reunião é obrigatório.');
+        if (eventType === 'online' && (!isValidHttpsUrl(meetingLink) || meetingLink.length > LINK_MAX_LENGTH)) {
+            Alert.alert('Link inválido', 'Informe um link HTTPS válido para a reunião online.');
             return;
         }
-        if (eventType === 'in-person' && (newMeeting.lat === 0 || newMeeting.lat == null)) {
+        if (eventType === 'in-person' && (!Number.isFinite(newMeeting.lat) || !Number.isFinite(newMeeting.lng) || newMeeting.lat < -90 || newMeeting.lat > 90 || newMeeting.lng < -180 || newMeeting.lng > 180 || (newMeeting.lat === 0 && newMeeting.lng === 0))) {
             Alert.alert('Atenção', 'Para eventos presenciais, é obrigatório selecionar uma localização no mapa.');
             return;
         }
@@ -133,6 +163,7 @@ export function CreateEventModal({
                             const batch = writeBatch(db);
                             const seriesId = doc(collection(db, 'meetings')).id; // Gerar um ID de série
                             let firstEventId = '';
+                            const createdEventReminders: EventReminder[] = [];
                             
                             for (let i = 0; i <= repeatCount; i++) {
                                 const currentEventDate = i === 0 || !repeatBaseDate
@@ -147,19 +178,23 @@ export function CreateEventModal({
                                 
                                 const newDocRef = doc(collection(db, 'meetings'));
                                 if (i === 0) firstEventId = newDocRef.id;
+                                createdEventReminders.push({ id: newDocRef.id, title: newMeeting.title, date: dateStr, time: newMeeting.time });
                                 batch.set(newDocRef, {
                                     ...newMeeting,
+                                    title,
+                                    description,
+                                    locationName,
                                     interests: normalizedInterests,
                                     date: dateStr,
                                     theme: normalizedInterests[0],
                                     type: eventType,
-                                    meetingLink: eventType === 'online' ? newMeeting.meetingLink : '',
+                                    meetingLink: eventType === 'online' ? meetingLink : '',
                                     lat: eventType === 'in-person' ? newMeeting.lat : null,
                                     lng: eventType === 'in-person' ? newMeeting.lng : null,
                                     placeId: eventType === 'in-person' ? newMeeting.placeId : '',
                                     createdBy: creatorId,
                                     creatorName,
-                                    createdAt: new Date().toISOString(),
+                                    createdAt: serverTimestamp(),
                                     isRepeated: repeatCount > 0,
                                     seriesId: repeatCount > 0 ? seriesId : null,
                                     attendees: [creatorId],
@@ -168,6 +203,9 @@ export function CreateEventModal({
                             }
 
                             await batch.commit();
+                            scheduleEventReminders(createdEventReminders, creatorId).catch(() => {
+                                console.warn('[CreateEvent] local_reminder_schedule_failed');
+                            });
 
 
 
@@ -176,8 +214,9 @@ export function CreateEventModal({
                                 : 'Seu evento foi criado e já está disponível para a comunidade!';
                             setNewMeeting({
                                 title: '', interests: [], description: '', locationName: '', date: '', time: '', endTime: '',
-                                lat: newMeeting.lat, lng: newMeeting.lng, type: 'in-person', meetingLink: '', placeId: '',
+                                lat: 0, lng: 0, type: 'in-person', meetingLink: '', placeId: '',
                             });
+                            setRepeatCount(0);
                             setRepeatStartDate('');
                             setInviteAfterCreate(false);
                             onClose();
@@ -187,8 +226,8 @@ export function CreateEventModal({
                             } else {
                                 Alert.alert('Sucesso', successMessage);
                             }
-                        } catch (error) {
-                            console.error('Error adding document: ', error);
+                        } catch {
+                            console.error('[CreateEvent] creation_failed');
                             Alert.alert('Erro', 'Ocorreu um problema ao criar seu evento.');
                         } finally {
                             setSubmitting(false);
@@ -212,7 +251,7 @@ export function CreateEventModal({
                     <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.formContent}>
                         <View style={styles.inputGroup}>
                             <Text style={styles.inputLabel}>Nome do Evento</Text>
-                            <TextInput style={styles.input} placeholderTextColor="#B6C0CE" placeholder="Ex: Café com Tecnologia" value={newMeeting.title} onChangeText={(text) => setNewMeeting({ ...newMeeting, title: text })} />
+                            <TextInput style={styles.input} maxLength={TITLE_MAX_LENGTH} placeholderTextColor="#B6C0CE" placeholder="Ex: Café com Tecnologia" value={newMeeting.title} onChangeText={(text) => setNewMeeting({ ...newMeeting, title: text })} />
                         </View>
                         <View style={styles.inputGroup}>
                             <Text style={styles.inputLabel}>Interesses Envolvidos</Text>
@@ -241,7 +280,7 @@ export function CreateEventModal({
                             </TouchableOpacity>
                         </View>
                         {showDatePicker && (
-                            <DateTimePicker value={new Date()} mode="date" display={Platform.OS === 'ios' ? 'spinner' : 'default'} onChange={(event, selectedDate) => {
+                            <DateTimePicker value={new Date()} minimumDate={new Date()} mode="date" display={Platform.OS === 'ios' ? 'spinner' : 'default'} onChange={(_event, selectedDate) => {
                                 setShowDatePicker(false);
                                 if (selectedDate) {
                                     const year = selectedDate.getFullYear();
@@ -262,7 +301,7 @@ export function CreateEventModal({
                             }} />
                         )}
                         {showEndTimePicker && (
-                            <DateTimePicker value={new Date()} mode="time" display={Platform.OS === 'ios' ? 'spinner' : 'default'} is24Hour={true} onChange={(event, selectedDate) => {
+                            <DateTimePicker value={new Date()} mode="time" display={Platform.OS === 'ios' ? 'spinner' : 'default'} is24Hour={true} onChange={(_event, selectedDate) => {
                                 setShowEndTimePicker(false);
                                 if (selectedDate) {
                                     const hours = String(selectedDate.getHours()).padStart(2, '0');
@@ -273,12 +312,12 @@ export function CreateEventModal({
                         )}
                         <View style={styles.inputGroup}>
                             <Text style={styles.inputLabel}>{eventType === 'online' ? 'Plataforma (ex: Zoom, Meet)' : 'Nome do Local'}</Text>
-                            <TextInput style={styles.input} placeholderTextColor="#B6C0CE" placeholder={eventType === 'online' ? "Ex: Google Meet" : "Ex: Parque do Ibirapuera, SP"} value={newMeeting.locationName} onChangeText={(text) => setNewMeeting({ ...newMeeting, locationName: text })} />
+                            <TextInput style={styles.input} maxLength={LOCATION_MAX_LENGTH} placeholderTextColor="#B6C0CE" placeholder={eventType === 'online' ? "Ex: Google Meet" : "Ex: Parque do Ibirapuera, SP"} value={newMeeting.locationName} onChangeText={(text) => setNewMeeting({ ...newMeeting, locationName: text })} />
                         </View>
                         {eventType === 'online' && (
                             <View style={styles.inputGroup}>
                                 <Text style={styles.inputLabel}>Link da Reunião</Text>
-                                <TextInput style={styles.input} placeholderTextColor="#B6C0CE" placeholder="Cole aqui o link (https://...)" value={newMeeting.meetingLink} onChangeText={(text) => setNewMeeting({ ...newMeeting, meetingLink: text })} autoCapitalize="none" keyboardType="url" />
+                                <TextInput style={styles.input} maxLength={LINK_MAX_LENGTH} placeholderTextColor="#B6C0CE" placeholder="Cole aqui o link (https://...)" value={newMeeting.meetingLink} onChangeText={(text) => setNewMeeting({ ...newMeeting, meetingLink: text })} autoCapitalize="none" keyboardType="url" />
                             </View>
                         )}
                         {eventType === 'in-person' && (
@@ -293,7 +332,7 @@ export function CreateEventModal({
 
                         <View style={styles.inputGroup}>
                             <Text style={styles.inputLabel}>Descrição Detalhada</Text>
-                            <TextInput style={[styles.input, styles.textArea]} placeholderTextColor="#B6C0CE" placeholder="Conte mais sobre o que vai acontecer no evento..." multiline numberOfLines={4} textAlignVertical="top" value={newMeeting.description} onChangeText={(text) => setNewMeeting({ ...newMeeting, description: text })} />
+                            <TextInput style={[styles.input, styles.textArea]} maxLength={DESCRIPTION_MAX_LENGTH} placeholderTextColor="#B6C0CE" placeholder="Conte mais sobre o que vai acontecer no evento..." multiline numberOfLines={4} textAlignVertical="top" value={newMeeting.description} onChangeText={(text) => setNewMeeting({ ...newMeeting, description: text })} />
                         </View>
                         <View style={styles.inputGroup}>
                             <Text style={styles.inputLabel}>Repetição Semanal (Opcional)</Text>
@@ -319,7 +358,7 @@ export function CreateEventModal({
                             </View>
                         )}
                         {showRepeatStartDatePicker && (
-                            <DateTimePicker value={new Date()} mode="date" display={Platform.OS === 'ios' ? 'spinner' : 'default'} onChange={(_event, selectedDate) => {
+                            <DateTimePicker value={new Date()} minimumDate={new Date()} mode="date" display={Platform.OS === 'ios' ? 'spinner' : 'default'} onChange={(_event, selectedDate) => {
                                 setShowRepeatStartDatePicker(false);
                                 if (!selectedDate) return;
                                 const year = selectedDate.getFullYear();

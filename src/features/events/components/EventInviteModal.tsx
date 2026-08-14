@@ -75,7 +75,13 @@ export function EventInviteModal({ visible, eventId, onClose }: EventInviteModal
             <View style={styles.candidateInfo}>
                 <Text style={styles.candidateName} numberOfLines={1}>{item.displayName}</Text>
                 {item.nick && <Text style={styles.candidateNick} numberOfLines={1}>@{item.nick}</Text>}
-                <Text style={styles.sharedEvents}>{item.sharedEventsCount} evento(s) em comum</Text>
+                <Text style={styles.sharedEvents}>
+                    {item.sharedEventsCount > 0
+                        ? `${item.sharedEventsCount} evento(s) em comum`
+                        : item.previousParticipant
+                            ? 'Participou de uma edição anterior'
+                            : 'Contato sugerido'}
+                </Text>
             </View>
             <TouchableOpacity disabled={sending} style={[styles.inviteButton, sending && styles.inviteButtonDisabled]} onPress={() => sendInvite(item)}>
                 <Text style={styles.inviteButtonText}>Convidar</Text>

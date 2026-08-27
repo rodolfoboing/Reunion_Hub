@@ -1,4 +1,4 @@
-const googleServicesFile = process.env.GOOGLE_SERVICES_JSON || './android/app/google-services.json';
+const googleServicesFile = process.env.GOOGLE_SERVICES_JSON || './google-services.json';
 const googleMapsApiKey = process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY;
 
 /** @type {import('expo/config').ExpoConfig} */
@@ -6,7 +6,7 @@ module.exports = {
   expo: {
     name: 'Reunion Hub',
     slug: 'reunion-hub',
-    version: '1.0.0',
+    version: '1.0.2',
     orientation: 'portrait',
     icon: './assets/images/icon.png',
     scheme: 'reunionhub',
@@ -17,6 +17,8 @@ module.exports = {
       backgroundColor: '#ffffff',
     },
     plugins: [
+      './plugins/withAndroidReleaseSigning',
+      './plugins/withAndroidReleaseOptimization',
       'expo-router',
       'expo-location',
       'expo-image-picker',
@@ -24,8 +26,10 @@ module.exports = {
       [
         'expo-notifications',
         {
-          icon: './assets/images/icon.png',
-          color: '#ffffff',
+          // Ícone monocromático com transparência, exigido pela bandeja do Android.
+          icon: './assets/images/favicon.png',
+          color: '#4F46E5',
+          defaultChannel: 'events',
         },
       ],
       [
@@ -42,6 +46,7 @@ module.exports = {
     ],
     android: {
       package: 'com.rodolfoboing.reunionhub',
+      versionCode: 3,
       adaptiveIcon: {
         foregroundImage: './assets/images/adaptive-icon.png',
         backgroundColor: '#ffffff',
@@ -50,12 +55,13 @@ module.exports = {
         'ACCESS_COARSE_LOCATION',
         'ACCESS_FINE_LOCATION',
         'POST_NOTIFICATIONS',
+        'SCHEDULE_EXACT_ALARM',
       ],
       config: googleMapsApiKey
         ? { googleMaps: { apiKey: googleMapsApiKey } }
         : undefined,
-      // EAS receives this path through its sensitive file variable. The fallback
-      // keeps local native development working without tracking this file in Git.
+      // Configuração pública do cliente Firebase. Uma variável de arquivo do
+      // EAS ainda pode substituí-la, mas clones locais funcionam sem etapa manual.
       googleServicesFile,
     },
     extra: {

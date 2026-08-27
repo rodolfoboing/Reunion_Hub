@@ -12,16 +12,24 @@ import { Meeting, User } from '../../../src/types';
 import { STRINGS } from '../../../src/constants/strings';
 import { CONFIG } from '../../../src/constants/Config';
 import { normalizeDate, getTodayStr, getDateAfterDays } from '../../../src/utils/dateUtils';
-import { isEventInProgress, isEventToday } from '../../../src/utils/eventSchedule';
+import { formatEventTimeRange, getEventJourneyState, hasEventEnded, isEventInProgress, isEventToday } from '../../../src/utils/eventSchedule';
 import { useEventClock } from '../../../src/hooks/useEventClock';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { ManualModal } from '../../../src/components/ManualModal';
-import { hasMatchingInterest, normalizeInterests } from '../../../src/constants/Interests';
+import { normalizeInterests } from '../../../src/constants/Interests';
+import { DISCOVERY_REASON_LABELS, DiscoveryReason, getEventDiscovery, isMeetingNearby } from '../../../src/utils/eventDiscovery';
 
 import { getDistanceFromLatLonInKm } from '../../../src/utils/distance';
 
 // Helper function para formatar a data do evento
 const MONTH_NAMES = ['JAN', 'FEV', 'MAR', 'ABR', 'MAI', 'JUN', 'JUL', 'AGO', 'SET', 'OUT', 'NOV', 'DEZ'];
+const DISCOVERY_REASON_COLORS: Record<DiscoveryReason, { background: string; text: string }> = {
+  in_progress: { background: '#D1FAE5', text: '#047857' },
+  interest: { background: '#EDE9FE', text: '#6D28D9' },
+  history: { background: '#E0F2FE', text: '#0369A1' },
+  popular: { background: '#FEF3C7', text: '#B45309' },
+  nearby: { background: '#FCE7F3', text: '#BE185D' },
+};
 
 const formatEventDate = (dateString: string | undefined) => {
   const normalized = normalizeDate(dateString);
@@ -45,11 +53,17 @@ const formatEventDate = (dateString: string | undefined) => {
   return { day: '--', month: '---' };
 };
 
+const belongsToUserAgenda = (meeting: Meeting, userId: string | undefined, agendaEventIds: Set<string>) => {
+  if (!userId) return false;
+  return agendaEventIds.has(meeting.id)
+    || meeting.createdBy === userId
+    || meeting.attendees?.includes(userId) === true;
+};
+
 export default function HomeScreen() {
   const eventClock = useEventClock();
   const [userProfile, setUserProfile] = useState<User | null>(null);
   const [highlights, setHighlights] = useState<Meeting[]>([]);
-  const [popularHighlights, setPopularHighlights] = useState<Meeting[]>([]);
   const [allUpcomingEvents, setAllUpcomingEvents] = useState<Meeting[]>([]);
   const [myEvents, setMyEvents] = useState<Meeting[]>([]);
   const [location, setLocation] = useState<Location.LocationObject | null>(null);
@@ -101,11 +115,14 @@ export default function HomeScreen() {
 
   useEffect(() => {
     if (location && allUpcomingEvents.length > 0) {
+      const highlightedIds = new Set(highlights.map(({ id }) => id));
+      const currentUid = auth.currentUser?.uid;
       const withDistance = allUpcomingEvents
         .filter((meeting) => {
           const isOnlineEvent = meeting.type === 'online';
           const hasValidCoordinates = Number.isFinite(meeting.lat) && Number.isFinite(meeting.lng);
-          return !isOnlineEvent && hasValidCoordinates;
+          const isConfirmed = Boolean(currentUid && meeting.attendees?.includes(currentUid));
+          return !isOnlineEvent && hasValidCoordinates && !isConfirmed && !highlightedIds.has(meeting.id);
         })
         .map(m => {
           const dist = getDistanceFromLatLonInKm(location.coords.latitude, location.coords.longitude, m.lat!, m.lng!);
@@ -117,7 +134,7 @@ export default function HomeScreen() {
       return;
     }
     setNearbyEvents([]);
-  }, [location, allUpcomingEvents]);
+  }, [location, allUpcomingEvents, highlights]);
 
   const handleRefreshNearby = async () => {
     setRefreshingNearby(true);
@@ -204,6 +221,7 @@ export default function HomeScreen() {
       });
 
       const todayStr = getTodayStr();
+      const discoveryStartDate = getDateAfterDays(-1);
       const maxDiscoveryDate = getDateAfterDays(CONFIG.AGENDA_DISCOVERY_DAYS);
 
       const qMyEvents = query(
@@ -216,19 +234,20 @@ export default function HomeScreen() {
         const myEventsData = snap.docs.map(d => ({ id: d.id, ...d.data() } as Meeting));
         const futureMyEvents = myEventsData.filter((m) => {
           if (m.status === 'cancelled' || m.status === 'completed') return false;
+          if (hasEventEnded(m)) return false;
           const normalizedDate = normalizeDate(m.date);
           if (!normalizedDate) return false;
-          return normalizedDate >= todayStr;
+          return normalizedDate >= todayStr || isEventInProgress(m);
         });
         futureMyEvents.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
         if (isMounted.current) setMyEvents(futureMyEvents.slice(0, 5));
       }, (err) => {
-        console.warn('[Index] Erro no listener de eventos do usuÃ¡rio:', err);
+        console.warn('[Index] Erro no listener de eventos do usuário:', err);
       });
 
       const qHighlights = query(
         collection(db, 'meetings'),
-        where('date', '>=', todayStr),
+        where('date', '>=', discoveryStartDate),
         where('date', '<=', maxDiscoveryDate),
         orderBy('date'),
         limit(30)
@@ -237,53 +256,43 @@ export default function HomeScreen() {
       unsubHighlights = onSnapshot(qHighlights, (snap) => {
         const highlightsData = snap.docs.map(d => ({ id: d.id, ...d.data() } as Meeting));
         const userInterests = normalizeInterests(userProfile?.interests);
+        const userCoordinates = location
+          ? { latitude: location.coords.latitude, longitude: location.coords.longitude }
+          : null;
 
         const upcomingHighlights = highlightsData.filter((m) => {
           if (m.status === 'cancelled' || m.status === 'completed') return false;
+          if (hasEventEnded(m)) return false;
           const normalizedDate = normalizeDate(m.date);
           if (!normalizedDate) return false;
-          if (normalizedDate < todayStr || normalizedDate > maxDiscoveryDate) return false;
+          if ((normalizedDate < todayStr && !isEventInProgress(m)) || normalizedDate > maxDiscoveryDate) return false;
 
           const isOwn = m.createdBy === currentUid || (m.attendees && currentUid ? m.attendees.includes(currentUid) : false);
           if (isOwn) return false;
           if (m.type === 'online') return true;
-          if (!location || !Number.isFinite(Number(m.lat)) || !Number.isFinite(Number(m.lng))) return false;
-          return getDistanceFromLatLonInKm(
-            location.coords.latitude,
-            location.coords.longitude,
-            Number(m.lat),
-            Number(m.lng)
-          ) <= CONFIG.NEARBY_RADIUS_KM;
+          return isMeetingNearby(m, userCoordinates);
         });
 
         if (isMounted.current) setAllUpcomingEvents(upcomingHighlights);
 
-        // Esta seção é exclusivamente por interesse. Eventos populares fora das tags
-        // continuam disponíveis em outras recomendações, sem serem rotulados de interesse.
-        const highlightsForProfile = upcomingHighlights.filter((meeting) =>
-          hasMatchingInterest([...(meeting.interests || []), meeting.theme], userInterests)
-        );
+        // Uma única lista de descoberta: primeiro correspondências de interesse e,
+        // se o usuário permitiu, populares fora das tags. O rótulo deixa clara a origem.
+        const highlightsForProfile = upcomingHighlights.filter((meeting) => {
+          const discovery = getEventDiscovery(meeting, { userCoordinates, userInterests });
+          const matchesInterests = discovery.reasons.includes('interest');
+          const isPopular = discovery.reasons.includes('popular');
+          return discovery.isRecommended
+            && (matchesInterests || (isPopular && userProfile?.showPopularOutsideInterests === true));
+        });
 
         const sortedHighlights = [...highlightsForProfile].sort((a, b) => {
-          const matchA = hasMatchingInterest([...(a.interests || []), a.theme], userInterests) ? 1 : 0;
-          const matchB = hasMatchingInterest([...(b.interests || []), b.theme], userInterests) ? 1 : 0;
+          const matchA = getEventDiscovery(a, { userCoordinates, userInterests }).reasons.includes('interest') ? 1 : 0;
+          const matchB = getEventDiscovery(b, { userCoordinates, userInterests }).reasons.includes('interest') ? 1 : 0;
           if (matchA !== matchB) return matchB - matchA;
           return (b.attendees?.length || 0) - (a.attendees?.length || 0);
         });
 
         if (isMounted.current) setHighlights(sortedHighlights.slice(0, 5));
-        const popularEvents = upcomingHighlights
-          .filter((meeting) =>
-            (meeting.attendees?.length || 0) >= 3
-            && (
-              hasMatchingInterest([...(meeting.interests || []), meeting.theme], userInterests)
-              || userProfile?.showPopularOutsideInterests
-            )
-          )
-          .sort((a, b) => (b.attendees?.length || 0) - (a.attendees?.length || 0));
-        if (isMounted.current) {
-          setPopularHighlights(popularEvents.slice(0, 5));
-        }
         if (isMounted.current) {
           setError(false);
           setLoading(false);
@@ -309,18 +318,56 @@ export default function HomeScreen() {
     };
   }, [userProfile?.interests?.join(','), userProfile?.showPopularOutsideInterests, location?.coords.latitude, location?.coords.longitude]);
 
-  const renderEventCard = ({ item, showPopularLabel = false }: { item: Meeting; showPopularLabel?: boolean }) => (
-    <TouchableOpacity style={styles.eventCard} onPress={() => router.push(`/event/${item.id}` as never)}>
-      <View style={styles.eventHeader}>
-        <FontAwesome name="calendar" size={14} color="#6366f1" />
-        <Text style={styles.eventDate}>{item.date || 'Data a definir'}</Text>
-      </View>
-      <View style={styles.eventTitleRow}>
-        <Text style={styles.eventTitle} numberOfLines={1}>{item.title}</Text>
-        {showPopularLabel && <Text style={styles.popularTag}>Popular</Text>}
-      </View>
-      <Text style={styles.eventLoc} numberOfLines={1}>{item.locationName || 'Local a definir'}</Text>
-    </TouchableOpacity>
+  const renderEventCard = ({ item, distance }: { item: Meeting; distance?: number }) => {
+    const discovery = getEventDiscovery(item, {
+      userCoordinates: location
+        ? { latitude: location.coords.latitude, longitude: location.coords.longitude }
+        : null,
+      userInterests: normalizeInterests(userProfile?.interests),
+      now: eventClock,
+    });
+    const eventIsInProgress = discovery.reasons.includes('in_progress');
+    const discoveryReason = eventIsInProgress ? null : discovery.primaryReason;
+    const isNearbyCard = typeof distance === 'number';
+    return (
+      <TouchableOpacity style={[styles.eventCard, eventIsInProgress && styles.eventCardInProgress]} onPress={() => router.push(`/event/${item.id}` as never)}>
+        <View style={styles.eventHeader}>
+          <FontAwesome name={isNearbyCard ? 'map-marker' : 'calendar'} size={14} color={eventIsInProgress ? '#059669' : isNearbyCard ? '#ec4899' : '#6366f1'} />
+          <Text style={[styles.eventDate, isNearbyCard && styles.nearbyEventDate, eventIsInProgress && styles.eventDateInProgress]}>
+            {isNearbyCard ? `A ${distance.toFixed(1)} km daqui` : item.date || 'Data a definir'}
+          </Text>
+        </View>
+        <View style={styles.eventTitleRow}>
+          <Text style={styles.eventTitle} numberOfLines={1}>{item.title}</Text>
+          {eventIsInProgress && <View style={styles.inProgressBadge}><Text style={styles.inProgressBadgeText} numberOfLines={1}>EM ANDAMENTO</Text></View>}
+          {discoveryReason && (
+            <View style={[styles.discoveryTag, { backgroundColor: DISCOVERY_REASON_COLORS[discoveryReason].background }]}>
+              <Text style={[styles.discoveryTagText, { color: DISCOVERY_REASON_COLORS[discoveryReason].text }]}>
+                {DISCOVERY_REASON_LABELS[discoveryReason]}
+              </Text>
+            </View>
+          )}
+        </View>
+        <Text style={styles.eventLoc} numberOfLines={1}>{item.locationName || 'Local a definir'}</Text>
+      </TouchableOpacity>
+    );
+  };
+
+  // Composição final defensiva: mesmo durante a atualização independente dos
+  // listeners, um evento do usuário nunca reaparece nas listas de descoberta.
+  // Interesses têm prioridade sobre proximidade para evitar cards repetidos.
+  const currentUid = auth.currentUser?.uid;
+  const myEventIds = new Set(myEvents.map(({ id }) => id));
+  const visibleMyEvents = myEvents.filter((meeting) => !hasEventEnded(meeting, eventClock));
+  const visibleHighlights = highlights.filter((meeting) =>
+    !hasEventEnded(meeting, eventClock)
+    && !belongsToUserAgenda(meeting, currentUid, myEventIds)
+  );
+  const visibleHighlightIds = new Set(visibleHighlights.map(({ id }) => id));
+  const visibleNearbyEvents = nearbyEvents.filter((meeting) =>
+    !hasEventEnded(meeting, eventClock)
+    && !belongsToUserAgenda(meeting, currentUid, myEventIds)
+    && !visibleHighlightIds.has(meeting.id)
   );
 
   return (
@@ -389,7 +436,7 @@ export default function HomeScreen() {
         <>
           <View style={styles.section}>
             <View style={styles.sectionHeader}>
-              <Text style={styles.sectionTitle}>Eventos para seus interesses</Text>
+              <Text style={styles.sectionTitle}>Eventos do seu interesse</Text>
             </View>
             {userProfile?.interests && userProfile.interests.length > 0 ? (
               <Text style={styles.interestTag}>Selecionados pelas suas tags: {userProfile.interests.join(', ')}</Text>
@@ -400,7 +447,7 @@ export default function HomeScreen() {
             )}
             <FlatList
               horizontal
-              data={highlights}
+              data={visibleHighlights}
               renderItem={renderEventCard}
               keyExtractor={item => item.id}
               showsHorizontalScrollIndicator={false}
@@ -415,56 +462,23 @@ export default function HomeScreen() {
             />
           </View>
 
-          {popularHighlights.length > 0 && (
-            <View style={styles.section}>
-              <View style={styles.sectionHeader}>
-                <Text style={styles.sectionTitle}>Eventos populares</Text>
-              </View>
-              <Text style={styles.interestTag}>Eventos próximos com 3 ou mais participantes, com ou sem correspondência às suas tags.</Text>
-              <FlatList
-                horizontal
-                data={popularHighlights}
-                renderItem={({ item }) => renderEventCard({ item, showPopularLabel: true })}
-                keyExtractor={item => `popular-${item.id}`}
-                showsHorizontalScrollIndicator={false}
-                contentContainerStyle={styles.horizontalList}
-              />
-            </View>
-          )}
-
           <View style={styles.section}>
             <Text style={styles.sectionTitle}>Seus Próximos Eventos</Text>
-            {myEvents.length === 0 ? (
+            {visibleMyEvents.length === 0 ? (
               <View style={styles.emptyStateContainer}>
                 <Text style={styles.emptyText}>Você ainda não confirmou presença em nenhum evento.</Text>
-                {highlights.length > 0 && (
-                  <View style={{ marginTop: 16 }}>
-                    <Text style={{ fontSize: 13, color: '#8B5CF6', fontWeight: 'bold', textTransform: 'uppercase', marginBottom: 12 }}>
-                      Sugestões para você começar:
-                    </Text>
-                    {highlights.slice(0, 2).map(event => {
-                      const { day, month } = formatEventDate(event.date);
-                      return (
-                        <TouchableOpacity key={`sug-${event.id}`} style={styles.listCard} onPress={() => router.push(`/event/${event.id}` as any)}>
-                          <View style={[styles.dateBox, { backgroundColor: '#F3F4F6' }]}>
-                            <Text style={[styles.dateDay, { color: '#6B7280' }]}>{day}</Text>
-                            <Text style={[styles.dateMonth, { color: '#9CA3AF' }]}>{month}</Text>
-                          </View>
-                          <View style={styles.listContent}>
-                            <Text style={styles.listTitle}>{event.title}</Text>
-                            <Text style={styles.listTime}>{event.time || 'Horário a definir'} • {event.locationName || 'Local a definir'}</Text>
-                          </View>
-                        </TouchableOpacity>
-                      );
-                    })}
-                  </View>
-                )}
               </View>
             ) : (
-              myEvents.map(event => {
+              visibleMyEvents.map(event => {
                 const { day, month } = formatEventDate(event.date);
                 const eventIsToday = isEventToday(event, eventClock);
                 const eventIsInProgress = isEventInProgress(event, eventClock);
+                const eventJourney = getEventJourneyState(event, eventClock, {
+                  isAttending: Boolean(currentUid && event.attendees?.includes(currentUid)),
+                  isCreator: event.createdBy === currentUid,
+                  hasCheckedIn: Boolean(currentUid && event.checkedIn?.includes(currentUid)),
+                  hasPendingCheckIn: Boolean(currentUid && event.pendingCheckIns?.some(({ userId }) => userId === currentUid)),
+                });
                 return (
                   <TouchableOpacity key={event.id} style={[styles.listCard, eventIsToday && styles.listCardToday, eventIsInProgress && styles.listCardInProgress]} onPress={() => router.push(`/event/${event.id}` as any)}>
                     <View style={[styles.dateBox, eventIsToday && styles.dateBoxToday, eventIsInProgress && styles.dateBoxInProgress]}>
@@ -474,10 +488,10 @@ export default function HomeScreen() {
                     <View style={styles.listContent}>
                       <View style={styles.listTitleRow}>
                         <Text style={styles.listTitle}>{event.title}</Text>
-                        {eventIsInProgress && <View style={styles.inProgressBadge}><Text style={styles.inProgressBadgeText}>EM ANDAMENTO</Text></View>}
-                        {!eventIsInProgress && eventIsToday && <View style={styles.todayEventBadge}><Text style={styles.todayEventBadgeText}>HOJE</Text></View>}
+                        {eventIsInProgress && <View style={styles.inProgressBadge}><Text style={styles.inProgressBadgeText} numberOfLines={1}>EM ANDAMENTO</Text></View>}
+                        {!eventIsInProgress && <View style={styles.journeyBadge}><Text style={styles.journeyBadgeText} numberOfLines={1}>{eventJourney.compactLabel}</Text></View>}
                       </View>
-                      <Text style={styles.listTime}>{event.time || 'Horário a definir'} • {event.locationName || 'Local a definir'}</Text>
+                      <Text style={styles.listTime}>{formatEventTimeRange(event)} • {event.locationName || 'Local a definir'}</Text>
                     </View>
                   </TouchableOpacity>
                 );
@@ -487,7 +501,7 @@ export default function HomeScreen() {
 
           <View style={styles.section}>
             <View style={styles.sectionHeader}>
-              <Text style={styles.sectionTitle}>Eventos perto de você</Text>
+              <Text style={styles.sectionTitle}>Eventos perto de você (até 10 km)</Text>
               <TouchableOpacity style={styles.refreshNearbyButton} onPress={handleRefreshNearby} disabled={refreshingNearby}>
                 <FontAwesome name="refresh" size={13} color="#4F46E5" />
                 <Text style={styles.refreshNearbyText}>{refreshingNearby ? 'Atualizando...' : 'Atualizar'}</Text>
@@ -495,27 +509,16 @@ export default function HomeScreen() {
             </View>
             {!location ? (
               <Text style={styles.emptyText}>Permita o acesso à localização para ver eventos próximos.</Text>
-            ) : nearbyEvents.length === 0 ? (
-              <Text style={styles.emptyText}>Nenhum evento presencial próximo encontrado no momento.</Text>
+            ) : visibleNearbyEvents.length === 0 ? (
+              <Text style={styles.emptyText}>Nenhum evento presencial em um raio de 10 km encontrado no momento.</Text>
             ) : (
               <FlatList
                 horizontal
-                data={nearbyEvents}
+                data={visibleNearbyEvents}
                 keyExtractor={item => item.id}
                 showsHorizontalScrollIndicator={false}
                 contentContainerStyle={styles.horizontalList}
-                renderItem={({ item }) => (
-                  <TouchableOpacity style={styles.eventCard} onPress={() => router.push(`/event/${item.id}` as any)}>
-                    <View style={styles.eventHeader}>
-                      <FontAwesome name="map-marker" size={14} color="#ec4899" />
-                      <Text style={[styles.eventDate, { color: '#ec4899' }]}>
-                        A {(item.distance ?? 0).toFixed(1)} km daqui
-                      </Text>
-                    </View>
-                    <Text style={styles.eventTitle} numberOfLines={1}>{item.title}</Text>
-                    <Text style={styles.eventLoc} numberOfLines={1}>{item.locationName || 'Local a definir'}</Text>
-                  </TouchableOpacity>
-                )}
+                renderItem={({ item }) => renderEventCard({ item, distance: item.distance ?? 0 })}
               />
             )}
           </View>
@@ -562,7 +565,7 @@ const styles = StyleSheet.create({
   // A imagem em si. Pode ser gigante agora.
   headerLogo: {
     width: 100, // Bem maior que o container (dá o efeito de zoom)
-    height: 100,
+    height: 95,
     // Brinque com estas margens para escolher QUAL parte vai aparecer
     marginLeft: 0, // Puxa para a esquerda para centralizar
     marginTop: -0,  // Sobe ou desce a imagem dentro do corte
@@ -653,12 +656,18 @@ const styles = StyleSheet.create({
     width: 220, backgroundColor: '#fff', borderRadius: 16, padding: 16, marginRight: 16,
     shadowColor: '#000', shadowOpacity: 0.05, shadowRadius: 8, elevation: 3, marginBottom: 10
   },
+  eventCardInProgress: { borderWidth: 1, borderColor: '#34D399', backgroundColor: '#ECFDF5' },
   eventHeader: { flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
   eventDate: { marginLeft: 6, color: '#6366f1', fontSize: 12, fontWeight: 'bold' },
+  nearbyEventDate: { color: '#ec4899' },
+  eventDateInProgress: { color: '#047857' },
   eventTitle: { flex: 1, fontSize: 16, fontWeight: 'bold', color: '#1f2937', marginBottom: 4 },
   eventTitleRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  popularTag: { color: '#B45309', backgroundColor: '#FEF3C7', borderRadius: 7, paddingHorizontal: 6, paddingVertical: 2, fontSize: 10, fontWeight: '800' },
+  discoveryTag: { borderRadius: 7, paddingHorizontal: 6, paddingVertical: 2, backgroundColor: '#EEF2FF' },
+  discoveryTagText: { color: '#4F46E5', fontSize: 9, fontWeight: '800' },
   eventLoc: { fontSize: 12, color: '#6b7280' },
+  journeyBadge: { flexShrink: 0, borderRadius: 7, paddingHorizontal: 7, paddingVertical: 3, backgroundColor: '#EEF2FF' },
+  journeyBadgeText: { color: '#4338CA', fontSize: 9, lineHeight: 12, fontWeight: '900' },
 
   emptyText: { color: '#6b7280', fontSize: 14, fontStyle: 'italic', textAlign: 'center', marginTop: 10 },
   emptyStateContainer: {
@@ -694,7 +703,7 @@ const styles = StyleSheet.create({
   listTime: { fontSize: 12, color: '#6b7280' },
   todayEventBadge: { backgroundColor: '#FEF3C7', borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 },
   todayEventBadgeText: { color: '#B45309', fontSize: 9, fontWeight: '800' },
-  inProgressBadge: { backgroundColor: '#059669', borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 },
-  inProgressBadgeText: { color: '#FFFFFF', fontSize: 9, fontWeight: '800' },
+  inProgressBadge: { flexShrink: 0, backgroundColor: '#059669', borderRadius: 6, paddingHorizontal: 7, paddingVertical: 3 },
+  inProgressBadgeText: { color: '#FFFFFF', fontSize: 9, lineHeight: 12, fontWeight: '800' },
   badgeText: { color: '#fff', fontSize: 10, fontWeight: 'bold' },
 });

@@ -3,7 +3,7 @@
 ## Ativação
 
 - **Mode:** Conditional
-- **Pattern:** `app/**/*.tsx, src/**/*.tsx, src/**/*.ts, services/**/*.ts, firebaseConfig.ts, types/**/*.ts`
+- **Pattern:** `app/**/*, src/**/*, functions/src/**/*, functions/tests/**/*, scripts/**/*, *.rules, *.json, *.js, *.ts, android/**/*`
 
 ## 1. Papel e objetivo
 
@@ -25,7 +25,7 @@ O produto combina:
 - encontros recorrentes em dias e horários definidos;
 - reconhecimento permanente de pioneiros que inauguram novos espaços;
 - reputação e mecanismos de responsabilidade para reduzir faltas em eventos confirmados;
-- privacidade, evitando exposição desnecessária de dados pessoais.
+- privacidade e segurança, evitando exposição desnecessária de dados pessoais.
 
 Ao decidir entre alternativas técnicas, preserve estes objetivos do produto e considere especialmente a experiência mobile, o consumo de rede, bateria, localização, privacidade e custo do Firestore.
 
@@ -172,7 +172,9 @@ Se o usuário autorizar explicitamente a implementação, apresente o plano e pr
 - Sugira a exclusão de código obsoleto e explique o impacto antes de removê-lo quando houver possibilidade de uso externo ou indireto.
 - Não adicione dependências sem justificar necessidade, manutenção, tamanho e compatibilidade com Expo.
 - Não faça atualização, busca, commit, push, pull, merge, rebase ou qualquer outra operação Git/GitHub sem autorização explícita do usuário, e quando for subir, nunca suba as apikey do usuario, ou qualquer dados sensiveis.
-- Nunca descarte ou sobrescreva alterações existentes do usuário.
+- Nunca descarte ou sobrescreva silenciosamente alterações existentes do usuário.
+Se uma alteração existente bloquear a correção, preserve-a quando possível;
+caso contrário, explique o conflito e peça autorização.
 - Preservação de funcionalidades e análise de regressão:
 Antes de alterar código para corrigir um problema, identifique os componentes, hooks, services, tipos, rotas e fluxos que interagem com a parte modificada. Verifique se a mudança pode quebrar comportamentos já funcionais, inclusive fora do arquivo editado.
 
@@ -186,8 +188,12 @@ Quando o usuário apontar um defeito:
    - mesmo defeito confirmado;
    - padrão semelhante que exige análise;
    - falso positivo;
-4. corrija automaticamente apenas as ocorrências dentro do escopo autorizado;
-5. apresente as demais ocorrências e peça autorização antes de ampliar materialmente a alteração.
+4. Considere parte do escopo todas as alterações necessárias para completar o
+mesmo fluxo de ponta a ponta, incluindo produtores, banco, regras, Functions,
+consumidores, notificações, moderação e estados visuais.
+5. Peça autorização somente quando houver mudança de regra de negócio, operação
+destrutiva ou ampliação para uma funcionalidade diferente.
+6. apresente as demais ocorrências e peça autorização antes de ampliar materialmente a alteração.
 
 Não faça uma substituição global cega.
 
@@ -222,15 +228,31 @@ Ao concluir, informe de forma objetiva:
 
 Nunca declare que algo está “funcionando”, “sem erros” ou “otimizado” sem evidência compatível.
 
-### Cloud Functions e custo
+### 14. Cloud Functions e custo
 
-Não crie Cloud Functions sem necessidade real. Use-as apenas para regras críticas que não podem ser confiadas ao app, sabendo que o app não ficará sempre rodando no celular do usuario.
-
-Antes de criar uma, explique seu gatilho, frequência esperada e leituras/escritas que ela fará. Evite funções disparadas em toda alteração do Firestore, loops e execuções duplicadas.
+Use Cloud Functions somente quando o trabalho exigir execução confiável fora do aparelho, credenciais privadas, autoridade administrativa, processamento agendado ou integridade que não possa ser delegada ao cliente.
 
 Toda Function deve ser idempotente: rodar duas vezes não pode duplicar pontos, notificações ou operações.
 
-## 14. Checklist crítico interno
+## 15. Fluxos de ponta a ponta
+
+Ao alterar uma funcionalidade, mapeie quando aplicável:
+
+1. ação e feedback na interface;
+2. validação no cliente;
+3. serviço ou caso de uso;
+4. persistência e formato dos dados;
+5. regras do Firestore;
+6. Cloud Function ou operação administrativa;
+7. notificações e deep linking;
+8. telas consumidoras;
+9. moderação, bloqueio e privacidade;
+10. compatibilidade com dados antigos;
+11. limpeza e retenção dos dados;
+12. teste entre dois usuários/dispositivos.
+
+
+## 16. Checklist crítico interno
 
 Antes da resposta final, confirme:
 
@@ -246,3 +268,22 @@ Antes da resposta final, confirme:
 10. As afirmações da resposta final são sustentadas pelas verificações executadas?
 
 Após a alteração, valide especificamente os fluxos afetados e informe quais interações foram verificadas. Não presuma que uma correção localizada é segura apenas porque o arquivo alterado compila ou funciona isoladamente.
+
+### 17. Verificações transversais
+
+1. Verificar acessibilidade, teclado, safe areas e navegação Android.
+2. Definir critérios de aceitação antes de implementar funcionalidades maiores.
+3. Não editar manualmente functions/lib; gerar com npm run build.
+4. Testar regras do Firestore e lembrar que Admin SDK ignora essas regras.
+5. Diferenciar identificadores públicos de credenciais realmente secretas.
+6. Considerar dados antigos antes de tornar novos campos obrigatórios.
+
+## Autonomia operacional
+
+## Autonomia operacional
+
+Não interrompa, desmonte ou substitua um fluxo funcional apenas para exigir que o usuário informe manualmente senhas, chaves, tokens ou configurações que já estejam disponíveis de forma segura no projeto, ambiente ou ferramentas autorizadas.
+
+Quando necessário para concluir o mesmo fluxo, use e atualize autonomamente as configurações, referências, permissões, regras, Functions e arquivos relacionados. Não delegue ao usuário tarefas técnicas que você consegue executar com segurança.
+
+Peça intervenção somente se a credencial estiver realmente ausente, exigir login/ação manual do usuário, envolver criação de novo segredo, custo externo relevante ou risco de expor dados sensíveis. Nunca grave segredos privados no código ou envie-os ao Git.

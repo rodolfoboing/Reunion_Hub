@@ -1,18 +1,18 @@
-import { useState, useEffect } from 'react';
-import { View, Text, StyleSheet, ScrollView, Alert, Image, TouchableOpacity, TextInput } from 'react-native';
+import { Dispatch, SetStateAction, useState } from 'react';
+import { View, Text, StyleSheet, ScrollView, Alert, Image, TouchableOpacity, TextInput, KeyboardAvoidingView, Platform } from 'react-native';
 import { router } from 'expo-router';
 import { auth, db } from '../../src/services/firebaseConfig';
 import { doc, updateDoc } from 'firebase/firestore';
 import { updateProfile } from 'firebase/auth';
 import { storage } from '../../src/services/firebaseConfig';
-import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import * as ImagePicker from 'expo-image-picker';
 import { StyledButton } from '../../src/components/StyledButton';
-import { StyledInput } from '../../src/components/StyledInput';
 import { FontAwesome } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { INTERESTS_OPTIONS, normalizeInterests } from '../../src/constants/Interests';
+import { uploadProfileImage } from '@/src/services/profileService';
+import { getFirebaseErrorCode } from '@/src/utils/authError';
 
 export default function CompleteProfileScreen() {
     const [bio, setBio] = useState('');
@@ -27,7 +27,6 @@ export default function CompleteProfileScreen() {
             allowsEditing: true,
             aspect: [1, 1],
             quality: 0.5,
-            base64: true,
         });
 
         if (!result.canceled) {
@@ -35,7 +34,7 @@ export default function CompleteProfileScreen() {
         }
     };
 
-    const toggleSelection = (item: string, list: string[], setList: any) => {
+    const toggleSelection = (item: string, list: string[], setList: Dispatch<SetStateAction<string[]>>) => {
         if (list.includes(item)) {
             setList(list.filter(i => i !== item));
         } else {
@@ -43,28 +42,20 @@ export default function CompleteProfileScreen() {
         }
     };
 
-    const uploadImageAsync = async (uri: string) => {
-        const response = await fetch(uri);
-        const blob = await response.blob();
-        
-        const fileRef = ref(storage, `avatars/${auth.currentUser?.uid}_${Date.now()}`);
-        await uploadBytes(fileRef, blob);
-        return await getDownloadURL(fileRef);
-    };
-
     const handleSave = async () => {
-        if (!auth.currentUser) return;
+        const user = auth.currentUser;
+        if (!user || loading) return;
         setLoading(true);
 
         try {
-            let uploadedPhotoUrl = auth.currentUser.photoURL || null;
+            let uploadedPhotoUrl = user.photoURL || null;
             
             // Se o usuário selecionou uma nova imagem local, fazemos o upload
             if (image && !image.startsWith('http')) {
-                uploadedPhotoUrl = await uploadImageAsync(image);
+                uploadedPhotoUrl = await uploadProfileImage(storage, user.uid, image);
             }
 
-            const userRef = doc(db, 'users', auth.currentUser.uid);
+            const userRef = doc(db, 'users', user.uid);
             await updateDoc(userRef, {
                 bio,
                 interests: normalizeInterests(selectedInterests),
@@ -73,15 +64,21 @@ export default function CompleteProfileScreen() {
             });
 
             if (uploadedPhotoUrl) {
-                await updateProfile(auth.currentUser, { photoURL: uploadedPhotoUrl });
+                await updateProfile(user, { photoURL: uploadedPhotoUrl });
             }
 
             Alert.alert('Sucesso', 'Perfil atualizado!', [
                 { text: 'Ir para Início', onPress: () => router.replace('/') }
             ]);
         } catch (error) {
-            console.error(error);
-            Alert.alert('Erro', 'Falha ao salvar perfil.');
+            const code = getFirebaseErrorCode(error);
+            console.error('[Onboarding] profile_completion_failed', { code });
+            Alert.alert(
+                'Não foi possível concluir',
+                code === 'auth/network-request-failed' || code === 'storage/retry-limit-exceeded'
+                    ? 'Verifique sua conexão e tente novamente.'
+                    : 'Seu perfil ainda não foi concluído. Tente novamente.',
+            );
         } finally {
             setLoading(false);
         }
@@ -89,7 +86,8 @@ export default function CompleteProfileScreen() {
 
     return (
         <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
-            <ScrollView contentContainerStyle={styles.content}>
+            <KeyboardAvoidingView style={styles.container} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
+            <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
             <View style={styles.header}>
                 <Text style={styles.title}>Complete seu Perfil</Text>
                 <Text style={styles.subtitle}>Conte-nos mais sobre você para personalizarmos sua experiência.</Text>
@@ -142,6 +140,7 @@ export default function CompleteProfileScreen() {
                 isLoading={loading}
             />
             </ScrollView>
+            </KeyboardAvoidingView>
         </SafeAreaView>
     );
 }

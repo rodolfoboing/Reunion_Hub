@@ -1,9 +1,11 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
+import { Platform } from 'react-native';
 import * as Location from 'expo-location';
 import { collection, onSnapshot, query, where, limit, getDocs, getDoc, doc, orderBy } from 'firebase/firestore';
 import type { DocumentData } from 'firebase/firestore';
-import { db } from '@/src/services/firebaseConfig';
+import { auth, db } from '@/src/services/firebaseConfig';
 import { fetchNearbyPlaces, mapOsmToPlace } from '@/src/services/osmService';
+import { updateRecommendationLocation } from '@/src/services/recommendationLocationService';
 import { Meeting, Place } from '@/src/types';
 import { normalizeDate, getTodayStr } from '@/src/utils/dateUtils';
 
@@ -22,6 +24,74 @@ export type ExploreRegion = {
 };
 
 export type LocationAccessStatus = 'checking' | 'granted' | 'denied' | 'error';
+export type LocationIssue = 'permission-denied' | 'services-disabled' | 'unavailable' | null;
+
+const LOCATION_FIX_TIMEOUT_MS = 20_000;
+
+function locationErrorDetails(error: unknown): { code: string; message: string } {
+    if (error && typeof error === 'object') {
+        const code = 'code' in error && typeof error.code === 'string'
+            ? error.code
+            : 'unknown';
+        const message = 'message' in error && typeof error.message === 'string'
+            ? error.message
+            : 'Location request failed';
+        return { code, message };
+    }
+    return { code: 'unknown', message: String(error) };
+}
+
+/**
+ * Alguns aparelhos Android devolvem null/erro no pedido pontual do Fused
+ * Location Provider, embora a permissão e os provedores estejam ativos. Uma
+ * assinatura curta recebe o primeiro fix e é removida imediatamente.
+ */
+function waitForAndroidLocation(signal: AbortSignal): Promise<Location.LocationObject> {
+    return new Promise((resolve, reject) => {
+        let subscription: Location.LocationSubscription | null = null;
+        let settled = false;
+
+        const cleanup = () => {
+            clearTimeout(timeout);
+            signal.removeEventListener('abort', handleAbort);
+            subscription?.remove();
+            subscription = null;
+        };
+        const finish = (location?: Location.LocationObject, error?: Error) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            if (location) resolve(location);
+            else reject(error ?? new Error('location-unavailable'));
+        };
+        const handleAbort = () => finish(undefined, new Error('location-request-aborted'));
+        const timeout = setTimeout(
+            () => finish(undefined, new Error('location-request-timeout')),
+            LOCATION_FIX_TIMEOUT_MS,
+        );
+
+        signal.addEventListener('abort', handleAbort, { once: true });
+        void Location.watchPositionAsync(
+            {
+                accuracy: Location.Accuracy.High,
+                timeInterval: 1_000,
+                distanceInterval: 0,
+                mayShowUserSettingsDialog: true,
+            },
+            (location) => finish(location),
+            (reason) => finish(undefined, new Error(reason)),
+        ).then((createdSubscription) => {
+            if (settled) {
+                createdSubscription.remove();
+                return;
+            }
+            subscription = createdSubscription;
+        }).catch((error: unknown) => {
+            const details = locationErrorDetails(error);
+            finish(undefined, new Error(`${details.code}: ${details.message}`));
+        });
+    });
+}
 
 const databasePlaceFrom = (id: string, data: DocumentData): Place => {
     const frequenters = Array.isArray(data.frequenters)
@@ -54,7 +124,10 @@ export function useExploreData(
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(false);
     const [retryKey, setRetryKey] = useState(0);
+    const [locationRetryKey, setLocationRetryKey] = useState(0);
     const [locationStatus, setLocationStatus] = useState<LocationAccessStatus>('checking');
+    const [locationIssue, setLocationIssue] = useState<LocationIssue>(null);
+    const [canAskLocationPermissionAgain, setCanAskLocationPermissionAgain] = useState(true);
     const [placesError, setPlacesError] = useState(false);
     const [osmError, setOsmError] = useState(false);
     const [osmLoading, setOsmLoading] = useState(false);
@@ -63,29 +136,93 @@ export function useExploreData(
 
     useEffect(() => {
         let isActive = true;
+        const locationAbortController = new AbortController();
 
         (async () => {
+            let fallbackLocation: Location.LocationObject | null = null;
+            if (isActive) {
+                setLocationStatus('checking');
+                setLocationIssue(null);
+            }
             try {
-                const { status } = await Location.requestForegroundPermissionsAsync();
+                let permission = await Location.getForegroundPermissionsAsync();
+                if (permission.status !== 'granted' && permission.canAskAgain) {
+                    permission = await Location.requestForegroundPermissionsAsync();
+                }
+                if (isActive) setCanAskLocationPermissionAgain(permission.canAskAgain);
+                const { status } = permission;
                 if (status === 'granted') {
-                    const lastLocation = await Location.getLastKnownPositionAsync();
-                    if (lastLocation && isActive) setLocation(lastLocation);
-                    const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+                    fallbackLocation = await Location.getLastKnownPositionAsync({
+                        maxAge: 7 * 24 * 60 * 60 * 1000,
+                        requiredAccuracy: 10_000,
+                    });
+                    if (fallbackLocation && isActive) {
+                        setLocation(fallbackLocation);
+                        setLocationStatus('granted');
+                        console.info('[ExploreData] location_acquired', { source: 'last_known' });
+                    }
+
+                    const providerStatus = await Location.getProviderStatusAsync();
+                    if (!providerStatus.locationServicesEnabled) {
+                        if (!fallbackLocation && isActive) {
+                            setLocationStatus('error');
+                            setLocationIssue('services-disabled');
+                        }
+                        return;
+                    }
+
+                    if (Platform.OS === 'android'
+                        && providerStatus.gpsAvailable === false
+                        && providerStatus.networkAvailable === false) {
+                        if (!fallbackLocation && isActive) {
+                            setLocationStatus('error');
+                            setLocationIssue('services-disabled');
+                        }
+                        return;
+                    }
+
+                    const loc = Platform.OS === 'android'
+                        ? await waitForAndroidLocation(locationAbortController.signal)
+                        : await Location.getCurrentPositionAsync({
+                            accuracy: Location.Accuracy.Balanced,
+                            mayShowUserSettingsDialog: true,
+                        });
                     if (isActive) {
                         setLocation(loc);
                         setLocationStatus('granted');
+                        setLocationIssue(null);
+                        console.info('[ExploreData] location_acquired', { source: 'fresh' });
+                    }
+                    const userId = auth.currentUser?.uid;
+                    if (userId) {
+                        updateRecommendationLocation(userId, loc.coords).catch(() => {
+                            console.warn('[ExploreData] recommendation_location_sync_failed');
+                        });
                     }
                 } else if (isActive) {
                     setLocationStatus('denied');
+                    setLocationIssue('permission-denied');
                 }
-            } catch (error) {
-                console.warn('Erro ao obter localizacao:', error);
-                if (isActive) setLocationStatus('error');
+            } catch (locationError: unknown) {
+                const details = locationErrorDetails(locationError);
+                if (details.message === 'location-request-aborted') return;
+                console.warn('[ExploreData] location_request_failed', {
+                    code: details.code,
+                    reason: details.message,
+                    platform: Platform.OS,
+                });
+                if (isActive && !fallbackLocation) {
+                    setLocationStatus('error');
+                    setLocationIssue('unavailable');
+                }
             }
         })();
 
-        return () => { isActive = false; };
-    }, []);
+        return () => {
+            isActive = false;
+            locationAbortController.abort();
+        };
+    }, [locationRetryKey]);
 
     useEffect(() => {
         if (!active) return;
@@ -261,9 +398,22 @@ export function useExploreData(
         setRetryKey((current) => current + 1);
     };
 
+    const retryLocation = async () => {
+        if (Platform.OS === 'android' && locationIssue === 'services-disabled') {
+            try {
+                await Location.enableNetworkProviderAsync();
+            } catch {
+                console.warn('[ExploreData] location_provider_enable_declined');
+            }
+        }
+        setLocationRetryKey((current) => current + 1);
+    };
+
     return {
         location,
         locationStatus,
+        locationIssue,
+        canAskLocationPermissionAgain,
         meetings,
         places,
         loading,
@@ -272,6 +422,7 @@ export function useExploreData(
         osmError,
         osmLoading,
         retry,
+        retryLocation,
         refreshPlace,
     };
 }

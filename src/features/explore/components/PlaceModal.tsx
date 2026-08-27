@@ -15,6 +15,12 @@ const WEEKDAYS: { key: HabitWeekday; label: string }[] = [
     { key: 'saturday', label: 'Sáb' },
     { key: 'sunday', label: 'Dom' },
 ];
+const PERIODS = ['Manhã', 'Tarde', 'Noite'] as const;
+
+type AttendanceProfile = {
+    profile: User;
+    scheduleLines: string[];
+};
 
 function currentWeekday(): HabitWeekday {
     const days: HabitWeekday[] = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
@@ -23,6 +29,15 @@ function currentWeekday(): HabitWeekday {
 
 function configuredDayCount(schedule: HabitSchedule): number {
     return WEEKDAYS.filter(({ key }) => (schedule[key]?.length || 0) > 0).length;
+}
+
+function orderedPeriods(periods: string[]): string[] {
+    return [...new Set(periods)].sort((first, second) => {
+        const firstIndex = PERIODS.findIndex((period) => period === first);
+        const secondIndex = PERIODS.findIndex((period) => period === second);
+        return (firstIndex < 0 ? PERIODS.length : firstIndex)
+            - (secondIndex < 0 ? PERIODS.length : secondIndex);
+    });
 }
 
 interface PlaceModalProps {
@@ -52,17 +67,54 @@ export function PlaceModal({
     const [selectedWeekday, setSelectedWeekday] = React.useState<HabitWeekday>(currentWeekday);
     const [selectedSchedule, setSelectedSchedule] = React.useState<HabitSchedule>({});
     const [savingHabit, setSavingHabit] = React.useState(false);
+    const [showFrequenters, setShowFrequenters] = React.useState(false);
 
     const ownSchedule = place?.currentUserHabitSchedule
         || (auth.currentUser?.uid ? place?.habitSchedules?.[auth.currentUser.uid] : undefined)
         || {};
     const isCurrentUserFrequenting = place?.isCurrentUserFrequenting === true || configuredDayCount(ownSchedule) > 0;
+    const attendanceSummary = React.useMemo(() => {
+        const activeWeekdays = new Set<HabitWeekday>();
+        const profiles = frequentersProfiles.map((profile): AttendanceProfile => {
+            const schedule = place?.habitSchedules?.[profile.uid];
+            const scheduleLines = WEEKDAYS.flatMap(({ key: weekday, label }) => {
+                const periods = orderedPeriods(schedule?.[weekday] || []);
+                if (periods.length === 0) return [];
+
+                activeWeekdays.add(weekday);
+                return [`${label}: ${periods.join(', ')}`];
+            });
+
+            if (scheduleLines.length === 0) {
+                const legacyPeriods = orderedPeriods(place?.habits?.[profile.uid] || []);
+                if (legacyPeriods.length > 0) {
+                    scheduleLines.push(`Dia não informado: ${legacyPeriods.join(', ')}`);
+                }
+            }
+
+            return { profile, scheduleLines };
+        }).sort((first, second) => {
+            const firstName = first.profile.nick || first.profile.displayName || '';
+            const secondName = second.profile.nick || second.profile.displayName || '';
+            return firstName.localeCompare(secondName, 'pt-BR');
+        });
+
+        const activeDayLabels = WEEKDAYS
+            .filter(({ key }) => activeWeekdays.has(key))
+            .map(({ label }) => label);
+
+        return {
+            profiles,
+            daysLabel: activeDayLabels.length > 0 ? activeDayLabels.join(', ') : 'Dias não informados',
+        };
+    }, [frequentersProfiles, place]);
     
     // Reset state when modal opens/closes
     React.useEffect(() => {
         setIsPickingHabit(false);
         setSelectedSchedule(ownSchedule);
         setSelectedWeekday(WEEKDAYS.find(({ key }) => (ownSchedule[key]?.length || 0) > 0)?.key || currentWeekday());
+        setShowFrequenters(false);
     }, [visible, place?.id]);
 
     const cancelHabitEditing = () => {
@@ -153,43 +205,62 @@ export function PlaceModal({
                     ) : frequentersProfiles.length > 0 ? (
                         <View style={{ marginBottom: 20 }}>
                             <Text style={{ fontSize: 16, fontWeight: 'bold', color: '#374151', marginBottom: 12 }}>
-                                Frequentadores
+                                Quando este lugar costuma ser frequentado
                             </Text>
-                            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
-                                {frequentersProfiles.map(prof => (
-                                    <TouchableOpacity key={prof.uid} onPress={() => { onClose(); router.push(`/public-profile/${prof.uid}` as any); }} style={{ alignItems: 'center', width: 60 }}>
-                                        {prof.photoURL ? (
-                                            <Image source={{ uri: prof.photoURL }} style={{ width: 44, height: 44, borderRadius: 22 }} />
-                                        ) : (
-                                            <View style={{ width: 44, height: 44, borderRadius: 22, backgroundColor: '#E5E7EB', justifyContent: 'center', alignItems: 'center' }}>
-                                                <Text style={{ fontSize: 18, color: '#9CA3AF', fontWeight: 'bold' }}>{prof.displayName?.charAt(0) || 'U'}</Text>
-                                            </View>
-                                        )}
-                                        <Text style={{ fontSize: 11, color: '#4B5563', marginTop: 4, textAlign: 'center' }} numberOfLines={1}>
-                                            {prof.nick || prof.displayName?.split(' ')[0]}
-                                        </Text>
-                                    </TouchableOpacity>
-                                ))}
-                            </View>
-                            {frequentersProfiles.map((profile) => {
-                                const schedule = place.habitSchedules?.[profile.uid];
-                                const legacyPeriods = place.habits?.[profile.uid] || [];
-                                const configuredDays = WEEKDAYS.filter(({ key }) => (schedule?.[key]?.length || 0) > 0);
-                                if (configuredDays.length === 0 && legacyPeriods.length === 0) return null;
-                                return (
-                                    <View key={`schedule_${profile.uid}`} style={styles.frequentScheduleCard}>
-                                        <Text style={styles.frequentScheduleName}>{profile.nick || profile.displayName || 'Usuário'}</Text>
-                                        {configuredDays.map(({ key, label }) => (
-                                            <Text key={key} style={styles.frequentScheduleText}>
-                                                {label}: {schedule?.[key]?.join(', ')}
-                                            </Text>
-                                        ))}
-                                        {configuredDays.length === 0 && legacyPeriods.length > 0 && (
-                                            <Text style={styles.frequentScheduleText}>Período: {legacyPeriods.join(', ')}</Text>
-                                        )}
+                            <Text style={styles.attendanceHelper}>Toque no indicador para ver as pessoas e seus horários.</Text>
+                            <View style={styles.attendanceCard}>
+                                <TouchableOpacity
+                                    style={styles.attendanceHeader}
+                                    onPress={() => setShowFrequenters((current) => !current)}
+                                    accessibilityRole="button"
+                                    accessibilityLabel={`Ver frequentadores presentes em ${attendanceSummary.daysLabel}`}
+                                    accessibilityState={{ expanded: showFrequenters }}
+                                >
+                                    <View style={styles.attendanceIcon}>
+                                        <Ionicons name="people" size={19} color="#4F46E5" />
                                     </View>
-                                );
-                            })}
+                                    <View style={{ flex: 1 }}>
+                                        <Text style={styles.attendanceLabel}>Presença em {attendanceSummary.daysLabel}</Text>
+                                        <Text style={styles.attendanceCount}>
+                                            {attendanceSummary.profiles.length} {attendanceSummary.profiles.length === 1 ? 'frequentador' : 'frequentadores'}
+                                        </Text>
+                                    </View>
+                                    <Ionicons name={showFrequenters ? 'chevron-up' : 'chevron-down'} size={20} color="#64748B" />
+                                </TouchableOpacity>
+
+                                {showFrequenters && (
+                                    <View style={styles.attendanceProfiles}>
+                                        {attendanceSummary.profiles.map(({ profile, scheduleLines }, index) => (
+                                            <TouchableOpacity
+                                                key={profile.uid}
+                                                onPress={() => {
+                                                    onClose();
+                                                    router.push({ pathname: '/public-profile/[id]', params: { id: profile.uid } });
+                                                }}
+                                                style={[
+                                                    styles.attendanceProfile,
+                                                    index === attendanceSummary.profiles.length - 1 && styles.attendanceProfileLast,
+                                                ]}
+                                            >
+                                                {profile.photoURL ? (
+                                                    <Image source={{ uri: profile.photoURL }} style={styles.attendanceAvatar} />
+                                                ) : (
+                                                    <View style={[styles.attendanceAvatar, styles.attendanceAvatarFallback]}>
+                                                        <Text style={styles.attendanceAvatarText}>{(profile.nick || profile.displayName || 'U').charAt(0).toUpperCase()}</Text>
+                                                    </View>
+                                                )}
+                                                <View style={styles.attendanceProfileDetails}>
+                                                    <Text style={styles.attendanceProfileName}>{profile.nick || profile.displayName || 'Usuário'}</Text>
+                                                    <Text style={styles.attendanceProfileSchedule}>
+                                                        {scheduleLines.length > 0 ? scheduleLines.join(' • ') : 'Dias e períodos não informados'}
+                                                    </Text>
+                                                </View>
+                                                <Ionicons name="chevron-forward" size={18} color="#94A3B8" />
+                                            </TouchableOpacity>
+                                        ))}
+                                    </View>
+                                )}
+                            </View>
                         </View>
                     ) : (
                         <View style={{ backgroundColor: '#F3F4F6', padding: 16, borderRadius: 12, marginBottom: 20, alignItems: 'center' }}>
@@ -211,7 +282,7 @@ export function PlaceModal({
                     ) : (
                         <View style={{ backgroundColor: '#F0FDF4', padding: 16, borderRadius: 12, borderWidth: 1, borderColor: '#BBF7D0', marginBottom: 20 }}>
                             <Text style={{ color: '#15803D', fontWeight: 'bold', marginBottom: 4 }}>Em quais dias e períodos você costuma vir?</Text>
-                            <Text style={styles.habitHelper}>Escolha um dia, marque os períodos e repita nos demais dias.</Text>
+                            <Text style={styles.habitHelper}>Você pode marcar vários períodos e vários dias. Ao trocar de dia, as escolhas anteriores continuam salvas.</Text>
                             <View style={styles.weekdayContainer}>
                                 {WEEKDAYS.map(({ key, label }) => (
                                     <TouchableOpacity
@@ -229,7 +300,7 @@ export function PlaceModal({
                                 ))}
                             </View>
                             <View style={{ flexDirection: 'row', gap: 8, marginBottom: 12 }}>
-                                {['Manhã', 'Tarde', 'Noite'].map(period => (
+                                {PERIODS.map(period => (
                                     <TouchableOpacity 
                                         key={period} 
                                         style={[styles.periodChip, selectedSchedule[selectedWeekday]?.includes(period) && styles.periodChipSelected]}
@@ -319,9 +390,21 @@ const styles = StyleSheet.create({
     modalTitle: { fontSize: 20, fontWeight: 'bold', color: '#111827' },
     discovererBanner: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#EEF2FF', padding: 12, borderRadius: 8, marginBottom: 16 },
     discovererText: { flex: 1, color: '#3730A3', fontWeight: 'bold' },
-    frequentScheduleCard: { marginTop: 10, padding: 10, borderRadius: 10, backgroundColor: '#F8FAFC', borderWidth: 1, borderColor: '#E2E8F0' },
-    frequentScheduleName: { color: '#334155', fontSize: 13, fontWeight: '800', marginBottom: 3 },
-    frequentScheduleText: { color: '#64748B', fontSize: 12, lineHeight: 18 },
+    attendanceHelper: { color: '#64748B', fontSize: 12, lineHeight: 17, marginTop: -6, marginBottom: 10 },
+    attendanceCard: { borderWidth: 1, borderColor: '#E2E8F0', borderRadius: 12, overflow: 'hidden', backgroundColor: '#F8FAFC' },
+    attendanceHeader: { flexDirection: 'row', alignItems: 'center', padding: 12 },
+    attendanceIcon: { width: 38, height: 38, borderRadius: 19, backgroundColor: '#EEF2FF', justifyContent: 'center', alignItems: 'center', marginRight: 10 },
+    attendanceLabel: { color: '#334155', fontSize: 14, fontWeight: '800', lineHeight: 19 },
+    attendanceCount: { color: '#64748B', fontSize: 12, marginTop: 2 },
+    attendanceProfiles: { paddingHorizontal: 12, borderTopWidth: 1, borderTopColor: '#E2E8F0' },
+    attendanceProfile: { minHeight: 66, flexDirection: 'row', alignItems: 'center', borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: '#CBD5E1', paddingVertical: 10 },
+    attendanceProfileLast: { borderBottomWidth: 0 },
+    attendanceAvatar: { width: 42, height: 42, borderRadius: 21 },
+    attendanceAvatarFallback: { backgroundColor: '#E5E7EB', justifyContent: 'center', alignItems: 'center' },
+    attendanceAvatarText: { color: '#64748B', fontWeight: '800', fontSize: 17 },
+    attendanceProfileDetails: { flex: 1, marginHorizontal: 10 },
+    attendanceProfileName: { color: '#334155', fontSize: 14, fontWeight: '700', lineHeight: 19 },
+    attendanceProfileSchedule: { color: '#64748B', fontSize: 12, lineHeight: 17, marginTop: 2 },
     habitHelper: { color: '#4B7C5C', fontSize: 12, lineHeight: 17, marginBottom: 10 },
     configuredDaysText: { color: '#15803D', fontSize: 12, fontWeight: '700', marginBottom: 10 },
     removeHabitButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7, marginTop: -10, marginBottom: 20, paddingVertical: 10 },

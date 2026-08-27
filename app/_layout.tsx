@@ -4,17 +4,18 @@ import { useFonts } from 'expo-font';
 import { Stack, router } from 'expo-router';
 import * as SplashScreen from 'expo-splash-screen';
 import React, { useEffect, useRef, useState } from 'react';
-import { View, Text } from 'react-native';
+import { AppState, View, Text } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import * as Notifications from 'expo-notifications';
 import type { User as FirebaseUser } from 'firebase/auth';
 import 'react-native-reanimated';
 import { auth, db } from '../src/services/firebaseConfig'; // Import auth
-import { doc, onSnapshot, setDoc } from 'firebase/firestore';
+import { doc, onSnapshot } from 'firebase/firestore';
 import { useColorScheme } from '@/src/components/useColorScheme';
-import { activateNotificationUser, getExpoPushToken, getNotificationRoute, setupNotifications } from '../src/utils/Notifications';
+import { activateNotificationUser, cancelEventReminder, getExpoPushToken, getNotificationRoute, refreshReengagementReminder, reportNotificationOperationError, setEventRemindersEnabled, setReengagementReminderEnabled, setupNotifications } from '../src/utils/Notifications';
 import { getNotificationTarget } from '../src/utils/Notifications';
 import { markRelatedNotificationsAsRead } from '../src/services/notificationReadService';
+import { savePushRegistration, unregisterCurrentPushDevice } from '../src/services/pushRegistrationService';
 import { ErrorBoundary as CustomErrorBoundary } from '../src/components/ErrorBoundary';
 
 export {
@@ -79,7 +80,9 @@ export default function RootLayout() {
         const unsubscribeProfile = onSnapshot(profileRef, (snapshot) => {
           if (snapshot.exists() && snapshot.data().banned === true) {
             console.warn('[RootLayout] banned_account_session_ended');
-            auth.signOut().catch(() => console.error('[RootLayout] banned_sign_out_failed'));
+            unregisterCurrentPushDevice(user.uid)
+              .catch(() => console.error('[RootLayout] banned_device_cleanup_failed'))
+              .finally(() => auth.signOut().catch(() => console.error('[RootLayout] banned_sign_out_failed')));
             router.replace('/login');
             return;
           }
@@ -93,53 +96,76 @@ export default function RootLayout() {
             router.replace(target as never);
           }
         }, () => console.error('[RootLayout] profile_route_check_failed'));
-        return unsubscribeProfile;
+        const unsubscribeNotificationSettings = onSnapshot(doc(db, 'notificationSettings', user.uid), (snapshot) => {
+          setEventRemindersEnabled(user.uid, snapshot.data()?.notifyEventReminders !== false).catch(() => {
+            console.warn('[RootLayout] reminder_preference_sync_failed');
+          });
+          setReengagementReminderEnabled(user.uid, snapshot.data()?.notifyRecommendations === true).catch(() => {
+            console.warn('[RootLayout] reengagement_preference_sync_failed');
+          });
+        }, () => console.error('[RootLayout] reminder_preference_load_failed'));
+        return () => {
+          unsubscribeProfile();
+          unsubscribeNotificationSettings();
+        };
       }
     }
   }, [loaded, authInitialized, user]);
 
-  // Fallback de segurança: Esconde a splash screen após 3 segundos de qualquer jeito
+  // Fallback de segurança: só atua se fontes ou autenticação ainda não terminaram.
   useEffect(() => {
+    if (loaded && authInitialized) return;
     const timer = setTimeout(() => {
-      console.log("[ReunionHub Debug] Forçando hideAsync após timeout");
-      SplashScreen.hideAsync().catch(e => console.warn(e));
+      if (__DEV__) console.warn('[RootLayout] splash_fallback_timeout');
+      SplashScreen.hideAsync().catch(() => {
+        if (__DEV__) console.warn('[RootLayout] splash_fallback_hide_failed');
+      });
     }, 3000);
     return () => clearTimeout(timer);
-  }, []);
+  }, [loaded, authInitialized]);
 
   // Inicializa notificações e salva o push token
   useEffect(() => {
     if (!authInitialized) return;
-    const savePushToken = async (token: string) => {
-      if (!user) return;
-      try {
-        await setDoc(doc(db, 'users', user.uid), { expoPushToken: token }, { merge: true });
-        if (__DEV__) console.info('[Notifications] expo_token_saved');
-      } catch (error) {
-        console.error('[ReunionHub Debug] Erro ao salvar push token', error);
-      }
-    };
-
     activateNotificationUser(user?.uid ?? null).catch(() => {
       console.warn('[Notifications] reminder_owner_sync_failed');
     });
+    if (!user) return;
 
     setupNotifications().then(async (result) => {
       console.log('[ReunionHub Debug] Permissões de notificação:', result.granted ? 'Concedidas' : 'Negadas');
-      if (result.granted && result.token && user) {
-        await savePushToken(result.token);
+      if (result.granted) {
+        await refreshReengagementReminder(user.uid);
       }
-    }).catch(() => console.error('[Notifications] setup_failed'));
+      if (result.granted && (result.expoToken || result.nativeToken)) {
+        await savePushRegistration(user.uid, result);
+        if (__DEV__) console.info('[Notifications] push_device_saved', { platform: result.platform });
+      }
+    }).catch((error: unknown) => reportNotificationOperationError('setup_or_registration', error));
 
     const tokenSubscription = Notifications.addPushTokenListener((deviceToken) => {
       getExpoPushToken(deviceToken).then((expoToken) => {
-        if (expoToken) return savePushToken(expoToken);
-      }).catch(() => {
-        console.error('[Notifications] expo_token_refresh_failed');
+        const nativeToken = typeof deviceToken.data === 'string' ? deviceToken.data : null;
+        if (expoToken || nativeToken) return savePushRegistration(user.uid, {
+          granted: true,
+          expoToken,
+          nativeToken,
+          platform: deviceToken.type === 'android' ? 'android' : deviceToken.type === 'ios' ? 'ios' : null,
+        });
+      }).catch((error: unknown) => reportNotificationOperationError('push_token_refresh', error));
+    });
+
+    const appStateSubscription = AppState.addEventListener('change', (nextState) => {
+      if (nextState !== 'active') return;
+      refreshReengagementReminder(user.uid).catch((error: unknown) => {
+        reportNotificationOperationError('reengagement_app_resume', error);
       });
     });
 
-    return () => tokenSubscription.remove();
+    return () => {
+      tokenSubscription.remove();
+      appStateSubscription.remove();
+    };
   }, [authInitialized, user]);
 
   useEffect(() => {
@@ -149,6 +175,10 @@ export default function RootLayout() {
       const notificationData = response.notification.request.content.data;
       const route = getNotificationRoute(notificationData);
       const target = getNotificationTarget(notificationData);
+      const notificationType = typeof notificationData.notificationType === 'string' ? notificationData.notificationType : '';
+      if (user && target?.meetingId && (notificationType === 'event_cancelled' || notificationType === 'event_completed')) {
+        await cancelEventReminder(target.meetingId, user.uid).catch(() => undefined);
+      }
       if (target) {
         try {
           await markRelatedNotificationsAsRead(target);
@@ -169,14 +199,26 @@ export default function RootLayout() {
       });
     });
 
+    const receivedSubscription = Notifications.addNotificationReceivedListener((notification) => {
+      const data = notification.request.content.data;
+      const target = getNotificationTarget(data);
+      const notificationType = typeof data.notificationType === 'string' ? data.notificationType : '';
+      if (user && target?.meetingId && (notificationType === 'event_cancelled' || notificationType === 'event_completed')) {
+        cancelEventReminder(target.meetingId, user.uid).catch(() => undefined);
+      }
+    });
+
     Notifications.getLastNotificationResponseAsync().then((response) => {
       if (response) return handleNotificationResponse(response);
     }).catch((error) => {
       console.error('[ReunionHub Debug] Erro ao ler última notificação:', error);
     });
 
-    return () => responseSubscription.remove();
-  }, [loaded, authInitialized]);
+    return () => {
+      responseSubscription.remove();
+      receivedSubscription.remove();
+    };
+  }, [loaded, authInitialized, user]);
 
   if (!loaded || !authInitialized) {
     // Retornamos uma View temporária para garantir que o React renderize algo

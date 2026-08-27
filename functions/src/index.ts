@@ -2,9 +2,10 @@ import * as functions from 'firebase-functions';
 import * as admin from 'firebase-admin';
 import { createHash } from 'crypto';
 import {
-    ExpoPushMessage,
-    sendExpoPushMessages as deliverExpoPushMessages,
-    sendExpoPushNotification as deliverExpoPushNotification,
+    PushChannel,
+    PushDeliverySummary,
+    PushMessage,
+    sendPushMessages as deliverPushMessages,
 } from './pushNotifications';
 import {
     isRecord,
@@ -15,6 +16,23 @@ import {
     requireDocumentIdValue,
     requireStringField,
 } from './validation';
+import {
+    RecommendationEvent,
+    RecommendationLocation,
+    RecommendationUser,
+    canSendDailyRecommendation,
+    recommendationCooldownNotificationIds,
+    selectDailyRecommendation,
+} from './recommendations';
+import {
+    CHECK_IN_REVIEW_WINDOW_MS,
+    canCancelEventAt,
+    canFavoriteEndedEvent,
+    canManuallyReviewCheckIns,
+    canSettleExpiredEventForUser,
+    checkInReviewDeadlineMs,
+    shouldApplyCompletionReputation,
+} from './eventLifecycle';
 
 admin.initializeApp();
 const db = admin.firestore();
@@ -30,18 +48,76 @@ const dailyFunction = functions.runWith({
     timeoutSeconds: 120,
     maxInstances: 1,
 });
+// Exclusão é rara, mas percorre todas as coleções ligadas à conta. Um limite
+// maior evita exclusão parcial sem aumentar custo quando a Function está ociosa.
+const accountFunction = functions.runWith({
+    memory: '128MB',
+    timeoutSeconds: 120,
+    maxInstances: 2,
+});
 
-async function sendExpoPushMessages(messages: ExpoPushMessage[]): Promise<void> {
-    await deliverExpoPushMessages(db, messages);
-}
+type PushNotificationOptions = {
+    channel?: PushChannel;
+    priority?: 'normal' | 'high';
+    preferenceField?: 'notifyMessages' | 'notifyEventUpdates' | 'notifyRecommendations';
+    tag?: string;
+    collapseKey?: string;
+};
 
-async function sendExpoPushNotification(
-    pushTokens: string[],
+async function pushMessagesForUser(
+    userId: string,
     title: string,
     body: string,
-    data: Record<string, unknown> = {}
-): Promise<void> {
-    await deliverExpoPushNotification(db, pushTokens, title, body, data);
+    data: Record<string, unknown>,
+    options: PushNotificationOptions
+): Promise<PushMessage[]> {
+    const preferenceField = options.preferenceField;
+    const [devicesSnapshot, settingsSnapshot] = await Promise.all([
+        db.collection('pushDevices').where('userId', '==', userId).limit(10).get(),
+        preferenceField ? db.collection('notificationSettings').doc(userId).get() : Promise.resolve(null),
+    ]);
+    if (settingsSnapshot && preferenceField && settingsSnapshot.data()?.[preferenceField] === false) return [];
+
+    const channel: PushChannel = options.channel ?? 'events';
+    const priority: 'normal' | 'high' = options.priority ?? 'high';
+    const common = {
+        userId,
+        title,
+        body,
+        data,
+        channel,
+        priority,
+        tag: options.tag,
+        collapseKey: options.collapseKey,
+    };
+    if (devicesSnapshot.empty) return [{ ...common }];
+    return devicesSnapshot.docs.map((device) => {
+        const tokenData = device.data();
+        return {
+            ...common,
+            registrationPath: device.ref.path,
+            expoToken: typeof tokenData.expoPushToken === 'string' ? tokenData.expoPushToken : undefined,
+            nativeToken: typeof tokenData.nativePushToken === 'string' ? tokenData.nativePushToken : undefined,
+            platform: typeof tokenData.platform === 'string' ? tokenData.platform : undefined,
+        };
+    });
+}
+
+async function sendPushNotification(
+    userIds: string[],
+    title: string,
+    body: string,
+    data: Record<string, unknown> = {},
+    options: PushNotificationOptions = {}
+): Promise<PushDeliverySummary> {
+    const resolvedOptions: PushNotificationOptions = {
+        channel: 'events',
+        priority: 'high',
+        preferenceField: 'notifyEventUpdates',
+        ...options,
+    };
+    const messages = (await Promise.all([...new Set(userIds)].map((userId) => pushMessagesForUser(userId, title, body, data, resolvedOptions)))).flat();
+    return deliverPushMessages(db, messages);
 }
 
 async function requireStaff(context: functions.https.CallableContext): Promise<string> {
@@ -61,6 +137,11 @@ type EventNotificationDelivery = {
     title: string;
     body: string;
     meetingId: string;
+    reputationDelta?: number;
+    detailTitle?: string;
+    detailBody?: string;
+    preferenceField?: 'notifyEventUpdates' | 'notifyRecommendations';
+    channel?: PushChannel;
 };
 
 async function deliverEventNotifications(deliveries: EventNotificationDelivery[]): Promise<void> {
@@ -76,7 +157,7 @@ async function deliverEventNotifications(deliveries: EventNotificationDelivery[]
         });
     }
 
-    const validDeliveries = deliveries.filter(({ userId }) => recipientProfiles.has(userId));
+    const validDeliveries = deliveries.filter(({ userId }) => recipientProfiles.get(userId)?.banned !== true);
     for (let index = 0; index < validDeliveries.length; index += 400) {
         const batch = db.batch();
         validDeliveries.slice(index, index + 400).forEach((delivery) => {
@@ -86,6 +167,9 @@ async function deliverEventNotifications(deliveries: EventNotificationDelivery[]
                 title: delivery.title,
                 body: delivery.body,
                 meetingId: delivery.meetingId,
+                ...(typeof delivery.reputationDelta === 'number' ? { reputationDelta: delivery.reputationDelta } : {}),
+                ...(delivery.detailTitle ? { detailTitle: delivery.detailTitle } : {}),
+                ...(delivery.detailBody ? { detailBody: delivery.detailBody } : {}),
                 createdAt: admin.firestore.FieldValue.serverTimestamp(),
                 read: false,
             }, { merge: true });
@@ -93,21 +177,125 @@ async function deliverEventNotifications(deliveries: EventNotificationDelivery[]
         await batch.commit();
     }
 
-    await sendExpoPushMessages(validDeliveries.flatMap((delivery): ExpoPushMessage[] => {
-        const token = recipientProfiles.get(delivery.userId)?.expoPushToken;
-        if (typeof token !== 'string') return [];
-        return [{
-            token,
-            title: delivery.title,
-            body: delivery.body,
-            data: {
-                path: `/event/${delivery.meetingId}`,
-                meetingId: delivery.meetingId,
-                notificationType: delivery.type,
-            },
-        }];
-    }));
+    const pushMessages = (await Promise.all(validDeliveries.map((delivery) => pushMessagesForUser(
+        delivery.userId,
+        delivery.title,
+        delivery.body,
+        {
+            path: `/event/${delivery.meetingId}`,
+            meetingId: delivery.meetingId,
+            notificationType: delivery.type,
+            notificationId: delivery.id,
+        },
+        {
+            channel: delivery.channel ?? 'events',
+            priority: delivery.type === 'event_completed' || delivery.type === 'daily_event_recommendation' ? 'normal' : 'high',
+            preferenceField: delivery.preferenceField ?? 'notifyEventUpdates',
+            ...(delivery.type === 'checkin_request' || delivery.type === 'checkin_review_ready' ? {
+                tag: `checkin_review_${delivery.meetingId}`,
+                collapseKey: `checkin_review_${delivery.meetingId}`,
+            } : {}),
+        }
+    )))).flat();
+    try {
+        await deliverPushMessages(db, pushMessages);
+    } catch {
+        // A notificação interna já foi persistida. Push não pode desfazer a ação principal.
+        console.error('[MeetingNotification] push_delivery_failed', { recipientCount: validDeliveries.length });
+    }
 }
+
+async function notifyReportersOfModerationAction(
+    targetType: 'event' | 'user',
+    targetId: string,
+    body: string,
+    path: string
+): Promise<void> {
+    const reports = await db.collection('reports')
+        .where('type', '==', targetType)
+        .where('targetId', '==', targetId)
+        .limit(50)
+        .get();
+    const reporterIds = [...new Set(reports.docs.map((report) => report.data().reportedBy).filter((userId): userId is string => typeof userId === 'string'))];
+    if (reporterIds.length === 0) return;
+
+    for (let index = 0; index < reporterIds.length; index += 400) {
+        const batch = db.batch();
+        reporterIds.slice(index, index + 400).forEach((userId) => {
+            batch.set(db.collection('notifications').doc(`report_resolved_${targetType}_${targetId}_${userId}`), {
+                userId,
+                type: 'report_resolved',
+                title: 'Denúncia analisada',
+                body,
+                path,
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                read: false,
+            }, { merge: true });
+        });
+        await batch.commit();
+    }
+    try {
+        await sendPushNotification(
+            reporterIds,
+            'Denúncia analisada',
+            body,
+            { path, notificationType: 'report_resolved' },
+            { priority: 'normal' }
+        );
+    } catch {
+        console.error('[Moderation] reporter_push_failed', { targetType, reporterCount: reporterIds.length });
+    }
+}
+
+export const onReportCreated = smallFunction.firestore
+    .document('reports/{reportId}')
+    .onCreate(async (snapshot) => {
+        const report = snapshot.data();
+        const currentReport = await snapshot.ref.get();
+        if (currentReport.data()?.moderatorNotifiedAt) return null;
+
+        const staffProfiles = await db.collection('users')
+            .where('role', 'in', ['admin', 'moderator'])
+            .limit(10)
+            .get();
+        const staffIds = staffProfiles.docs
+            .filter((profile) => profile.data().banned !== true)
+            .map((profile) => profile.id);
+        if (staffIds.length === 0) {
+            console.warn('[Moderation] report_without_available_staff');
+            return null;
+        }
+
+        const targetLabel = report.type === 'user' ? 'usuário' : 'evento';
+        const batch = db.batch();
+        staffIds.forEach((userId) => {
+            batch.set(db.collection('notifications').doc(`report_received_${snapshot.id}_${userId}`), {
+                userId,
+                type: 'report_received',
+                title: 'Nova denúncia para análise',
+                body: `Uma denúncia de ${targetLabel} aguarda moderação.`,
+                path: '/(drawer)/(tabs)/moderation',
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                read: false,
+            }, { merge: true });
+        });
+        batch.set(snapshot.ref, { moderatorNotifiedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+        await batch.commit();
+
+        try {
+            await sendPushNotification(
+                staffIds,
+                'Nova denúncia para análise',
+                `Uma denúncia de ${targetLabel} aguarda moderação.`,
+                { path: '/(drawer)/(tabs)/moderation', notificationType: 'report_received' },
+                { priority: 'normal', preferenceField: undefined }
+            );
+        } catch {
+            console.error('[Moderation] report_push_failed', { staffCount: staffIds.length });
+        }
+        console.info('[Moderation] report_alert_created', { staffCount: staffIds.length, targetType: report.type });
+        return null;
+    });
 
 function requireAuthenticated(context: functions.https.CallableContext): string {
     if (!context.auth) {
@@ -116,8 +304,34 @@ function requireAuthenticated(context: functions.https.CallableContext): string 
     return context.auth.uid;
 }
 
+function requireRecentAuthentication(context: functions.https.CallableContext, maximumAgeSeconds = 5 * 60): string {
+    const uid = requireAuthenticated(context);
+    const authTime = context.auth?.token.auth_time;
+    const ageSeconds = typeof authTime === 'number' ? Math.floor(Date.now() / 1000) - authTime : Number.POSITIVE_INFINITY;
+    if (ageSeconds < 0 || ageSeconds > maximumAgeSeconds) {
+        throw new functions.https.HttpsError(
+            'failed-precondition',
+            'Confirme sua senha novamente antes de realizar esta ação.',
+        );
+    }
+    return uid;
+}
+
 function requireEventId(data: unknown): string {
     return requireDocumentIdField(data, 'eventId', 500);
+}
+
+function requireEventIds(data: unknown): string[] {
+    if (!isRecord(data) || !Array.isArray(data.eventIds)) {
+        throw new functions.https.HttpsError('invalid-argument', 'A lista de eventos é obrigatória.');
+    }
+    const eventIds = [...new Set(data.eventIds.map((eventId) =>
+        requireDocumentIdValue(eventId, 'eventIds', 500)
+    ))];
+    if (eventIds.length === 0 || eventIds.length > 10) {
+        throw new functions.https.HttpsError('invalid-argument', 'Envie entre 1 e 10 eventos por vez.');
+    }
+    return eventIds;
 }
 
 function isBlockedBy(profile: FirebaseFirestore.DocumentData | undefined, userId: string): boolean {
@@ -125,11 +339,16 @@ function isBlockedBy(profile: FirebaseFirestore.DocumentData | undefined, userId
     return Array.isArray(blockedUsers) && blockedUsers.includes(userId);
 }
 
+function notificationSnapshotTimestamp(value: unknown): Date | null {
+    return value instanceof admin.firestore.Timestamp ? value.toDate() : null;
+}
+
 function conversationIdFor(firstUserId: string, secondUserId: string): string {
     return [firstUserId, secondUserId].sort().join('_');
 }
 
 function getEventStartDate(event: FirebaseFirestore.DocumentData): Date | null {
+    if (event.startsAt instanceof admin.firestore.Timestamp) return event.startsAt.toDate();
     if (typeof event.date !== 'string' || typeof event.time !== 'string') return null;
     if (!isValidCalendarDate(event.date) || !isValidClockTime(event.time)) return null;
     // Eventos do produto são registrados no horário de São Paulo. Sem o offset,
@@ -139,15 +358,24 @@ function getEventStartDate(event: FirebaseFirestore.DocumentData): Date | null {
 }
 
 function getEventEndDate(event: FirebaseFirestore.DocumentData): Date | null {
+    if (event.endsAt instanceof admin.firestore.Timestamp) return event.endsAt.toDate();
     if (typeof event.date !== 'string' || typeof event.time !== 'string') return null;
     const endTime = typeof event.endTime === 'string' ? event.endTime : '';
-    const end = endTime && isValidCalendarDate(event.date) && isValidClockTime(endTime)
-        ? new Date(`${event.date}T${endTime}:00-03:00`)
+    const endDate = typeof event.endDate === 'string' && isValidCalendarDate(event.endDate) ? event.endDate : event.date;
+    const end = endTime && isValidCalendarDate(endDate) && isValidClockTime(endTime)
+        ? new Date(`${endDate}T${endTime}:00-03:00`)
         : null;
     if (end && !Number.isNaN(end.getTime())) return end;
 
     const start = getEventStartDate(event);
     return start ? new Date(start.getTime() + 3 * 60 * 60 * 1000) : null;
+}
+
+function getCheckInReviewDeadline(event: FirebaseFirestore.DocumentData, eventEnd: Date): Date {
+    if (event.checkInReviewDeadlineAt instanceof admin.firestore.Timestamp) {
+        return event.checkInReviewDeadlineAt.toDate();
+    }
+    return new Date(checkInReviewDeadlineMs(eventEnd.getTime()));
 }
 
 function isCheckInWindowOpen(event: FirebaseFirestore.DocumentData, now: Date): boolean {
@@ -156,7 +384,19 @@ function isCheckInWindowOpen(event: FirebaseFirestore.DocumentData, now: Date): 
     return Boolean(start && end && now >= start && now <= end);
 }
 
-type PendingCheckIn = { userId: string; displayName: string };
+type PendingCheckIn = {
+    userId: string;
+    displayName: string;
+    requestedAt?: FirebaseFirestore.Timestamp;
+};
+
+type CheckInReviewStatus = 'confirmed' | 'rejected' | 'auto_confirmed';
+
+type CheckInReview = PendingCheckIn & {
+    status: CheckInReviewStatus;
+    reviewedAt: FirebaseFirestore.Timestamp;
+    reviewedBy: string | null;
+};
 
 function pendingCheckIns(value: unknown): PendingCheckIn[] {
     if (!Array.isArray(value)) return [];
@@ -165,6 +405,7 @@ function pendingCheckIns(value: unknown): PendingCheckIn[] {
         return [{
             userId: item.userId,
             displayName: typeof item.displayName === 'string' && item.displayName ? item.displayName : 'Usuário',
+            ...(item.requestedAt instanceof admin.firestore.Timestamp ? { requestedAt: item.requestedAt } : {}),
         }];
     });
 }
@@ -192,7 +433,7 @@ function requireHabitSchedule(data: Record<string, unknown>): HabitScheduleInput
             const normalizedPeriods = [...new Set(periods
                 .filter((period): period is string => typeof period === 'string')
                 .map((period) => period.trim())
-                .filter(Boolean))].slice(0, 3);
+                .filter((period) => ['Manhã', 'Tarde', 'Noite'].includes(period)))].slice(0, 3);
             if (normalizedPeriods.length > 0) normalizedSchedule[weekday] = normalizedPeriods;
         });
     } else {
@@ -201,7 +442,7 @@ function requireHabitSchedule(data: Record<string, unknown>): HabitScheduleInput
             ? [...new Set(data.periods
                 .filter((period): period is string => typeof period === 'string')
                 .map((period) => period.trim())
-                .filter(Boolean))].slice(0, 3)
+                .filter((period) => ['Manhã', 'Tarde', 'Noite'].includes(period)))].slice(0, 3)
             : [];
         if (periods.length > 0) normalizedSchedule[weekday] = periods;
     }
@@ -322,16 +563,12 @@ export const reportEventLinkIssue = smallFunction.https.onCall(async (data, cont
     if (!result.created) return { sent: false, alreadyReported: true };
 
     try {
-        const creatorSnapshot = await db.collection('users').doc(result.creatorId).get();
-        const token = creatorSnapshot.data()?.expoPushToken;
-        if (typeof token === 'string') {
-            await sendExpoPushNotification(
-                [token],
-                'Possível problema no link',
-                `Um participante pediu que você verifique o link de "${result.eventTitle}".`,
-                { path: `/event/${eventId}`, meetingId: eventId, notificationType: 'event_link_issue' }
-            );
-        }
+        await sendPushNotification(
+            [result.creatorId],
+            'Possível problema no link',
+            `Um participante pediu que você verifique o link de "${result.eventTitle}".`,
+            { path: `/event/${eventId}`, meetingId: eventId, notificationType: 'event_link_issue' }
+        );
     } catch {
         // O aviso dentro do app já foi salvo; falha no push não invalida a ação do usuário.
         console.error('[EventLinkIssue] push_delivery_failed', { eventId });
@@ -376,10 +613,7 @@ export const rsvpToEvent = smallFunction.https.onCall(async (data, context) => {
 
     if (result.added && result.creatorId) {
         try {
-            const [creatorSnap, attendeeSnap] = await Promise.all([
-                db.collection('users').doc(result.creatorId).get(),
-                userRef.get(),
-            ]);
+            const attendeeSnap = await userRef.get();
             const attendeeName = displayNameFor(attendeeSnap.data());
             await db.collection('notifications').doc(`event_rsvp_${eventId}_${uid}`).set({
                 userId: result.creatorId,
@@ -391,16 +625,13 @@ export const rsvpToEvent = smallFunction.https.onCall(async (data, context) => {
                 createdAt: admin.firestore.FieldValue.serverTimestamp(),
                 read: false,
             }, { merge: true });
-            const token = creatorSnap.data()?.expoPushToken;
-            if (typeof token === 'string') {
-                await sendExpoPushNotification(
-                    [token],
-                    'Nova presença confirmada',
-                    `${attendeeName} confirmou presença em "${result.eventTitle}".`,
-                    { path: `/event/${eventId}`, meetingId: eventId, notificationType: 'event_rsvp' }
-                );
-            }
-            console.info('[EventRsvp] organizer_notified');
+            const push = await sendPushNotification(
+                [result.creatorId],
+                'Nova presença confirmada',
+                `${attendeeName} confirmou presença em "${result.eventTitle}".`,
+                { path: `/event/${eventId}`, meetingId: eventId, notificationType: 'event_rsvp' }
+            );
+            console.info('[EventRsvp] organizer_notified', { deliveredToProvider: push.deliveredToProvider, rejected: push.rejected, missingToken: push.missingToken });
         } catch {
             console.error('[EventRsvp] organizer_notification_failed', { eventId });
         }
@@ -411,18 +642,13 @@ export const rsvpToEvent = smallFunction.https.onCall(async (data, context) => {
 
 function favoriteSnapshotFor(event: FirebaseFirestore.DocumentData, eventId: string): FirebaseFirestore.DocumentData {
     const eventTime = typeof event.time === 'string' ? event.time : '';
-    const legacyTimeMatch = /^(\d{2}):(\d{2})$/.exec(eventTime);
-    const legacyStartMinutes = legacyTimeMatch
-        ? Number(legacyTimeMatch[1]) * 60 + Number(legacyTimeMatch[2])
-        : Number.NaN;
-    const legacyEndMinutes = Number.isFinite(legacyStartMinutes) && legacyStartMinutes < (23 * 60 + 59)
-        ? Math.min(legacyStartMinutes + 180, 23 * 60 + 59)
-        : Number.NaN;
+    const compatibleEnd = getEventEndDate(event);
     const compatibleEndTime = typeof event.endTime === 'string' && event.endTime
         ? event.endTime
-        : Number.isFinite(legacyEndMinutes)
-            ? `${String(Math.floor(legacyEndMinutes / 60)).padStart(2, '0')}:${String(legacyEndMinutes % 60).padStart(2, '0')}`
-            : '';
+        : compatibleEnd ? timeStringInSaoPaulo(compatibleEnd) : '';
+    const compatibleEndDate = typeof event.endDate === 'string' && isValidCalendarDate(event.endDate)
+        ? event.endDate
+        : compatibleEnd ? dateStringInSaoPaulo(compatibleEnd) : (typeof event.date === 'string' ? event.date : '');
 
     return {
         sourceEventId: eventId,
@@ -434,6 +660,7 @@ function favoriteSnapshotFor(event: FirebaseFirestore.DocumentData, eventId: str
         locationName: typeof event.locationName === 'string' ? event.locationName : '',
         date: typeof event.date === 'string' ? event.date : '',
         time: eventTime,
+        endDate: compatibleEndDate,
         endTime: compatibleEndTime,
         type: event.type === 'online' ? 'online' : 'in-person',
         meetingLink: typeof event.meetingLink === 'string' ? event.meetingLink : '',
@@ -464,6 +691,37 @@ export const toggleEventFavorite = smallFunction.https.onCall(async (data, conte
     const userRef = db.collection('users').doc(uid);
     const favoriteRef = userRef.collection('favoriteEvents').doc(eventId);
 
+    // Eventos legados sem `status` e eventos cujo fechamento diário atrasou são
+    // concluídos sob demanda. Isso permite favoritar um check-in pendente antigo
+    // sem criar uma rotina frequente, mantendo a transação de conclusão idempotente.
+    const eventBeforeToggle = await eventRef.get();
+    if (eventBeforeToggle.exists) {
+        const event = eventBeforeToggle.data()!;
+        const eventEnd = getEventEndDate(event);
+        const belongsToUser = event.createdBy === uid || stringIds(event.attendees).includes(uid);
+        const shouldSettle = canSettleExpiredEventForUser(
+            event.status,
+            eventEnd?.getTime() ?? null,
+            Date.now(),
+            eventEnd ? dateStringInSaoPaulo(eventEnd) : '',
+            dateInSaoPaulo(),
+            belongsToUser,
+        );
+        if (shouldSettle) {
+            const completion = await completeEventTransaction(eventRef);
+            if (!completion.alreadyCompleted) {
+                try {
+                    await deliverHistorySettlementSummaries(
+                        historySettlementSummariesFor(completion),
+                        dateInSaoPaulo(),
+                    );
+                } catch {
+                    console.error('[FavoriteEvent] settlement_summary_failed');
+                }
+            }
+        }
+    }
+
     const result = await db.runTransaction(async (transaction) => {
         const [eventSnap, userSnap, favoriteSnap] = await Promise.all([
             transaction.get(eventRef),
@@ -479,8 +737,15 @@ export const toggleEventFavorite = smallFunction.https.onCall(async (data, conte
         }
         if (!eventSnap.exists) throw new functions.https.HttpsError('not-found', 'Evento não encontrado.');
         const event = eventSnap.data()!;
-        if (event.status !== 'completed' || !stringIds(event.checkedIn).includes(uid)) {
-            throw new functions.https.HttpsError('failed-precondition', 'Somente eventos concluídos com seu check-in confirmado podem ser favoritadas.');
+        const eventEnd = getEventEndDate(event);
+        const canFavorite = canFavoriteEndedEvent(
+            event.status,
+            eventEnd?.getTime() ?? null,
+            Date.now(),
+            stringIds(event.checkedIn).includes(uid),
+        );
+        if (!canFavorite) {
+            throw new functions.https.HttpsError('failed-precondition', 'Somente eventos encerrados com seu check-in confirmado podem ser favoritos.');
         }
         transaction.set(favoriteRef, favoriteSnapshotFor(event, eventId));
         transaction.update(userRef, { favorites: [...new Set([...currentFavorites, eventId])] });
@@ -515,6 +780,18 @@ export const recreateFavoriteEvent = smallFunction.https.onCall(async (data, con
         if (favorite.createdBy !== uid) throw new functions.https.HttpsError('permission-denied', 'Apenas o criador original pode repetir este evento.');
         if (date <= dateInSaoPaulo()) throw new functions.https.HttpsError('invalid-argument', 'Escolha uma data futura para repetir o evento.');
         if (typeof favorite.time !== 'string' || typeof favorite.endTime !== 'string') throw new functions.https.HttpsError('failed-precondition', 'Este favorito não possui horários suficientes para ser repetido.');
+        const favoriteStart = getEventStartDate(favorite);
+        const favoriteEnd = getEventEndDate(favorite);
+        if (!favoriteStart || !favoriteEnd) throw new functions.https.HttpsError('failed-precondition', 'Este favorito não possui uma duração válida.');
+        const durationMs = favoriteEnd.getTime() - favoriteStart.getTime();
+        if (durationMs < 15 * 60 * 1000 || durationMs > 24 * 60 * 60 * 1000) {
+            throw new functions.https.HttpsError('failed-precondition', 'Este favorito possui uma duração incompatível com as regras atuais.');
+        }
+        const newStart = new Date(`${date}T${favorite.time}:00-03:00`);
+        const newEnd = new Date(newStart.getTime() + durationMs);
+        if (Number.isNaN(newStart.getTime()) || newStart <= new Date()) {
+            throw new functions.https.HttpsError('invalid-argument', 'Escolha uma data e horário futuros para repetir o evento.');
+        }
         if (existingEventSnap.exists) {
             const existingEvent = existingEventSnap.data();
             if (existingEvent?.createdBy !== uid || existingEvent.repeatedFrom !== eventId || existingEvent.date !== date) {
@@ -531,7 +808,10 @@ export const recreateFavoriteEvent = smallFunction.https.onCall(async (data, con
             locationName: favorite.locationName,
             date,
             time: favorite.time,
+            endDate: dateStringInSaoPaulo(newEnd),
             endTime: favorite.endTime,
+            startsAt: admin.firestore.Timestamp.fromDate(newStart),
+            endsAt: admin.firestore.Timestamp.fromDate(newEnd),
             type: favorite.type === 'online' ? 'online' : 'in-person',
             meetingLink: favorite.type === 'online' ? favorite.meetingLink || '' : '',
             placeId: favorite.type === 'in-person' ? favorite.placeId || '' : '',
@@ -539,7 +819,7 @@ export const recreateFavoriteEvent = smallFunction.https.onCall(async (data, con
             lng: favorite.type === 'in-person' && typeof favorite.lng === 'number' ? favorite.lng : null,
             createdBy: uid,
             creatorName: displayNameFor(userSnap.data()),
-            createdAt: new Date().toISOString(),
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
             attendees: [uid],
             suggestedInviteeIds: stringIds(favorite.checkedIn).filter((participantId) => participantId !== uid).slice(0, 50),
             status: 'active',
@@ -574,7 +854,7 @@ export const proposeFavoriteEventRepeat = smallFunction.https.onCall(async (data
             type: 'repeat_proposal',
             title: 'Pedido para repetir evento',
             body: `Uma pessoa que participou de "${typeof favorite.title === 'string' ? favorite.title : 'seu evento'}" gostaria de uma nova edição.`,
-            meetingId: eventId,
+            path: '/(drawer)/(tabs)/agenda?tab=history',
             fromUserId: uid,
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             read: false,
@@ -583,10 +863,16 @@ export const proposeFavoriteEventRepeat = smallFunction.https.onCall(async (data
     });
 
     if (!result.alreadyProposed) {
-        const creatorSnap = await db.collection('users').doc(result.creatorId).get();
-        const token = creatorSnap.data()?.expoPushToken;
-        if (typeof token === 'string') {
-            await sendExpoPushNotification([token], 'Pedido para repetir evento', 'Uma pessoa pediu uma nova edição de um evento seu.', { path: '/(drawer)/(tabs)/agenda', notificationType: 'repeat_proposal' });
+        try {
+            await sendPushNotification(
+                [result.creatorId],
+                'Pedido para repetir evento',
+                'Uma pessoa pediu uma nova edição de um evento seu.',
+                { path: '/(drawer)/(tabs)/agenda', notificationType: 'repeat_proposal' },
+                { priority: 'normal' }
+            );
+        } catch {
+            console.error('[FavoriteEvent] repeat_proposal_push_failed', { eventId });
         }
     }
     console.info('[FavoriteEvent] repeat_proposal_processed', { alreadyProposed: result.alreadyProposed });
@@ -629,7 +915,6 @@ export const leaveEvent = smallFunction.https.onCall(async (data, context) => {
 
     if (result.creatorId) {
         try {
-            const creatorSnap = await db.collection('users').doc(result.creatorId).get();
             await db.collection('notifications').doc(`event_leave_${eventId}_${uid}`).set({
                 userId: result.creatorId,
                 type: 'event_attendee_left',
@@ -640,15 +925,12 @@ export const leaveEvent = smallFunction.https.onCall(async (data, context) => {
                 createdAt: admin.firestore.FieldValue.serverTimestamp(),
                 read: false,
             }, { merge: true });
-            const token = creatorSnap.data()?.expoPushToken;
-            if (typeof token === 'string') {
-                await sendExpoPushNotification(
-                    [token],
-                    'Participante cancelou presença',
-                    `${result.attendeeName} saiu de "${result.eventTitle}".`,
-                    { path: `/event/${eventId}`, meetingId: eventId, notificationType: 'event_attendee_left' }
-                );
-            }
+            await sendPushNotification(
+                [result.creatorId],
+                'Participante cancelou presença',
+                `${result.attendeeName} saiu de "${result.eventTitle}".`,
+                { path: `/event/${eventId}`, meetingId: eventId, notificationType: 'event_attendee_left' }
+            );
         } catch {
             console.error('[EventLeave] organizer_notification_failed', { eventId });
         }
@@ -770,7 +1052,7 @@ export const inviteUserToEvent = smallFunction.https.onCall(async (data, context
         ]);
         if (!eventSnap.exists) throw new functions.https.HttpsError('not-found', 'Evento não encontrado.');
         if (!inviteeSnap.exists) throw new functions.https.HttpsError('not-found', 'Usuário não encontrado.');
-        if (existingInvitation.exists) return { alreadyInvited: true, inviteeToken: undefined, eventTitle: '' };
+        if (existingInvitation.exists) return { alreadyInvited: true, eventTitle: '' };
 
         const event = eventSnap.data()!;
         const eventStart = getEventStartDate(event);
@@ -812,7 +1094,6 @@ export const inviteUserToEvent = smallFunction.https.onCall(async (data, context
         });
         return {
             alreadyInvited: false,
-            inviteeToken: typeof inviteeSnap.data()?.expoPushToken === 'string' ? inviteeSnap.data()?.expoPushToken : undefined,
             eventTitle: typeof event.title === 'string' ? event.title : 'um evento',
         };
     });
@@ -821,15 +1102,18 @@ export const inviteUserToEvent = smallFunction.https.onCall(async (data, context
         console.info('[EventInvite] duplicate_ignored');
         return { ok: true, alreadyInvited: true };
     }
-    if (result.inviteeToken) {
-        await sendExpoPushNotification(
-            [result.inviteeToken],
+    let push: PushDeliverySummary | null = null;
+    try {
+        push = await sendPushNotification(
+            [targetRef.id],
             'Você recebeu um convite',
             `Abra o Reunion Hub para ver o convite para "${result.eventTitle}".`,
             { path: `/event/${eventId}`, meetingId: eventId, notificationType: 'event_invitation' }
         );
+    } catch {
+        console.error('[EventInvite] invitation_push_failed', { eventId });
     }
-    console.info('[EventInvite] invitation_created', { pushSent: Boolean(result.inviteeToken) });
+    console.info('[EventInvite] invitation_created', { deliveredToProvider: push?.deliveredToProvider || 0, rejected: push?.rejected || 0, missingToken: push?.missingToken || 0 });
     return { ok: true, alreadyInvited: false };
 });
 
@@ -861,14 +1145,17 @@ export const getOrCreateConversation = smallFunction.https.onCall(async (data, c
 
         const target = targetSnap.data();
         const participantName = target?.nick || target?.displayName || 'Usuário';
+        const caller = callerSnap.data();
+        const callerName = caller?.nick || caller?.displayName || 'Usuário';
         if (existing.exists) {
             transaction.update(conversationRef, {
                 deletedBy: admin.firestore.FieldValue.arrayRemove(uid),
+                [`participantNames.${uid}`]: callerName,
+                [`participantNames.${targetUserId}`]: participantName,
             });
             return { conversationId, participantName, created: false };
         }
 
-        const caller = callerSnap.data();
         transaction.create(conversationRef, {
             participants: [uid, targetUserId].sort(),
             participantNames: {
@@ -901,6 +1188,7 @@ export const sendChatMessage = smallFunction.https.onCall(async (data, context) 
     const messageRef = requestedMessageId
         ? conversationRef.collection('messages').doc(requestedMessageId)
         : conversationRef.collection('messages').doc();
+    const pushThrottleCutoff = Date.now() - (2 * 60 * 1000);
     const delivery = await db.runTransaction(async (transaction) => {
         const conversationSnap = await transaction.get(conversationRef);
         if (!conversationSnap.exists) throw new functions.https.HttpsError('not-found', 'Conversa não encontrada.');
@@ -918,7 +1206,7 @@ export const sendChatMessage = smallFunction.https.onCall(async (data, context) 
             if (!existingMessage || existingMessage.senderId !== uid || existingMessage.text !== text) {
                 throw new functions.https.HttpsError('already-exists', 'Este identificador já pertence a outra mensagem.');
             }
-            return { senderName: '', recipientToken: '', alreadySent: true };
+            return { senderName: '', recipientUserId: '', shouldPush: false, alreadySent: true };
         }
 
         const notificationRef = db.collection('notifications').doc(`chat_${conversationId}_${otherUserId}`);
@@ -949,6 +1237,8 @@ export const sendChatMessage = smallFunction.https.onCall(async (data, context) 
             deletedBy: admin.firestore.FieldValue.arrayRemove(uid, otherUserId),
         });
         const senderName = displayNameFor(senderSnap.data());
+        const previousPushAt = notificationSnapshotTimestamp(notificationSnap.data()?.lastPushAt);
+        const shouldPush = !previousPushAt || previousPushAt.getTime() <= pushThrottleCutoff;
         transaction.set(notificationRef, {
             userId: otherUserId,
             type: 'chat',
@@ -958,25 +1248,43 @@ export const sendChatMessage = smallFunction.https.onCall(async (data, context) 
             fromUserId: uid,
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             read: false,
+            ...(shouldPush ? { lastPushAt: admin.firestore.FieldValue.serverTimestamp() } : {}),
         }, { merge: true });
-        const hasUnreadNotification = notificationSnap.exists && notificationSnap.data()?.read === false;
-        const recipientToken = recipientSnap.data()?.expoPushToken;
         return {
             senderName,
-            recipientToken: !hasUnreadNotification && typeof recipientToken === 'string' ? recipientToken : '',
+            recipientUserId: otherUserId,
+            shouldPush,
             alreadySent: false,
         };
     });
 
-    if (delivery.recipientToken) {
-        await sendExpoPushNotification(
-            [delivery.recipientToken],
-            `Nova mensagem de ${delivery.senderName}`,
-            text,
-            { path: `/conversation/${conversationId}`, conversationId }
-        );
+    let push: PushDeliverySummary | null = null;
+    if (delivery.shouldPush && delivery.recipientUserId) {
+        try {
+            push = await sendPushNotification(
+                [delivery.recipientUserId],
+                `Nova mensagem de ${delivery.senderName}`,
+                text,
+                { path: `/conversation/${conversationId}`, conversationId, notificationType: 'chat' },
+                {
+                    channel: 'messages',
+                    priority: 'high',
+                    preferenceField: 'notifyMessages',
+                    tag: `chat_${conversationId}`,
+                    collapseKey: `chat_${conversationId}`,
+                }
+            );
+        } catch {
+            console.error('[ChatMessage] push_delivery_failed', { conversationId });
+        }
     }
-    console.info('[ChatMessage] processed', { pushSent: Boolean(delivery.recipientToken), alreadySent: delivery.alreadySent });
+    console.info('[ChatMessage] processed', {
+        pushRequested: delivery.shouldPush,
+        deliveredToProvider: push?.deliveredToProvider || 0,
+        rejected: push?.rejected || 0,
+        missingToken: push?.missingToken || 0,
+        alreadySent: delivery.alreadySent,
+    });
 
     return { ok: true, alreadySent: delivery.alreadySent, messageId: messageRef.id };
 });
@@ -1010,7 +1318,6 @@ export const savePlaceHabit = smallFunction.https.onCall(async (data, context) =
         ]);
         if (!userSnap.exists) throw new functions.https.HttpsError('not-found', 'Perfil não encontrado.');
         const discovererName = displayNameFor(userSnap.data());
-        const sharePublicly = userSnap.data()?.shareFrequentedPlaces === true;
         transaction.set(privateHabitRef, {
             placeId,
             name,
@@ -1027,8 +1334,8 @@ export const savePlaceHabit = smallFunction.https.onCall(async (data, context) =
                 latitude,
                 longitude,
                 vocations,
-                frequenters: sharePublicly ? [uid] : [],
-                habitSchedules: sharePublicly ? { [uid]: schedule } : {},
+                frequenters: [uid],
+                habitSchedules: { [uid]: schedule },
                 discovererId: uid,
                 discovererName,
                 discoveredAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -1047,12 +1354,8 @@ export const savePlaceHabit = smallFunction.https.onCall(async (data, context) =
                 discoveredAt: admin.firestore.FieldValue.serverTimestamp(),
             };
         transaction.update(placeRef, {
-            frequenters: sharePublicly
-                ? admin.firestore.FieldValue.arrayUnion(uid)
-                : admin.firestore.FieldValue.arrayRemove(uid),
-            [`habitSchedules.${uid}`]: sharePublicly
-                ? schedule
-                : admin.firestore.FieldValue.delete(),
+            frequenters: admin.firestore.FieldValue.arrayUnion(uid),
+            [`habitSchedules.${uid}`]: schedule,
             [`habits.${uid}`]: admin.firestore.FieldValue.delete(),
             ...discovererFields,
         });
@@ -1100,30 +1403,22 @@ export const setFrequentedPlacesPrivacy = smallFunction.https.onCall(async (data
     const batch = db.batch();
     batch.set(userRef, { shareFrequentedPlaces: enabled }, { merge: true });
 
+    // A preferência controla somente a seção "Lugares que frequenta" do perfil.
+    // A presença no próprio local continua pública, pois é o dado comunitário
+    // necessário para mostrar dias/períodos e reunir pessoas naquele espaço.
+    // Este lote também repara hábitos antigos que foram removidos de `places`.
     habitsSnapshot.docs.forEach((habitDocument) => {
         const schedule = habitDocument.data().schedule;
         const placeRef = db.collection('places').doc(habitDocument.id);
         batch.set(placeRef, {
-            frequenters: enabled
-                ? admin.firestore.FieldValue.arrayUnion(uid)
-                : admin.firestore.FieldValue.arrayRemove(uid),
-            [`habitSchedules.${uid}`]: enabled && isRecord(schedule)
+            frequenters: admin.firestore.FieldValue.arrayUnion(uid),
+            [`habitSchedules.${uid}`]: isRecord(schedule)
                 ? schedule
                 : admin.firestore.FieldValue.delete(),
             [`habits.${uid}`]: admin.firestore.FieldValue.delete(),
         }, { merge: true });
     });
     await batch.commit();
-    if (!enabled) {
-        await processQueryInBatches(
-            db.collection('places').where('frequenters', 'array-contains', uid),
-            (cleanupBatch, document) => cleanupBatch.update(document.ref, {
-                frequenters: admin.firestore.FieldValue.arrayRemove(uid),
-                [`habitSchedules.${uid}`]: admin.firestore.FieldValue.delete(),
-                [`habits.${uid}`]: admin.firestore.FieldValue.delete(),
-            }),
-        );
-    }
     console.info('[PlaceHabit] privacy_updated', { enabled, habitCount: habitsSnapshot.size });
     return { ok: true };
 });
@@ -1141,101 +1436,63 @@ export const checkInToEvent = smallFunction.https.onCall(async (data, context) =
         if ((event.status && event.status !== 'active') || !stringIds(event.attendees).includes(uid) || !isCheckInWindowOpen(event, new Date())) {
             throw new functions.https.HttpsError('failed-precondition', 'O check-in só pode ser solicitado entre o início e o término do evento ativo.');
         }
-        if (stringIds(event.checkedIn).includes(uid)) return { requested: false, alreadyConfirmed: true, creatorId: '' };
+        if (stringIds(event.checkedIn).includes(uid)) return { requested: false, alreadyConfirmed: true, organizerConfirmed: event.createdBy === uid, creatorId: '', eventTitle: '', requesterName: '' };
 
         const requests = pendingCheckIns(event.pendingCheckIns);
-        if (requests.some((request) => request.userId === uid)) return { requested: false, alreadyConfirmed: false, creatorId: '' };
+        if (requests.some((request) => request.userId === uid)) return { requested: false, alreadyConfirmed: false, organizerConfirmed: false, creatorId: '', eventTitle: '', requesterName: '' };
 
         const requesterName = displayNameFor(userSnap.data());
+        const creatorId = typeof event.createdBy === 'string' ? event.createdBy : '';
+        const now = admin.firestore.Timestamp.now();
+        if (creatorId === uid) {
+            transaction.update(eventRef, {
+                checkedIn: admin.firestore.FieldValue.arrayUnion(uid),
+            });
+            transaction.set(db.collection('eventCheckInReviews').doc(`${eventId}_${uid}`), {
+                eventId,
+                userId: uid,
+                displayName: requesterName,
+                requestedAt: now,
+                status: 'confirmed',
+                reviewedAt: now,
+                reviewedBy: uid,
+            });
+            transaction.update(userRef, {
+                reputation: admin.firestore.FieldValue.increment(10),
+                eventsAttended: admin.firestore.FieldValue.increment(1),
+            });
+            return { requested: false, alreadyConfirmed: false, organizerConfirmed: true, creatorId: '', eventTitle: '', requesterName };
+        }
+        if (!creatorId) throw new functions.https.HttpsError('failed-precondition', 'Este evento não possui um organizador válido.');
         transaction.update(eventRef, {
-            pendingCheckIns: [...requests, { userId: uid, displayName: requesterName }],
+            pendingCheckIns: [...requests, { userId: uid, displayName: requesterName, requestedAt: now }],
         });
-        return { requested: true, alreadyConfirmed: false, creatorId: typeof event.createdBy === 'string' ? event.createdBy : '', eventTitle: typeof event.title === 'string' ? event.title : 'este evento' };
+        return {
+            requested: true,
+            alreadyConfirmed: false,
+            organizerConfirmed: false,
+            creatorId,
+            eventTitle: typeof event.title === 'string' ? event.title : 'este evento',
+            requesterName,
+        };
     });
 
-    if (result.requested && result.creatorId && result.creatorId !== uid) {
+    if (result.requested && result.creatorId) {
         try {
-            const creatorSnap = await db.collection('users').doc(result.creatorId).get();
-            const token = creatorSnap.data()?.expoPushToken;
-            await db.collection('notifications').doc(`checkin_request_${eventId}_${uid}`).set({
+            await deliverEventNotifications([{
+                id: `checkin_review_${eventId}_${result.creatorId}`,
                 userId: result.creatorId,
                 type: 'checkin_request',
-                title: 'Confirmação de presença pendente',
-                body: 'Um participante pediu confirmação de check-in.',
+                title: 'Check-in para revisar',
+                body: `${result.requesterName} registrou check-in em "${result.eventTitle}". Revise as presenças ao final do evento.`,
                 meetingId: eventId,
-                fromUserId: uid,
-                createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                read: false,
-            }, { merge: true });
-            if (typeof token === 'string') {
-                await sendExpoPushNotification([token], 'Confirmação de presença pendente', `Confirme o check-in em "${result.eventTitle || 'seu evento'}".`, { path: `/event/${eventId}`, meetingId: eventId, notificationType: 'checkin_request' });
-            }
+            }]);
         } catch {
-            console.error('[CheckIn] request_notification_failed');
+            console.error('[CheckIn] request_notification_failed', { eventId });
         }
     }
 
-    console.info('[CheckIn] request_processed', { requested: result.requested, alreadyConfirmed: result.alreadyConfirmed });
-    return { ok: true, ...result };
-});
-
-export const confirmEventCheckIn = smallFunction.https.onCall(async (data, context) => {
-    const uid = requireAuthenticated(context);
-    const eventId = requireEventId(data);
-    const targetUserId = requireDocumentIdField(data, 'targetUserId', 128);
-    if (targetUserId === uid) throw new functions.https.HttpsError('permission-denied', 'Outra pessoa deve confirmar seu check-in.');
-
-    const eventRef = db.collection('meetings').doc(eventId);
-    const targetUserRef = db.collection('users').doc(targetUserId);
-    const result = await db.runTransaction(async (transaction) => {
-        const [eventSnap, targetUserSnap] = await Promise.all([transaction.get(eventRef), transaction.get(targetUserRef)]);
-        if (!eventSnap.exists) throw new functions.https.HttpsError('not-found', 'Evento não encontrado.');
-        if (!targetUserSnap.exists) throw new functions.https.HttpsError('not-found', 'Participante não encontrado.');
-        const event = eventSnap.data()!;
-        const attendees = stringIds(event.attendees);
-        if (!attendees.includes(uid) || !attendees.includes(targetUserId) || !isCheckInWindowOpen(event, new Date())) {
-            throw new functions.https.HttpsError('failed-precondition', 'Esta confirmação não está disponível.');
-        }
-        if (event.status && event.status !== 'active') throw new functions.https.HttpsError('failed-precondition', 'Este evento não está ativo.');
-        if (stringIds(event.checkedIn).includes(targetUserId)) return { confirmed: false, title: '' };
-
-        const requests = pendingCheckIns(event.pendingCheckIns);
-        if (!requests.some((request) => request.userId === targetUserId)) {
-            throw new functions.https.HttpsError('failed-precondition', 'Não há solicitação de check-in pendente para este participante.');
-        }
-        transaction.update(eventRef, {
-            checkedIn: admin.firestore.FieldValue.arrayUnion(targetUserId),
-            pendingCheckIns: requests.filter((request) => request.userId !== targetUserId),
-        });
-        transaction.update(targetUserRef, {
-            reputation: admin.firestore.FieldValue.increment(10),
-            eventsAttended: admin.firestore.FieldValue.increment(1),
-        });
-        return { confirmed: true, title: typeof event.title === 'string' ? event.title : 'o evento' };
-    });
-
-    if (result.confirmed) {
-        try {
-            const targetSnap = await targetUserRef.get();
-            const token = targetSnap.data()?.expoPushToken;
-            await db.collection('notifications').doc(`checkin_confirmed_${eventId}_${targetUserId}`).set({
-                userId: targetUserId,
-                type: 'checkin_confirmed',
-                title: 'Check-in confirmado',
-                body: `Sua presença em "${result.title}" foi confirmada e seus pontos foram adicionados.`,
-                meetingId: eventId,
-                fromUserId: uid,
-                createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                read: false,
-            }, { merge: true });
-            if (typeof token === 'string') {
-                await sendExpoPushNotification([token], 'Check-in confirmado', `Sua presença em "${result.title}" foi confirmada.`, { path: `/event/${eventId}`, meetingId: eventId, notificationType: 'checkin_confirmed' });
-            }
-        } catch {
-            console.error('[CheckIn] confirmation_notification_failed');
-        }
-    }
-    console.info('[CheckIn] confirmation_processed', { confirmed: result.confirmed });
+    console.info('[CheckIn] request_processed', { requested: result.requested, alreadyConfirmed: result.alreadyConfirmed, organizerConfirmed: result.organizerConfirmed });
     return { ok: true, ...result };
 });
 
@@ -1244,58 +1501,329 @@ type CompleteEventResult = {
     becameFounder: boolean;
     alreadyCompleted: boolean;
     noCheckIns: boolean;
+    confirmedCheckIns: number;
+    rejectedCheckIns: number;
+    callerReputationDelta: number;
 };
 
-type CompletedEventDetails = CompleteEventResult & { recipientUserIds: string[]; title: string };
+type CompletedEventDetails = Omit<CompleteEventResult, 'callerReputationDelta'> & {
+    registeredUserIds: string[];
+    checkedInUserIds: string[];
+    penalizedUserIds: string[];
+    manuallyConfirmedUserIds: string[];
+    autoConfirmedUserIds: string[];
+    rejectedUserIds: string[];
+    penalty: number;
+    title: string;
+    reputationApplied: boolean;
+};
+
+type CheckInDecision = {
+    userId: string;
+    status: 'confirmed' | 'rejected';
+};
+
+function requireCheckInDecisions(data: unknown): CheckInDecision[] {
+    if (!isRecord(data) || !Array.isArray(data.decisions) || data.decisions.length > 100) {
+        throw new functions.https.HttpsError('invalid-argument', 'A revisão de check-ins é inválida.');
+    }
+    const decisions = data.decisions.flatMap((decision): CheckInDecision[] => {
+        if (!isRecord(decision) || (decision.status !== 'confirmed' && decision.status !== 'rejected')) return [];
+        return [{
+            userId: requireDocumentIdValue(decision.userId, 'userId', 128),
+            status: decision.status,
+        }];
+    });
+    if (decisions.length !== data.decisions.length || new Set(decisions.map(({ userId }) => userId)).size !== decisions.length) {
+        throw new functions.https.HttpsError('invalid-argument', 'Cada participante deve ter uma única decisão válida.');
+    }
+    return decisions;
+}
 
 function completedEventDeliveries(eventId: string, result: CompletedEventDetails): EventNotificationDelivery[] {
-    const body = result.noCheckIns
-        ? `O evento "${result.title}" terminou sem check-ins. Cada inscrito perdeu somente 1 ponto.`
-        : `O evento "${result.title}" foi encerrado. Obrigado por participar!`;
-    return result.recipientUserIds.map((userId) => ({
-        id: `event_completed_${eventId}_${userId}`,
-        userId,
-        type: 'event_completed',
-        title: 'Evento encerrado',
-        body,
-        meetingId: eventId,
-    }));
+    const manuallyConfirmed = new Set(result.manuallyConfirmedUserIds);
+    const autoConfirmed = new Set(result.autoConfirmedUserIds);
+    const rejected = new Set(result.rejectedUserIds);
+    const compactTitle = result.title.length > 42 ? `${result.title.slice(0, 39)}...` : result.title;
+    const participantDeliveries = result.checkedInUserIds.map((userId): EventNotificationDelivery => {
+        const receivedPoints = autoConfirmed.has(userId) || manuallyConfirmed.has(userId);
+        if (!receivedPoints) {
+            return {
+                id: `event_completed_${eventId}_${userId}`,
+                userId,
+                type: 'event_completed',
+                title: 'Evento encerrado',
+                body: `O evento "${compactTitle}" foi encerrado. Obrigado por participar!`,
+                meetingId: eventId,
+            };
+        }
+        const approvedAutomatically = autoConfirmed.has(userId);
+        return {
+            id: `event_completed_${eventId}_${userId}`,
+            userId,
+            type: 'event_completed',
+            title: 'Reputação +10',
+            body: approvedAutomatically
+                ? `Check-in aprovado em "${compactTitle}". Toque para entender.`
+                : `Presença confirmada em "${compactTitle}". Toque para entender.`,
+            detailTitle: 'Presença confirmada',
+            detailBody: approvedAutomatically
+                ? `Seu check-in em "${result.title}" foi aprovado automaticamente no encerramento porque não houve uma revisão válida do organizador. Sua reputação aumentou em 10 pontos.`
+                : `O organizador confirmou sua presença em "${result.title}". Sua reputação aumentou em 10 pontos.`,
+            reputationDelta: 10,
+            meetingId: eventId,
+        };
+    });
+    const penaltyDeliveries = result.penalizedUserIds.map((userId): EventNotificationDelivery => {
+        const penalty = Math.abs(result.penalty);
+        const wasRejected = rejected.has(userId);
+        return {
+            id: `event_completed_${eventId}_${userId}`,
+            userId,
+            type: 'event_completed',
+            title: `Reputação -${penalty}`,
+            body: wasRejected
+                ? `Check-in não confirmado em "${compactTitle}". Toque para ver os detalhes.`
+                : result.noCheckIns
+                    ? 'Evento sem presença comprovada: -1 ponto. Toque para entender.'
+                    : `Presença não confirmada em "${compactTitle}": -${penalty} pontos.`,
+            detailTitle: wasRejected ? 'Check-in não confirmado' : 'Presença não confirmada',
+            detailBody: wasRejected
+                ? `O organizador informou que não conseguiu confirmar sua presença em "${result.title}". Por isso, sua reputação foi reduzida em ${penalty} pontos. Se essa revisão estiver incorreta, você pode denunciar o evento nesta tela.`
+                : result.noCheckIns
+                    ? `O evento "${result.title}" terminou sem nenhum check-in confirmado. Como não houve presença comprovada e ninguém foi diretamente prejudicado, foi aplicada a penalidade reduzida de 1 ponto a cada pessoa inscrita.`
+                    : `Você estava inscrito em "${result.title}", mas não teve um check-in confirmado durante o período do evento. Por isso, sua reputação foi reduzida em ${penalty} pontos.`,
+            reputationDelta: result.penalty,
+            meetingId: eventId,
+        };
+    });
+    return [...participantDeliveries, ...penaltyDeliveries];
 }
 
 async function notifyCompletedEvent(eventId: string, result: CompletedEventDetails): Promise<void> {
     await deliverEventNotifications(completedEventDeliveries(eventId, result));
-    console.info('[MeetingNotification] completion_delivered', { recipientCount: result.recipientUserIds.length, noCheckIns: result.noCheckIns });
+    console.info('[MeetingNotification] completion_delivered', {
+        participantCount: result.checkedInUserIds.length,
+        penalizedCount: result.penalizedUserIds.length,
+        noCheckIns: result.noCheckIns,
+    });
 }
 
-async function completeEventTransaction(eventRef: FirebaseFirestore.DocumentReference, expectedCreatorId?: string): Promise<CompletedEventDetails> {
+type HistorySettlementSummary = {
+    userId: string;
+    eventCount: number;
+    reputationDelta: number;
+};
+
+function historySettlementSummariesFor(result: CompletedEventDetails): HistorySettlementSummary[] {
+    const rewarded = new Set([...result.manuallyConfirmedUserIds, ...result.autoConfirmedUserIds]);
+    const penalized = new Set(result.penalizedUserIds);
+    return result.registeredUserIds.map((userId) => ({
+        userId,
+        eventCount: 1,
+        reputationDelta: rewarded.has(userId) ? 10 : penalized.has(userId) ? result.penalty : 0,
+    }));
+}
+
+function historySettlementBody(eventCount: number, reputationDelta: number): string {
+    const eventLabel = eventCount === 1 ? '1 evento antigo' : `${eventCount} eventos antigos`;
+    if (reputationDelta > 0) return `Atualizamos ${eventLabel} do seu histórico. Saldo de reputação: +${reputationDelta} pontos.`;
+    if (reputationDelta < 0) return `Atualizamos ${eventLabel} do seu histórico. Saldo de reputação: ${reputationDelta} pontos.`;
+    return `Atualizamos ${eventLabel} do seu histórico sem recalcular sua reputação.`;
+}
+
+async function deliverHistorySettlementSummaries(
+    summaries: HistorySettlementSummary[],
+    dateKey: string,
+): Promise<void> {
+    if (summaries.length === 0) return;
+
+    const totals = new Map<string, HistorySettlementSummary>();
+    summaries.forEach((summary) => {
+        const current = totals.get(summary.userId) ?? { userId: summary.userId, eventCount: 0, reputationDelta: 0 };
+        current.eventCount += summary.eventCount;
+        current.reputationDelta += summary.reputationDelta;
+        totals.set(summary.userId, current);
+    });
+
+    const userIds = [...totals.keys()];
+    const notificationRefs = userIds.map((userId) => db.collection('notifications').doc(`history_settlement_${dateKey}_${userId}`));
+    const [notificationSnapshots, profileSnapshots] = await Promise.all([
+        db.getAll(...notificationRefs),
+        db.getAll(...userIds.map((userId) => db.collection('users').doc(userId))),
+    ]);
+    const profilesById = new Map(profileSnapshots.map((profile) => [profile.id, profile]));
+    const pushSummaries: Array<HistorySettlementSummary & { notificationId: string }> = [];
+    const batch = db.batch();
+
+    notificationSnapshots.forEach((snapshot, index) => {
+        const userId = userIds[index];
+        const profile = profilesById.get(userId);
+        if (!profile?.exists || profile.data()?.banned === true) return;
+        const incoming = totals.get(userId)!;
+        const previousCount = typeof snapshot.data()?.eventCount === 'number' ? snapshot.data()!.eventCount : 0;
+        const previousDelta = typeof snapshot.data()?.reputationDelta === 'number' ? snapshot.data()!.reputationDelta : 0;
+        const eventCount = previousCount + incoming.eventCount;
+        const reputationDelta = previousDelta + incoming.reputationDelta;
+        const notificationId = snapshot.id;
+        batch.set(snapshot.ref, {
+            userId,
+            type: 'history_settlement_summary',
+            title: 'Histórico atualizado',
+            body: historySettlementBody(eventCount, reputationDelta),
+            eventCount,
+            reputationDelta,
+            path: '/(drawer)/(tabs)/agenda?tab=history',
+            ...(!snapshot.exists ? { createdAt: admin.firestore.FieldValue.serverTimestamp() } : {}),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            read: false,
+        }, { merge: true });
+        if (!snapshot.exists) pushSummaries.push({ ...incoming, notificationId });
+    });
+    await batch.commit();
+
+    const pushMessages = (await Promise.all(pushSummaries.map((summary) => pushMessagesForUser(
+        summary.userId,
+        'Histórico atualizado',
+        historySettlementBody(summary.eventCount, summary.reputationDelta),
+        {
+            path: '/(drawer)/(tabs)/agenda',
+            notificationType: 'history_settlement_summary',
+            notificationId: summary.notificationId,
+        },
+        {
+            channel: 'events',
+            priority: 'normal',
+            preferenceField: 'notifyEventUpdates',
+            tag: 'history_settlement_summary',
+            collapseKey: 'history_settlement_summary',
+        },
+    )))).flat();
+    await deliverPushMessages(db, pushMessages);
+}
+
+async function completeEventTransaction(
+    eventRef: FirebaseFirestore.DocumentReference,
+    expectedCreatorId?: string,
+    decisions?: CheckInDecision[]
+): Promise<CompletedEventDetails> {
     return db.runTransaction(async (transaction) => {
         const eventSnap = await transaction.get(eventRef);
         if (!eventSnap.exists) throw new functions.https.HttpsError('not-found', 'Evento não encontrado.');
         const event = eventSnap.data()!;
         if (expectedCreatorId && event.createdBy !== expectedCreatorId) throw new functions.https.HttpsError('permission-denied', 'Apenas o criador pode encerrar este evento.');
-        if (event.status === 'completed') return { noShows: 0, becameFounder: false, alreadyCompleted: true, noCheckIns: false, recipientUserIds: [], title: '' };
+        if (event.status === 'completed') return {
+            noShows: 0,
+            becameFounder: false,
+            alreadyCompleted: true,
+            noCheckIns: false,
+            registeredUserIds: [],
+            checkedInUserIds: [],
+            penalizedUserIds: [],
+            manuallyConfirmedUserIds: [],
+            autoConfirmedUserIds: [],
+            rejectedUserIds: [],
+            penalty: 0,
+            title: '',
+            confirmedCheckIns: 0,
+            rejectedCheckIns: 0,
+            reputationApplied: false,
+        };
         if (event.status === 'cancelled') throw new functions.https.HttpsError('failed-precondition', 'Um evento cancelado não pode ser encerrado.');
 
-        const eventStart = getEventStartDate(event);
-        if (!eventStart || new Date() < eventStart) throw new functions.https.HttpsError('failed-precondition', 'O evento só pode ser encerrado após o horário de início.');
+        const eventEnd = getEventEndDate(event);
+        const now = new Date();
+        if (!eventEnd || now < eventEnd) throw new functions.https.HttpsError('failed-precondition', 'O evento só pode ser encerrado após o horário de término.');
+        const reviewDeadline = getCheckInReviewDeadline(event, eventEnd);
+        const reputationApplied = shouldApplyCompletionReputation(
+            eventEnd.getTime(),
+            event.reputationProcessedAt instanceof admin.firestore.Timestamp,
+        );
 
         const creatorId = typeof event.createdBy === 'string' ? event.createdBy : '';
         const attendees = [...new Set(stringIds(event.attendees))];
-        const checkedInUserIds = [...new Set(stringIds(event.checkedIn))];
+        const previouslyCheckedIn = [...new Set(stringIds(event.checkedIn))];
+        const creatorCheckedIn = Boolean(creatorId && previouslyCheckedIn.includes(creatorId));
+        const pending = pendingCheckIns(event.pendingCheckIns)
+            .filter((request) => attendees.includes(request.userId) && !previouslyCheckedIn.includes(request.userId));
+        const pendingIds = new Set(pending.map(({ userId }) => userId));
+        if (!expectedCreatorId && creatorCheckedIn && pending.length > 0 && now < reviewDeadline) {
+            throw new functions.https.HttpsError('failed-precondition', 'A janela de revisão do organizador ainda está aberta.');
+        }
+        if (expectedCreatorId && creatorCheckedIn && pending.length > 0 && decisions === undefined) {
+            throw new functions.https.HttpsError('failed-precondition', 'Revise todos os check-ins pendentes antes de encerrar o evento.');
+        }
+
+        let acceptedRequests: PendingCheckIn[] = [];
+        let rejectedRequests: PendingCheckIn[] = [];
+        let reviewStatus: 'confirmed' | 'auto_confirmed' = 'auto_confirmed';
+        let reviewedBy: string | null = null;
+        if (decisions !== undefined) {
+            if (!expectedCreatorId || expectedCreatorId !== creatorId || !creatorCheckedIn) {
+                throw new functions.https.HttpsError('permission-denied', 'O organizador precisa fazer check-in para revisar presenças.');
+            }
+            if (!canManuallyReviewCheckIns(event.status, eventEnd.getTime(), reviewDeadline.getTime(), now.getTime())) {
+                throw new functions.https.HttpsError('deadline-exceeded', 'O prazo de duas horas para revisar os check-ins terminou.');
+            }
+            const decisionIds = new Set(decisions.map(({ userId }) => userId));
+            if (decisionIds.size !== pendingIds.size || [...pendingIds].some((userId) => !decisionIds.has(userId))) {
+                throw new functions.https.HttpsError('failed-precondition', 'Revise todas as solicitações pendentes antes de concluir.');
+            }
+            const statusByUserId = new Map(decisions.map((decision) => [decision.userId, decision.status]));
+            acceptedRequests = pending.filter(({ userId }) => statusByUserId.get(userId) === 'confirmed');
+            rejectedRequests = pending.filter(({ userId }) => statusByUserId.get(userId) === 'rejected');
+            reviewStatus = 'confirmed';
+            reviewedBy = creatorId;
+        } else {
+            acceptedRequests = pending;
+        }
+
+        const newlyConfirmedUserIds = acceptedRequests.map(({ userId }) => userId);
+        const checkedInUserIds = [...new Set([...previouslyCheckedIn, ...newlyConfirmedUserIds])];
         const checkedIn = new Set(checkedInUserIds);
         const noCheckIns = checkedInUserIds.length === 0;
         const allRegisteredUserIds = [...new Set([...attendees, ...(creatorId ? [creatorId] : [])])];
         const noShows = noCheckIns
             ? allRegisteredUserIds
-            : attendees.filter((attendeeId) => attendeeId !== creatorId && !checkedIn.has(attendeeId));
+            : allRegisteredUserIds.filter((attendeeId) => !checkedIn.has(attendeeId));
         const noShowPenalty = noCheckIns ? -1 : -20;
         const placeRef = typeof event.placeId === 'string' && event.placeId ? db.collection('places').doc(event.placeId) : null;
         const placeSnap = placeRef ? await transaction.get(placeRef) : null;
-        const becameFounder = Boolean(!noCheckIns && placeRef && (!placeSnap?.exists || !placeSnap.data()?.founderId));
+        const becameFounder = Boolean(creatorId && checkedIn.has(creatorId) && placeRef && (!placeSnap?.exists || !placeSnap.data()?.founderId));
 
-        transaction.update(eventRef, { status: 'completed', pendingCheckIns: [] });
-        noShows.forEach((attendeeId) => transaction.update(db.collection('users').doc(attendeeId), { reputation: admin.firestore.FieldValue.increment(noShowPenalty) }));
-        if (becameFounder && placeRef && creatorId) {
+        const reviewedAt = admin.firestore.Timestamp.now();
+        const rejectedReviews: CheckInReview[] = rejectedRequests.map((request) => ({
+            ...request,
+            status: 'rejected',
+            reviewedAt,
+            reviewedBy,
+        }));
+        const newReviews: CheckInReview[] = [
+            ...acceptedRequests.map((request) => ({ ...request, status: reviewStatus, reviewedAt, reviewedBy })),
+            ...rejectedReviews,
+        ];
+        transaction.update(eventRef, {
+            status: 'completed',
+            checkedIn: checkedInUserIds,
+            pendingCheckIns: [],
+            completedAt: reviewedAt,
+            checkInReviewCompletedAt: reviewedAt,
+            reputationProcessedAt: reviewedAt,
+            reputationProcessingVersion: 2,
+            reputationProcessingMode: reputationApplied ? 'applied' : 'legacy_preserved',
+        });
+        newReviews.forEach((review) => transaction.set(
+            db.collection('eventCheckInReviews').doc(`${eventRef.id}_${review.userId}`),
+            { eventId: eventRef.id, ...review }
+        ));
+        if (reputationApplied) {
+            newlyConfirmedUserIds.forEach((userId) => transaction.update(db.collection('users').doc(userId), {
+                reputation: admin.firestore.FieldValue.increment(10),
+                eventsAttended: admin.firestore.FieldValue.increment(1),
+            }));
+            noShows.forEach((attendeeId) => transaction.update(db.collection('users').doc(attendeeId), { reputation: admin.firestore.FieldValue.increment(noShowPenalty) }));
+        }
+        if (reputationApplied && becameFounder && placeRef && creatorId) {
             const founderName = typeof event.creatorName === 'string' ? event.creatorName : 'Fundador';
             if (placeSnap?.exists) {
                 transaction.update(placeRef, { founderId: creatorId, founderName });
@@ -1319,11 +1847,20 @@ async function completeEventTransaction(eventRef: FirebaseFirestore.DocumentRefe
         }
         return {
             noShows: noShows.length,
-            becameFounder,
+            becameFounder: reputationApplied && becameFounder,
             alreadyCompleted: false,
             noCheckIns,
-            recipientUserIds: noCheckIns ? allRegisteredUserIds : checkedInUserIds,
+            registeredUserIds: allRegisteredUserIds,
+            checkedInUserIds,
+            penalizedUserIds: reputationApplied ? noShows : [],
+            manuallyConfirmedUserIds: reputationApplied && reviewStatus === 'confirmed' ? newlyConfirmedUserIds : [],
+            autoConfirmedUserIds: reputationApplied && reviewStatus === 'auto_confirmed' ? newlyConfirmedUserIds : [],
+            rejectedUserIds: rejectedRequests.map(({ userId }) => userId),
+            penalty: noShowPenalty,
             title: typeof event.title === 'string' ? event.title : 'este evento',
+            confirmedCheckIns: acceptedRequests.length,
+            rejectedCheckIns: rejectedRequests.length,
+            reputationApplied,
         };
     });
 }
@@ -1342,7 +1879,121 @@ export const completeEvent = smallFunction.https.onCall(async (data, context): P
             console.error('[MeetingNotification] completion_delivery_failed', { eventId });
         }
     }
-    return { noShows: result.noShows, becameFounder: result.becameFounder, alreadyCompleted: result.alreadyCompleted, noCheckIns: result.noCheckIns };
+    return {
+        noShows: result.noShows,
+        becameFounder: result.becameFounder,
+        alreadyCompleted: result.alreadyCompleted,
+        noCheckIns: result.noCheckIns,
+        confirmedCheckIns: result.confirmedCheckIns,
+        rejectedCheckIns: result.rejectedCheckIns,
+        callerReputationDelta: result.penalizedUserIds.includes(uid) ? result.penalty : 0,
+    };
+});
+
+export const reviewAndCompleteEvent = smallFunction.https.onCall(async (data, context): Promise<CompleteEventResult> => {
+    const uid = requireAuthenticated(context);
+    const eventId = requireEventId(data);
+    const decisions = requireCheckInDecisions(data);
+    const result = await completeEventTransaction(db.collection('meetings').doc(eventId), uid, decisions);
+    if (!result.alreadyCompleted) {
+        try {
+            await notifyCompletedEvent(eventId, result);
+        } catch {
+            console.error('[MeetingNotification] reviewed_completion_delivery_failed', { eventId });
+        }
+    }
+    console.info('[CheckInReview] event_completed', {
+        confirmed: result.confirmedCheckIns,
+        rejected: result.rejectedCheckIns,
+        noShows: result.noShows,
+    });
+    return {
+        noShows: result.noShows,
+        becameFounder: result.becameFounder,
+        alreadyCompleted: result.alreadyCompleted,
+        noCheckIns: result.noCheckIns,
+        confirmedCheckIns: result.confirmedCheckIns,
+        rejectedCheckIns: result.rejectedCheckIns,
+        callerReputationDelta: result.penalizedUserIds.includes(uid) ? result.penalty : 0,
+    };
+});
+
+/**
+ * Recupera, sob demanda, eventos do histórico que ficaram ativos por atraso do
+ * fechamento diário ou por serem documentos legados sem o campo `status`.
+ * A lista vem da Agenda do próprio usuário e é curta; cada evento ainda é
+ * revalidado no servidor antes da transação idempotente de reputação.
+ */
+export const settleMyExpiredEvents = smallFunction.https.onCall(async (data, context): Promise<{
+    completed: number;
+    alreadySettled: number;
+    skipped: number;
+    failed: number;
+}> => {
+    const uid = requireAuthenticated(context);
+    const eventIds = requireEventIds(data);
+    const currentDate = dateInSaoPaulo();
+    const nowMs = Date.now();
+    let completed = 0;
+    let alreadySettled = 0;
+    let skipped = 0;
+    let failed = 0;
+    const settlementSummaries: HistorySettlementSummary[] = [];
+
+    for (const eventId of eventIds) {
+        const eventRef = db.collection('meetings').doc(eventId);
+        try {
+            const snapshot = await eventRef.get();
+            if (!snapshot.exists) {
+                skipped += 1;
+                continue;
+            }
+            const event = snapshot.data()!;
+            if (event.status === 'completed') {
+                alreadySettled += 1;
+                continue;
+            }
+            const eventEnd = getEventEndDate(event);
+            const belongsToUser = event.createdBy === uid || stringIds(event.attendees).includes(uid);
+            if (!canSettleExpiredEventForUser(
+                event.status,
+                eventEnd?.getTime() ?? null,
+                nowMs,
+                eventEnd ? dateStringInSaoPaulo(eventEnd) : '',
+                currentDate,
+                belongsToUser,
+            )) {
+                skipped += 1;
+                continue;
+            }
+
+            const result = await completeEventTransaction(eventRef);
+            if (result.alreadyCompleted) {
+                alreadySettled += 1;
+                continue;
+            }
+            completed += 1;
+            settlementSummaries.push(...historySettlementSummariesFor(result));
+        } catch {
+            failed += 1;
+            console.error('[EventHistorySettlement] completion_failed');
+        }
+    }
+
+    try {
+        await deliverHistorySettlementSummaries(settlementSummaries, currentDate);
+    } catch {
+        console.error('[EventHistorySettlement] summary_delivery_failed', { recipientCount: settlementSummaries.length });
+    }
+
+    console.info('[EventHistorySettlement] batch_completed', {
+        requested: eventIds.length,
+        completed,
+        alreadySettled,
+        skipped,
+        failed,
+    });
+    return { completed, alreadySettled, skipped, failed };
 });
 
 function dateInSaoPaulo(daysOffset = 0): string {
@@ -1355,6 +2006,28 @@ function dateInSaoPaulo(daysOffset = 0): string {
     }).formatToParts(target);
     const valueFor = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value;
     return `${valueFor('year')}-${valueFor('month')}-${valueFor('day')}`;
+}
+
+function dateStringInSaoPaulo(target: Date): string {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'America/Sao_Paulo',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+    }).formatToParts(target);
+    const valueFor = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value;
+    return `${valueFor('year')}-${valueFor('month')}-${valueFor('day')}`;
+}
+
+function timeStringInSaoPaulo(target: Date): string {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'America/Sao_Paulo',
+        hour: '2-digit',
+        minute: '2-digit',
+        hourCycle: 'h23',
+    }).formatToParts(target);
+    const valueFor = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value;
+    return `${valueFor('hour')}:${valueFor('minute')}`;
 }
 
 async function cleanUpOldEventHistory(): Promise<number> {
@@ -1371,11 +2044,12 @@ async function cleanUpOldEventHistory(): Promise<number> {
     const relatedDocuments: FirebaseFirestore.QueryDocumentSnapshot[] = [];
     for (let index = 0; index < eventIds.length; index += 10) {
         const eventIdChunk = eventIds.slice(index, index + 10);
-        const [invitations, notifications] = await Promise.all([
+        const [invitations, notifications, checkInReviewDocuments] = await Promise.all([
             db.collection('eventInvitations').where('eventId', 'in', eventIdChunk).get(),
             db.collection('notifications').where('meetingId', 'in', eventIdChunk).get(),
+            db.collection('eventCheckInReviews').where('eventId', 'in', eventIdChunk).get(),
         ]);
-        relatedDocuments.push(...invitations.docs, ...notifications.docs);
+        relatedDocuments.push(...invitations.docs, ...notifications.docs, ...checkInReviewDocuments.docs);
     }
 
     const documentsToDelete = [...oldEvents.docs, ...relatedDocuments];
@@ -1387,28 +2061,373 @@ async function cleanUpOldEventHistory(): Promise<number> {
     return oldEvents.size;
 }
 
-// Uma única execução diária: consulta somente eventos ainda ativos de dias anteriores.
-// O limite impede que um volume inesperado transforme a rotina em uma varredura cara.
+async function cleanUpOldNotifications(): Promise<number> {
+    const cutoff = admin.firestore.Timestamp.fromMillis(Date.now() - 90 * 24 * 60 * 60 * 1000);
+    const oldNotifications = await db.collection('notifications')
+        .where('createdAt', '<', cutoff)
+        .orderBy('createdAt', 'asc')
+        .limit(50)
+        .get();
+    if (oldNotifications.empty) return 0;
+
+    const batch = db.batch();
+    oldNotifications.docs.forEach((notification) => batch.delete(notification.ref));
+    await batch.commit();
+    return oldNotifications.size;
+}
+
+const DAILY_RECOMMENDATION_EVENT_LIMIT = 30;
+const DAILY_RECOMMENDATION_DEVICE_LIMIT = 200;
+const DAILY_RECOMMENDATION_USER_LIMIT = 100;
+const RECOMMENDATION_LOCATION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
+function recommendationLocationFrom(settings: FirebaseFirestore.DocumentData | undefined): RecommendationLocation | null {
+    const location = settings?.recommendationLocation;
+    if (!isRecord(location)
+        || typeof location.latitude !== 'number'
+        || typeof location.longitude !== 'number'
+        || !Number.isFinite(location.latitude)
+        || !Number.isFinite(location.longitude)
+        || !(location.updatedAt instanceof admin.firestore.Timestamp)
+        || Date.now() - location.updatedAt.toMillis() > RECOMMENDATION_LOCATION_MAX_AGE_MS) return null;
+    return { latitude: location.latitude, longitude: location.longitude };
+}
+
+function recommendationEventFrom(
+    eventDocument: FirebaseFirestore.QueryDocumentSnapshot,
+): RecommendationEvent | null {
+    const event = eventDocument.data();
+    const start = getEventStartDate(event);
+    const end = getEventEndDate(event);
+    const createdBy = typeof event.createdBy === 'string' ? event.createdBy : '';
+    if (!start || !end || !createdBy) return null;
+    const interests = Array.isArray(event.interests)
+        ? event.interests.filter((interest): interest is string => typeof interest === 'string')
+        : [];
+    if (typeof event.theme === 'string') interests.push(event.theme);
+    return {
+        eventId: eventDocument.id,
+        title: typeof event.title === 'string' && event.title.trim() ? event.title.trim() : 'Evento',
+        type: event.type === 'online' ? 'online' : 'in-person',
+        interests,
+        latitude: typeof event.lat === 'number' && Number.isFinite(event.lat) ? event.lat : null,
+        longitude: typeof event.lng === 'number' && Number.isFinite(event.lng) ? event.lng : null,
+        startsAtMs: start.getTime(),
+        endsAtMs: end.getTime(),
+        createdBy,
+        attendees: stringIds(event.attendees),
+    };
+}
+
+// Uma execução diária e limitada. O trabalho é proporcional aos aparelhos com
+// push ativo, não ao total histórico de usuários, eventos ou notificações.
+export const dailyEventRecommendations = dailyFunction.pubsub
+    .schedule('0 9 * * *')
+    .timeZone('America/Sao_Paulo')
+    .onRun(async () => {
+        const today = dateInSaoPaulo();
+        const [eventSnapshot, deviceSnapshot] = await Promise.all([
+            db.collection('meetings')
+                .where('status', '==', 'active')
+                .where('date', '==', today)
+                .limit(DAILY_RECOMMENDATION_EVENT_LIMIT)
+                .get(),
+            db.collection('pushDevices')
+                .limit(DAILY_RECOMMENDATION_DEVICE_LIMIT)
+                .get(),
+        ]);
+        const nowMs = Date.now();
+        const events = eventSnapshot.docs
+            .map(recommendationEventFrom)
+            .filter((event): event is RecommendationEvent => event !== null && event.endsAtMs > nowMs);
+        const recipientIds = [...new Set(deviceSnapshot.docs
+            .map((device) => device.data().userId)
+            .filter((userId): userId is string => typeof userId === 'string' && userId.length > 0))]
+            .slice(0, DAILY_RECOMMENDATION_USER_LIMIT);
+        if (events.length === 0 || recipientIds.length === 0) {
+            console.info('[DailyRecommendation] no_candidates', { eventCount: events.length, recipientCount: recipientIds.length });
+            return null;
+        }
+
+        const [profiles, settingsDocuments] = await Promise.all([
+            db.getAll(...recipientIds.map((userId) => db.collection('users').doc(userId))),
+            db.getAll(...recipientIds.map((userId) => db.collection('notificationSettings').doc(userId))),
+        ]);
+        const settingsByUserId = new Map(settingsDocuments.map((settings) => [settings.id, settings.data()]));
+        const deliveries = profiles.flatMap((profile): EventNotificationDelivery[] => {
+            const profileData = profile.data();
+            if (!profile.exists || !profileData || profileData.banned === true) return [];
+            const settings = settingsByUserId.get(profile.id);
+            if (settings?.notifyRecommendations !== true) return [];
+            const user: RecommendationUser = {
+                userId: profile.id,
+                interests: Array.isArray(profileData.interests)
+                    ? profileData.interests.filter((interest: unknown): interest is string => typeof interest === 'string')
+                    : [],
+                location: recommendationLocationFrom(settings),
+            };
+            const selectedEvent = selectDailyRecommendation(events, user, nowMs);
+            if (!selectedEvent) return [];
+            const inProgress = selectedEvent.startsAtMs <= nowMs;
+            return [{
+                id: `daily_recommendation_${today}_${profile.id}`,
+                userId: profile.id,
+                type: 'daily_event_recommendation',
+                title: inProgress ? 'Um evento do seu interesse está acontecendo' : 'Evento do seu interesse hoje',
+                body: selectedEvent.type === 'online'
+                    ? `"${selectedEvent.title}" é online e combina com seus interesses.`
+                    : `"${selectedEvent.title}" acontece hoje perto de você.`,
+                meetingId: selectedEvent.eventId,
+                preferenceField: 'notifyRecommendations',
+                channel: 'recommendations',
+            }];
+        });
+        if (deliveries.length === 0) {
+            console.info('[DailyRecommendation] no_matches', { eventCount: events.length, recipientCount: recipientIds.length });
+            return null;
+        }
+
+        // O job roda sempre no mesmo horário. Consultar hoje e os dois dias
+        // anteriores cria um cooldown de 72 horas sem outro documento de estado,
+        // escrita adicional ou consulta aberta por usuário.
+        const cooldownReferences = deliveries.flatMap((delivery) =>
+            recommendationCooldownNotificationIds(today, delivery.userId)
+                .map((notificationId) => db.collection('notifications').doc(notificationId))
+        );
+        const existingNotifications = await db.getAll(...cooldownReferences);
+        const existingIds = new Set(existingNotifications.filter((notification) => notification.exists).map((notification) => notification.id));
+        const newDeliveries = deliveries.filter((delivery) =>
+            canSendDailyRecommendation(today, delivery.userId, existingIds)
+        );
+        if (newDeliveries.length > 0) {
+            const notificationBatch = db.batch();
+            newDeliveries.forEach((delivery) => notificationBatch.create(db.collection('notifications').doc(delivery.id), {
+                userId: delivery.userId,
+                type: delivery.type,
+                title: delivery.title,
+                body: delivery.body,
+                meetingId: delivery.meetingId,
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                read: false,
+            }));
+            await notificationBatch.commit();
+
+            const deliveryByUserId = new Map(newDeliveries.map((delivery) => [delivery.userId, delivery]));
+            const pushMessages = deviceSnapshot.docs.flatMap((device): PushMessage[] => {
+                const deviceData = device.data();
+                const userId = typeof deviceData.userId === 'string' ? deviceData.userId : '';
+                const delivery = deliveryByUserId.get(userId);
+                if (!delivery) return [];
+                return [{
+                    userId,
+                    registrationPath: device.ref.path,
+                    expoToken: typeof deviceData.expoPushToken === 'string' ? deviceData.expoPushToken : undefined,
+                    nativeToken: typeof deviceData.nativePushToken === 'string' ? deviceData.nativePushToken : undefined,
+                    platform: typeof deviceData.platform === 'string' ? deviceData.platform : undefined,
+                    title: delivery.title,
+                    body: delivery.body,
+                    data: {
+                        path: `/event/${delivery.meetingId}`,
+                        meetingId: delivery.meetingId,
+                        notificationType: delivery.type,
+                    },
+                    channel: 'recommendations',
+                    priority: 'normal',
+                    tag: 'daily_event_recommendation',
+                    collapseKey: 'daily_event_recommendation',
+                }];
+            });
+            try {
+                await deliverPushMessages(db, pushMessages);
+            } catch {
+                console.error('[DailyRecommendation] push_delivery_failed', { recipientCount: newDeliveries.length });
+            }
+        }
+        console.info('[DailyRecommendation] completed', {
+            eventCount: events.length,
+            recipientCount: recipientIds.length,
+            matched: deliveries.length,
+            delivered: newDeliveries.length,
+        });
+        return null;
+    });
+
+type CheckInReviewWindow = {
+    creatorId: string;
+    eventTitle: string;
+    pendingCount: number;
+    deadline: Date;
+};
+
+async function openCheckInReviewWindow(
+    eventRef: FirebaseFirestore.DocumentReference,
+    now: Date,
+): Promise<CheckInReviewWindow | null> {
+    return db.runTransaction(async (transaction) => {
+        const snapshot = await transaction.get(eventRef);
+        if (!snapshot.exists) return null;
+        const event = snapshot.data()!;
+        if (event.status !== 'active') return null;
+
+        const eventEnd = getEventEndDate(event);
+        const creatorId = typeof event.createdBy === 'string' ? event.createdBy : '';
+        const creatorCheckedIn = creatorId !== '' && stringIds(event.checkedIn).includes(creatorId);
+        const attendees = new Set(stringIds(event.attendees));
+        const alreadyCheckedIn = new Set(stringIds(event.checkedIn));
+        const pending = pendingCheckIns(event.pendingCheckIns)
+            .filter((request) => attendees.has(request.userId) && !alreadyCheckedIn.has(request.userId));
+        if (!eventEnd || eventEnd > now || !creatorCheckedIn || pending.length === 0) return null;
+
+        const deadline = new Date(eventEnd.getTime() + CHECK_IN_REVIEW_WINDOW_MS);
+        if (deadline <= now) return null;
+
+        transaction.update(eventRef, {
+            status: 'awaiting_review',
+            checkInReviewStartedAt: admin.firestore.Timestamp.fromDate(now),
+            checkInReviewDeadlineAt: admin.firestore.Timestamp.fromDate(deadline),
+        });
+        return {
+            creatorId,
+            eventTitle: typeof event.title === 'string' && event.title.trim() ? event.title.trim() : 'Evento',
+            pendingCount: pending.length,
+            deadline,
+        };
+    });
+}
+
+async function processCompletedEventForSchedule(
+    eventId: string,
+    eventRef: FirebaseFirestore.DocumentReference,
+    completionDeliveries: EventNotificationDelivery[],
+): Promise<boolean> {
+    const result = await completeEventTransaction(eventRef);
+    if (result.alreadyCompleted) return false;
+    if (result.reputationApplied) {
+        completionDeliveries.push(...completedEventDeliveries(eventId, result));
+    }
+    return true;
+}
+
+// Uma única rotina curta, a cada cinco minutos, cobre dois momentos confiáveis:
+// abre a revisão após o término e conclui automaticamente ao vencer as duas horas.
+// As consultas são indexadas, limitadas e não percorrem o histórico do app.
+export const processEventCheckInReviews = dailyFunction.pubsub
+    .schedule('every 5 minutes')
+    .timeZone('America/Sao_Paulo')
+    .onRun(async () => {
+        const now = new Date();
+        const nowTimestamp = admin.firestore.Timestamp.fromDate(now);
+        const [endedActiveEvents, expiredReviewWindows] = await Promise.all([
+            db.collection('meetings')
+                .where('status', '==', 'active')
+                .where('endsAt', '<=', nowTimestamp)
+                .orderBy('endsAt', 'asc')
+                .limit(50)
+                .get(),
+            db.collection('meetings')
+                .where('status', '==', 'awaiting_review')
+                .where('checkInReviewDeadlineAt', '<=', nowTimestamp)
+                .orderBy('checkInReviewDeadlineAt', 'asc')
+                .limit(50)
+                .get(),
+        ]);
+
+        const reviewDeliveries: EventNotificationDelivery[] = [];
+        const completionDeliveries: EventNotificationDelivery[] = [];
+        let reviewsOpened = 0;
+        let completed = 0;
+
+        for (const eventDocument of endedActiveEvents.docs) {
+            try {
+                const reviewWindow = await openCheckInReviewWindow(eventDocument.ref, now);
+                if (reviewWindow) {
+                    reviewsOpened += 1;
+                    const compactTitle = reviewWindow.eventTitle.length > 42
+                        ? `${reviewWindow.eventTitle.slice(0, 39)}...`
+                        : reviewWindow.eventTitle;
+                    reviewDeliveries.push({
+                        id: `checkin_review_ready_${eventDocument.id}_${reviewWindow.creatorId}`,
+                        userId: reviewWindow.creatorId,
+                        type: 'checkin_review_ready',
+                        title: 'Revise os check-ins do evento',
+                        body: `${reviewWindow.pendingCount} presença(s) de "${compactTitle}" aguardam sua validação até ${timeStringInSaoPaulo(reviewWindow.deadline)}.`,
+                        meetingId: eventDocument.id,
+                    });
+                    continue;
+                }
+                if (await processCompletedEventForSchedule(eventDocument.id, eventDocument.ref, completionDeliveries)) {
+                    completed += 1;
+                }
+            } catch (error) {
+                console.error('[CheckInReviewSchedule] active_event_failed', {
+                    eventId: eventDocument.id,
+                    code: error instanceof functions.https.HttpsError ? error.code : 'unknown',
+                });
+            }
+        }
+
+        for (const eventDocument of expiredReviewWindows.docs) {
+            try {
+                if (await processCompletedEventForSchedule(eventDocument.id, eventDocument.ref, completionDeliveries)) {
+                    completed += 1;
+                }
+            } catch (error) {
+                console.error('[CheckInReviewSchedule] expired_review_failed', {
+                    eventId: eventDocument.id,
+                    code: error instanceof functions.https.HttpsError ? error.code : 'unknown',
+                });
+            }
+        }
+
+        try {
+            await deliverEventNotifications([...reviewDeliveries, ...completionDeliveries]);
+        } catch {
+            console.error('[CheckInReviewSchedule] notification_delivery_failed', {
+                reviewCount: reviewDeliveries.length,
+                completionCount: completionDeliveries.length,
+            });
+        }
+        console.info('[CheckInReviewSchedule] run_completed', {
+            activeCandidates: endedActiveEvents.size,
+            expiredCandidates: expiredReviewWindows.size,
+            reviewsOpened,
+            completed,
+        });
+        return null;
+    });
+
+// Uma execução diária mantém o tratamento de eventos legados e a limpeza.
+// Eventos modernos são processados pela rotina indexada de revisão acima.
 export const closeExpiredEventsDaily = dailyFunction.pubsub
     .schedule('10 0 * * *')
     .timeZone('America/Sao_Paulo')
     .onRun(async () => {
-        const lastEligibleDate = dateInSaoPaulo(-1);
-        const expiredEvents = await db.collection('meetings')
+        const lastEligibleDate = dateInSaoPaulo();
+        const activeCandidates = await db.collection('meetings')
             .where('status', '==', 'active')
             .where('date', '<=', lastEligibleDate)
             .orderBy('date', 'asc')
             .limit(50)
             .get();
+        const now = new Date();
+        const expiredEvents = activeCandidates.docs.filter((eventDocument) => {
+            const end = getEventEndDate(eventDocument.data());
+            return Boolean(end && end <= now);
+        });
 
         let completed = 0;
         const completionDeliveries: EventNotificationDelivery[] = [];
-        for (const eventDocument of expiredEvents.docs) {
+        const legacySettlementSummaries: HistorySettlementSummary[] = [];
+        for (const eventDocument of expiredEvents) {
             try {
                 const result = await completeEventTransaction(eventDocument.ref);
                 if (!result.alreadyCompleted) {
                     completed += 1;
-                    completionDeliveries.push(...completedEventDeliveries(eventDocument.id, result));
+                    if (result.reputationApplied) {
+                        completionDeliveries.push(...completedEventDeliveries(eventDocument.id, result));
+                    } else {
+                        legacySettlementSummaries.push(...historySettlementSummariesFor(result));
+                    }
                 }
             } catch {
                 console.error('[EventAutoClose] completion_failed', { eventId: eventDocument.id });
@@ -1416,11 +2435,22 @@ export const closeExpiredEventsDaily = dailyFunction.pubsub
         }
         try {
             await deliverEventNotifications(completionDeliveries);
+            await deliverHistorySettlementSummaries(legacySettlementSummaries, dateInSaoPaulo());
         } catch {
-            console.error('[EventAutoClose] notification_delivery_failed', { recipientCount: completionDeliveries.length });
+            console.error('[EventAutoClose] notification_delivery_failed', {
+                recipientCount: completionDeliveries.length + legacySettlementSummaries.length,
+            });
         }
-        const cleaned = expiredEvents.size < 50 ? await cleanUpOldEventHistory() : 0;
-        console.info('[EventAutoClose] daily_run_completed', { scanned: expiredEvents.size, completed, cleaned });
+        const canRunMaintenance = activeCandidates.size < 50;
+        const cleaned = canRunMaintenance ? await cleanUpOldEventHistory() : 0;
+        const notificationsCleaned = canRunMaintenance ? await cleanUpOldNotifications() : 0;
+        console.info('[EventAutoClose] daily_run_completed', {
+            scanned: activeCandidates.size,
+            expired: expiredEvents.length,
+            completed,
+            cleaned,
+            notificationsCleaned,
+        });
         return null;
     });
 
@@ -1436,6 +2466,10 @@ export const cancelEvent = smallFunction.https.onCall(async (data, context) => {
         const event = eventSnap.data()!;
         if (event.createdBy !== uid) throw new functions.https.HttpsError('permission-denied', 'Apenas o criador pode cancelar.');
         if (event.status && event.status !== 'active') return { penalized: false, alreadyClosed: true, cancelledEvent: null };
+        const eventEnd = getEventEndDate(event);
+        if (!canCancelEventAt(event.status, eventEnd?.getTime() ?? null, Date.now())) {
+            throw new functions.https.HttpsError('failed-precondition', 'Eventos que já terminaram não podem ser cancelados.');
+        }
 
         const hasOtherAttendees = stringIds(event.attendees).some((attendeeId) => attendeeId !== uid);
         transaction.update(eventRef, { status: 'cancelled' });
@@ -1491,6 +2525,12 @@ export const removeReportedEvent = smallFunction.https.onCall(async (data, conte
         } catch {
             console.error('[Moderation] reported_event_notification_failed', { eventId });
         }
+        await notifyReportersOfModerationAction(
+            'event',
+            eventId,
+            'A moderação analisou sua denúncia e removeu o evento informado.',
+            `/event/${eventId}`
+        ).catch(() => console.error('[Moderation] reporter_resolution_failed', { targetType: 'event' }));
     }
     console.info('[Moderation] reported_event_removed', { removed: result.removed });
     return { ok: true, removed: result.removed };
@@ -1500,15 +2540,15 @@ export const banUser = smallFunction.https.onCall(async (data, context) => {
     const moderatorId = await requireStaff(context);
     const targetUserId = requireDocumentIdField(data, 'targetUserId', 128);
     if (targetUserId === moderatorId) {
-        throw new functions.https.HttpsError('failed-precondition', 'VocÃª nÃ£o pode banir sua prÃ³pria conta.');
+        throw new functions.https.HttpsError('failed-precondition', 'Você não pode banir sua própria conta.');
     }
 
     const targetUserRef = db.collection('users').doc(targetUserId);
     const targetProfile = await targetUserRef.get();
-    if (!targetProfile.exists) throw new functions.https.HttpsError('not-found', 'UsuÃ¡rio nÃ£o encontrado.');
+    if (!targetProfile.exists) throw new functions.https.HttpsError('not-found', 'Usuário não encontrado.');
     const targetRole = targetProfile.data()?.role;
     if (targetRole === 'admin' || targetRole === 'moderator') {
-        throw new functions.https.HttpsError('permission-denied', 'Contas da moderaÃ§Ã£o nÃ£o podem ser banidas por esta ferramenta.');
+        throw new functions.https.HttpsError('permission-denied', 'Contas da moderação não podem ser banidas por esta ferramenta.');
     }
 
     await Promise.all([
@@ -1521,8 +2561,8 @@ export const banUser = smallFunction.https.onCall(async (data, context) => {
         bannedBy: moderatorId,
     }, { merge: true });
 
-    // A conta continua marcada como banida para impedir nova sessÃ£o; as demais
-    // relaÃ§Ãµes do usuÃ¡rio saem do app por consultas limitadas e sob demanda.
+    // A conta continua marcada como banida para impedir nova sessão; as demais
+    // relações do usuário saem do app por consultas limitadas e sob demanda.
     const createdEvents = await db.collection('meetings').where('createdBy', '==', targetUserId).limit(200).get();
     const eventsToCancel = createdEvents.docs.filter((eventDocument) => {
         const status = eventDocument.data().status;
@@ -1551,7 +2591,7 @@ export const banUser = smallFunction.https.onCall(async (data, context) => {
         (batch, document) => batch.update(document.ref, {
             participants: admin.firestore.FieldValue.arrayRemove(targetUserId),
             deletedBy: admin.firestore.FieldValue.arrayUnion(targetUserId),
-            [`participantNames.${targetUserId}`]: 'UsuÃ¡rio banido',
+            [`participantNames.${targetUserId}`]: 'Usuário banido',
             [`unreadCounts.${targetUserId}`]: admin.firestore.FieldValue.delete(),
         })
     );
@@ -1567,6 +2607,16 @@ export const banUser = smallFunction.https.onCall(async (data, context) => {
         db.collection('eventInvitations').where('inviteeId', '==', targetUserId),
         (batch, document) => batch.delete(document.ref)
     );
+    await processQueryInBatches(
+        db.collection('eventCheckInReviews').where('userId', '==', targetUserId),
+        (batch, document) => batch.delete(document.ref)
+    );
+    await processQueryInBatches(
+        db.collection('pushDevices').where('userId', '==', targetUserId),
+        (batch, document) => batch.delete(document.ref)
+    );
+    await db.collection('pushTokens').doc(targetUserId).delete().catch(() => undefined);
+    await db.collection('notificationSettings').doc(targetUserId).delete().catch(() => undefined);
     await processQueryInBatches(
         targetUserRef.collection('favoriteEvents'),
         (batch, document) => batch.delete(document.ref)
@@ -1592,13 +2642,23 @@ export const banUser = smallFunction.https.onCall(async (data, context) => {
     await admin.storage().bucket().deleteFiles({ prefix: `avatars/${targetUserId}_` }).catch(() => {
         console.warn('[Moderation] banned_avatar_cleanup_failed');
     });
+    await notifyReportersOfModerationAction(
+        'user',
+        targetUserId,
+        'A moderação analisou a denúncia e tomou uma medida sobre a conta informada.',
+        '/notifications'
+    ).catch(() => console.error('[Moderation] reporter_resolution_failed', { targetType: 'user' }));
     console.info('[Moderation] user_banned', { cancelledEvents: eventsToCancel.length });
     return { ok: true, cancelledEvents: eventsToCancel.length };
 });
 
-export const deleteMyAccount = smallFunction.https.onCall(async (_data, context) => {
-    const uid = requireAuthenticated(context);
+export const deleteMyAccount = accountFunction.https.onCall(async (_data, context) => {
+    const uid = requireRecentAuthentication(context);
     const userRef = db.collection('users').doc(uid);
+    const userSnapshot = await userRef.get();
+    const searchName = typeof userSnapshot.data()?.searchName === 'string'
+        ? userSnapshot.data()!.searchName
+        : null;
     console.info('[AccountDeletion] started');
 
     // Cada atualização remove o documento do resultado da própria consulta. Isso evita
@@ -1612,6 +2672,12 @@ export const deleteMyAccount = smallFunction.https.onCall(async (_data, context)
         (batch, document) => batch.delete(document.ref)
     );
     await processQueryInBatches(
+        db.collection('pushDevices').where('userId', '==', uid),
+        (batch, document) => batch.delete(document.ref)
+    );
+    await db.collection('pushTokens').doc(uid).delete().catch(() => undefined);
+    await db.collection('notificationSettings').doc(uid).delete().catch(() => undefined);
+    await processQueryInBatches(
         db.collection('reports').where('reportedBy', '==', uid),
         (batch, document) => batch.delete(document.ref)
     );
@@ -1621,6 +2687,10 @@ export const deleteMyAccount = smallFunction.https.onCall(async (_data, context)
     );
     await processQueryInBatches(
         db.collection('eventInvitations').where('inviteeId', '==', uid),
+        (batch, document) => batch.delete(document.ref)
+    );
+    await processQueryInBatches(
+        db.collection('eventCheckInReviews').where('userId', '==', uid),
         (batch, document) => batch.delete(document.ref)
     );
     await processQueryInBatches(
@@ -1661,6 +2731,11 @@ export const deleteMyAccount = smallFunction.https.onCall(async (_data, context)
         })
     );
 
+    if (searchName) {
+        const nicknameRef = db.collection('nicknames').doc(searchName);
+        const nicknameSnapshot = await nicknameRef.get();
+        if (nicknameSnapshot.data()?.uid === uid) await nicknameRef.delete();
+    }
     await userRef.delete();
     await admin.storage().bucket().deleteFiles({ prefix: `avatars/${uid}_` }).catch(() => {
         console.warn('[AccountDeletion] avatar_cleanup_failed');

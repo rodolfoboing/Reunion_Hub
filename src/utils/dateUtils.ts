@@ -57,6 +57,11 @@ export function getCurrentTimeStr(now = new Date()): string {
     return `${parts.hour}:${parts.minute}`;
 }
 
+export function getDateStr(now: Date): string {
+    const parts = saoPauloParts(now);
+    return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
 export function getDateAfterDays(days: number, now = new Date()): string {
     const [year, month, day] = getTodayStr(now).split('-').map(Number);
     const date = new Date(Date.UTC(year, month - 1, day + Math.trunc(days)));

@@ -2,11 +2,11 @@ import { ErrorState } from '@/src/components/ErrorState';
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as Location from 'expo-location';
-import { router, useFocusEffect } from 'expo-router';
+import { router, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import { collection, doc, getDocs, onSnapshot, query, where, limit, orderBy } from 'firebase/firestore';
 import { httpsCallable } from 'firebase/functions';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, Animated, FlatList, LayoutAnimation, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, TouchableOpacity, UIManager, View } from 'react-native';
+import { ActivityIndicator, Alert, Animated, FlatList, LayoutAnimation, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, ToastAndroid, TouchableOpacity, UIManager, View } from 'react-native';
 import { Calendar, LocaleConfig } from 'react-native-calendars';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -14,25 +14,27 @@ import { Meeting } from '../../../src/types';
 import { STRINGS } from '../../../src/constants/strings';
 import { CONFIG } from '../../../src/constants/Config';
 import { normalizeDate, getTodayStr, getDateAfterDays } from '../../../src/utils/dateUtils';
-import { formatEventTimeRange, isEventInProgress } from '../../../src/utils/eventSchedule';
+import { canCancelActiveEvent, canFavoriteAttendedEvent, canLeaveActiveEvent, canRequestFavoriteAttendedEvent, formatEventTimeRange, getEventInterval, getEventJourneyState, hasEventEnded } from '../../../src/utils/eventSchedule';
 import { useEventClock } from '../../../src/hooks/useEventClock';
 import { auth, db, functions } from '../../../src/services/firebaseConfig';
-import { hasMatchingInterest, normalizeInterests } from '../../../src/constants/Interests';
-import { scheduleEventReminders, syncEventReminders } from '../../../src/utils/Notifications';
+import { normalizeInterests } from '../../../src/constants/Interests';
+import { cancelEventReminder, scheduleEventReminders, syncEventReminders } from '../../../src/utils/Notifications';
+import { DISCOVERY_REASON_LABELS, getEventDiscovery } from '../../../src/utils/eventDiscovery';
+import { ReputationFeedbackModal } from '../../../src/components/ReputationFeedbackModal';
 
 type FavoriteActionState = 'idle' | 'saving' | 'added' | 'removed';
 type PendingRepeatRequest = { sourceEventId: string; date: string; requestId: string };
+
+function eventScheduleMillis(event: Pick<Meeting, 'date' | 'time' | 'endDate' | 'endTime'>, boundary: 'start' | 'end'): number {
+    const interval = getEventInterval(event);
+    return interval?.[boundary].getTime() ?? 0;
+}
 
 if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
     UIManager.setLayoutAnimationEnabledExperimental(true);
 }
 
 import { getDistanceFromLatLonInKm } from '../../../src/utils/distance';
-
-const matchesUserInterest = (event: Pick<Meeting, 'interests' | 'theme'>, interests: string[]) => {
-    if (interests.length === 0) return false;
-    return hasMatchingInterest([...(event.interests || []), event.theme], interests);
-};
 
 // Configure Locale for Calendar
 LocaleConfig.locales['pt-br'] = {
@@ -123,8 +125,17 @@ const CalendarDayCell = ({ date, state, marking, onPress }: any) => {
 
 export default function AgendaScreen() {
     const eventClock = useEventClock();
+    const { tab: requestedTab } = useLocalSearchParams<{ tab?: string }>();
     // Tab State: 'upcoming' | 'history' | 'favorites'
     const [activeTab, setActiveTab] = useState<'upcoming' | 'history' | 'favorites'>('upcoming');
+
+    useEffect(() => {
+        if (requestedTab === 'history' || requestedTab === 'favorites' || requestedTab === 'upcoming') {
+            setSelectedDate('');
+            setSelectedEvent(null);
+            setActiveTab(requestedTab);
+        }
+    }, [requestedTab]);
 
     // Data State
     const [filteredEvents, setFilteredEvents] = useState<any[]>([]);
@@ -138,6 +149,7 @@ export default function AgendaScreen() {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(false);
     const [selectedEvent, setSelectedEvent] = useState<any>(null);
+    const [cancellationPenalty, setCancellationPenalty] = useState(false);
     const [showFavoriteRepeatDatePicker, setShowFavoriteRepeatDatePicker] = useState(false);
     const [recommendations, setRecommendations] = useState<any[]>([]);
     const [allRecs, setAllRecs] = useState<any[]>([]);
@@ -147,8 +159,18 @@ export default function AgendaScreen() {
     const favoriteHeartScale = useRef(new Animated.Value(1)).current;
     const favoriteFeedbackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
     const pendingRepeatRequestRef = useRef<PendingRepeatRequest | null>(null);
+    const fetchRequestId = useRef(0);
+    const settlementAttemptedEventIds = useRef(new Set<string>());
 
     const isMounted = useRef(true);
+    const getAgendaDiscovery = (meeting: Meeting) => getEventDiscovery(meeting, {
+        userCoordinates: userLocation
+            ? { latitude: userLocation.coords.latitude, longitude: userLocation.coords.longitude }
+            : null,
+        userInterests,
+        historyTitles,
+        now: eventClock,
+    });
 
     useEffect(() => {
         if (favoriteFeedbackTimer.current) {
@@ -166,10 +188,13 @@ export default function AgendaScreen() {
     useFocusEffect(
         useCallback(() => {
             isMounted.current = true;
+            settlementAttemptedEventIds.current.clear();
             setRefreshKey((current) => current + 1);
             let unsubProfile: any;
             const unsubscribeAuth = auth.onAuthStateChanged((user) => {
                 if (user && isMounted.current) {
+                    setRefreshKey((current) => current + 1);
+                    if (unsubProfile) unsubProfile();
                     unsubProfile = onSnapshot(doc(db, 'users', user.uid), (snap) => {
                         if (snap.exists() && isMounted.current) {
                             setFavorites(snap.data().favorites || []);
@@ -181,18 +206,21 @@ export default function AgendaScreen() {
             });
 
             (async () => {
-                let { status } = await Location.requestForegroundPermissionsAsync();
+                const { status } = await Location.requestForegroundPermissionsAsync();
                 if (status === 'granted') {
-                    let lastLoc = await Location.getLastKnownPositionAsync();
+                    const lastLoc = await Location.getLastKnownPositionAsync();
                     if (lastLoc && isMounted.current) setUserLocation(lastLoc);
                     
-                    let loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+                    const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
                     if (isMounted.current) setUserLocation(loc);
                 }
-            })();
+            })().catch((locationError: unknown) => {
+                if (__DEV__) console.warn('[Agenda] location_unavailable', locationError instanceof Error ? locationError.message : 'unknown');
+            });
 
             return () => {
                 isMounted.current = false;
+                fetchRequestId.current += 1;
                 unsubscribeAuth();
                 if (unsubProfile) unsubProfile();
             };
@@ -201,14 +229,13 @@ export default function AgendaScreen() {
 
     useEffect(() => {
         fetchEvents();
-    }, [activeTab, favorites.length, selectedDate, userLocation, userInterests.join(','), showPopularOutsideInterests, refreshKey]);
+    }, [activeTab, favorites.join(','), selectedDate, userLocation, userInterests.join(','), showPopularOutsideInterests, refreshKey]);
 
     useEffect(() => {
         if (allRecs.length === 0) return;
 
         const todayStr = getTodayStr();
         const maxDateStr = getDateAfterDays(CONFIG.AGENDA_DISCOVERY_DAYS);
-        
         let finalRecs = allRecs.filter((e: any) => {
             if (!e.date) return false;
             // Futuros em até 30 dias
@@ -216,15 +243,14 @@ export default function AgendaScreen() {
             return true;
         });
 
-        // Baseado em histórico ou categoria de interesse
-        if (userInterests.length > 0 || historyTitles.length > 0) {
-            finalRecs = finalRecs.filter((e: any) => {
-                const matchesInterest = matchesUserInterest(e, userInterests);
-                const matchesHistory = historyTitles.includes(e.title);
-                const isPopular = (e.attendees?.length || 0) >= CONFIG.POPULAR_ATTENDEES_COUNT;
-                return matchesInterest || matchesHistory || (showPopularOutsideInterests && isPopular);
-            });
-        }
+        // Recomendado é uma classificação local: interesse/histórico ou,
+        // quando permitido no perfil, popularidade contextual.
+        finalRecs = finalRecs.filter((event: Meeting) => {
+            const discovery = getAgendaDiscovery(event);
+            const personalized = discovery.reasons.includes('interest') || discovery.reasons.includes('history');
+            return discovery.isRecommended
+                && (personalized || (showPopularOutsideInterests && discovery.reasons.includes('popular')));
+        });
 
         // Próximos (<= CONFIG.NEARBY_RADIUS_KM) ou Online
         if (userLocation && finalRecs.length > 0) {
@@ -241,11 +267,16 @@ export default function AgendaScreen() {
         }
 
         setRecommendations(finalRecs.slice(0, 10));
-    }, [allRecs, userInterests, historyTitles, userLocation, showPopularOutsideInterests]);
+    }, [allRecs, userInterests, historyTitles, userLocation, showPopularOutsideInterests, eventClock]);
 
     const fetchEvents = async () => {
+        const requestId = ++fetchRequestId.current;
+        const isLatestRequest = () => isMounted.current && requestId === fetchRequestId.current;
         const currentUid = auth.currentUser?.uid;
-        if (!currentUid || !isMounted.current) return;
+        if (!currentUid || !isMounted.current) {
+            if (isLatestRequest()) setLoading(false);
+            return;
+        }
 
         setLoading(true);
         setError(false);
@@ -253,13 +284,6 @@ export default function AgendaScreen() {
             const todayStr = getTodayStr();
 
             if (activeTab === 'favorites') {
-                if (favorites.length === 0) {
-                    setFilteredEvents([]);
-                    setMarkedDates({});
-                    setLoading(false);
-                    return;
-                }
-
                 const favoritesSnapshot = await getDocs(query(
                     collection(db, 'users', currentUid, 'favoriteEvents'),
                     orderBy('favoritedAt', 'desc'),
@@ -268,11 +292,14 @@ export default function AgendaScreen() {
                 const events = favoritesSnapshot.docs.map((favorite) => ({
                     id: favorite.id,
                     ...favorite.data(),
-                    date: normalizeDate(favorite.data().date),
+                    date: normalizeDate(favorite.data().date) || undefined,
                     isFavoriteSnapshot: true,
                 }));
 
-                events.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+                if (!isLatestRequest()) return;
+                const favoriteIds = events.map((event) => event.id);
+                setFavorites((current) => current.join('|') === favoriteIds.join('|') ? current : favoriteIds);
+                events.sort((a, b) => eventScheduleMillis(b, 'end') - eventScheduleMillis(a, 'end'));
                 setFilteredEvents(events);
                 setMarkedDates({});
                 setLoading(false);
@@ -305,14 +332,15 @@ export default function AgendaScreen() {
                     date: normalizeDate(data.date)
                 };
             }).filter((e: any) => e.date !== null && e.status !== 'cancelled');
+            if (!isLatestRequest()) return;
 
             // Local filter for Upcoming vs History
             let results: any[] = [];
             let historyEvents: any[] = [];
 
             if (activeTab === 'upcoming') {
-                results = events.filter((ev: any) => ev.status !== 'completed' && ev.date >= todayStr);
-                historyEvents = events.filter((ev: any) => ev.date < todayStr || ev.status === 'completed');
+                results = events.filter((ev: any) => ev.status !== 'completed' && ev.date >= todayStr && !hasEventEnded(ev, eventClock));
+                historyEvents = events.filter((ev: any) => ev.date < todayStr || ev.status === 'completed' || hasEventEnded(ev, eventClock));
 
                 // Marcações do calendário: cada dia recebe um objeto com as flags de
                 // sinalização (criado por você, recorrente, popular, passado/próximo).
@@ -322,8 +350,8 @@ export default function AgendaScreen() {
                 events.forEach((ev: any) => {
                     if (!ev.date) return;
                     const isMine = ev.createdBy === currentUid;
-                    const isPopular = ev.attendees && ev.attendees.length >= CONFIG.POPULAR_ATTENDEES_COUNT;
-                    const isPast = ev.date.localeCompare(todayStr) < 0;
+                    const isPopular = getAgendaDiscovery(ev).reasons.includes('popular');
+                    const isPast = ev.date.localeCompare(todayStr) < 0 || hasEventEnded(ev, eventClock);
 
                     if (!marks[ev.date]) {
                         marks[ev.date] = { mine: false, recurring: false, popular: false, past: isPast, hasEvent: true };
@@ -335,7 +363,7 @@ export default function AgendaScreen() {
                 setMarkedDates(marks);
 
                 // Sort nearest first
-                results.sort((a: any, b: any) => (a.date || '').localeCompare(b.date || ''));
+                results.sort((a: Meeting, b: Meeting) => eventScheduleMillis(a, 'start') - eventScheduleMillis(b, 'start'));
 
                 // Calculando Recomendações Baseadas em Histórico, Interesses ou Proximidade (Cold Start)
                 const hTitles = [...new Set(historyEvents.map((e: any) => e.title))];
@@ -350,6 +378,7 @@ export default function AgendaScreen() {
                     limit(CONFIG.AGENDA_DISCOVERY_LIMIT)
                 );
                 const snapRec = await getDocs(qRec);
+                if (!isLatestRequest()) return;
                 let fetchedRecs = snapRec.docs
                     .map(d => ({ 
                         id: d.id, 
@@ -367,15 +396,12 @@ export default function AgendaScreen() {
                 
                 setAllRecs(fetchedRecs);
                 fetchedRecs.forEach((event: any) => {
-                    const matchesInterest = matchesUserInterest(event, userInterests);
-                    const hasCoordinates = Number.isFinite(Number(event.lat)) && Number.isFinite(Number(event.lng));
-                    const isNearby = event.type === 'in-person' && !!userLocation && hasCoordinates
-                        && getDistanceFromLatLonInKm(userLocation.coords.latitude, userLocation.coords.longitude, Number(event.lat), Number(event.lng)) <= CONFIG.NEARBY_RADIUS_KM;
-                    const isPopular = isNearby && (event.attendees?.length || 0) >= CONFIG.POPULAR_ATTENDEES_COUNT;
-                    const isRecommended = !!matchesInterest;
+                    const discovery = getAgendaDiscovery(event);
+                    const isPopular = discovery.reasons.includes('popular');
+                    const isRecommended = discovery.reasons.includes('interest') || discovery.reasons.includes('history');
                     if (!isPopular && !isRecommended) return;
                     if (!marks[event.date]) marks[event.date] = { mine: false, recurring: false, popular: false, recommended: false, past: false, hasEvent: true };
-                    if (isPopular && (showPopularOutsideInterests || matchesInterest)) marks[event.date].popular = true;
+                    if (isPopular && (showPopularOutsideInterests || isRecommended)) marks[event.date].popular = true;
                     if (isRecommended) marks[event.date].recommended = true;
                 });
                 setMarkedDates(marks);
@@ -388,24 +414,63 @@ export default function AgendaScreen() {
                     title: event.title || 'Evento',
                     date: event.date,
                     time: event.time,
-                })), currentUid).catch(() => console.warn('[Agenda] local_reminder_schedule_failed'));
+                    endDate: event.endDate,
+                    endTime: event.endTime,
+                    type: event.type,
+                    isOrganizer: event.createdBy === currentUid,
+                })), currentUid).catch(() => undefined);
                 setLoading(false);
                 return;
 
             } else if (activeTab === 'history') {
-                results = events.filter((ev: any) => ev.date < todayStr || ev.status === 'completed');
+                results = events.filter((ev: any) => ev.date < todayStr || ev.status === 'completed' || hasEventEnded(ev, eventClock));
                 setMarkedDates({});
                 // Sort most recent past first
-                results.sort((a: any, b: any) => (b.date || '').localeCompare(a.date || ''));
+                results.sort((a: Meeting, b: Meeting) => eventScheduleMillis(b, 'end') - eventScheduleMillis(a, 'end'));
+
+                // Recupera em um único lote curto eventos de dias anteriores que
+                // ficaram ativos (inclusive legados sem `status`). O servidor
+                // valida vínculo, horário e idempotência antes de calcular pontos.
+                const staleEventIds = results
+                    .filter((event: Meeting) => {
+                        const interval = getEventInterval(event);
+                        return event.status !== 'completed'
+                            && event.status !== 'cancelled'
+                            && Boolean(interval && getTodayStr(interval.end) < todayStr)
+                            && !settlementAttemptedEventIds.current.has(event.id);
+                    })
+                    .slice(0, 10)
+                    .map((event: Meeting) => event.id);
+                if (staleEventIds.length > 0) {
+                    staleEventIds.forEach((eventId) => settlementAttemptedEventIds.current.add(eventId));
+                    void httpsCallable<
+                        { eventIds: string[] },
+                        { completed: number; alreadySettled: number; skipped: number; failed: number }
+                    >(functions, 'settleMyExpiredEvents')({ eventIds: staleEventIds })
+                        .then((settlement) => {
+                            if (isMounted.current && settlement.data.completed > 0) {
+                                setRefreshKey((current) => current + 1);
+                            }
+                            if (__DEV__ && settlement.data.failed > 0) {
+                                console.warn('[Agenda] history_settlement_partial_failure', { failed: settlement.data.failed });
+                            }
+                        })
+                        .catch((settlementError: unknown) => {
+                            if (__DEV__) console.warn(
+                                '[Agenda] history_settlement_failed',
+                                settlementError instanceof Error ? settlementError.message : 'unknown',
+                            );
+                        });
+                }
             }
 
             setFilteredEvents(results);
 
         } catch (error: any) {
             console.error(`${STRINGS.LOG_DB_READ} [Agenda] Erro ao buscar eventos da agenda:`, error.code, error.message);
-            if (isMounted.current) setError(true);
+            if (isLatestRequest()) setError(true);
         } finally {
-            if (isMounted.current) setLoading(false);
+            if (isLatestRequest()) setLoading(false);
         }
     };
 
@@ -457,12 +522,19 @@ export default function AgendaScreen() {
 
     const handleCancelRSVP = async (event: any) => {
         if (!auth.currentUser) return;
+        if (!canLeaveActiveEvent(event, eventClock)) {
+            setSelectedEvent(null);
+            Alert.alert('Presença não pode ser cancelada', 'A saída fica disponível somente antes do horário de início do evento.');
+            return;
+        }
+        const currentUid = auth.currentUser.uid;
         Alert.alert('Cancelar Presença', `Tem certeza que deseja cancelar sua presença em "${event.title}"?`, [
             { text: 'Não', style: 'cancel' },
             {
                 text: 'Sim, Cancelar', style: 'destructive', onPress: async () => {
                     try {
                         await httpsCallable(functions, 'leaveEvent')({ eventId: event.id });
+                        await cancelEventReminder(event.id, currentUid).catch(() => undefined);
                         LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
                         setFilteredEvents(prev => prev.filter(e => e.id !== event.id));
                         setSelectedEvent(null);
@@ -475,6 +547,11 @@ export default function AgendaScreen() {
     };
 
     const handleDeleteEvent = async (event: any) => {
+        if (!canCancelActiveEvent(event, eventClock)) {
+            setSelectedEvent(null);
+            Alert.alert('Evento já encerrado', 'Eventos que já terminaram não podem ser cancelados. Consulte o histórico para acompanhar o processamento.');
+            return;
+        }
         const hasOtherAttendees = (event.attendees || []).some((attendeeId: string) => attendeeId !== auth.currentUser?.uid);
         Alert.alert('Cancelar Evento', hasOtherAttendees
             ? `Cancelar "${event.title}" avisará os participantes e reduzirá sua reputação.`
@@ -483,10 +560,20 @@ export default function AgendaScreen() {
             {
                 text: 'Cancelar Evento', style: 'destructive', onPress: async () => {
                     try {
-                        await httpsCallable(functions, 'cancelEvent')({ eventId: event.id });
+                        const cancelEvent = httpsCallable<{ eventId: string }, { penalized: boolean }>(functions, 'cancelEvent');
+                        const result = await cancelEvent({ eventId: event.id });
+                        const currentUid = auth.currentUser?.uid;
+                        if (currentUid) {
+                            await cancelEventReminder(event.id, currentUid).catch(() => undefined);
+                        }
                         LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
                         setFilteredEvents(prev => prev.filter(e => e.id !== event.id));
                         setSelectedEvent(null);
+                        if (result.data.penalized) {
+                            setCancellationPenalty(true);
+                        } else {
+                            Alert.alert('Evento cancelado', 'Como não havia outros participantes, sua reputação não foi alterada.');
+                        }
                     } catch (e) {
                         Alert.alert('Erro', 'Falha ao excluir evento.');
                     }
@@ -521,7 +608,11 @@ export default function AgendaScreen() {
                 title: selectedEvent.title || 'Evento',
                 date,
                 time: selectedEvent.time,
-            }], currentUid).catch(() => console.warn('[Agenda] repeated_event_reminder_schedule_failed'));
+                endDate: date,
+                endTime: selectedEvent.endTime,
+                type: selectedEvent.type,
+                isOrganizer: true,
+            }], currentUid).catch(() => undefined);
             setShowFavoriteRepeatDatePicker(false);
             setSelectedEvent(null);
             Alert.alert(result.data.alreadyCreated ? 'Evento já existente' : 'Evento repetido', result.data.alreadyCreated
@@ -554,13 +645,37 @@ export default function AgendaScreen() {
         const pulseAnim = useRef(new Animated.Value(1)).current;
         const favoriteCardScale = useRef(new Animated.Value(1)).current;
         const [removingFavorite, setRemovingFavorite] = useState(false);
+        const [updatingHistoryFavorite, setUpdatingHistoryFavorite] = useState(false);
 
         const todayStr = getTodayStr();
         const tomorrowStr = getDateAfterDays(1);
 
-        const isInProgress = isEventInProgress(item, eventClock);
+        const discovery = getAgendaDiscovery(item);
+        const isInProgress = discovery.reasons.includes('in_progress');
         const isVerySoon = !isInProgress && (item.date === todayStr || item.date === tomorrowStr);
-        const isPopular = item.attendees && item.attendees.length >= CONFIG.POPULAR_ATTENDEES_COUNT; // +3 pessoas = Popular
+        const isPopular = discovery.reasons.includes('popular');
+        const viewerUid = auth.currentUser?.uid;
+        const isUserEvent = item.createdBy === viewerUid || item.attendees?.includes(viewerUid);
+        const hasConfirmedCheckIn = Boolean(viewerUid && item.checkedIn?.includes(viewerUid));
+        const hasPendingCheckIn = Boolean(viewerUid && item.pendingCheckIns?.some(
+            ({ userId }: { userId: string }) => userId === viewerUid
+        ));
+        const canToggleHistoryFavorite = activeTab === 'history' && canRequestFavoriteAttendedEvent(
+            item,
+            hasConfirmedCheckIn,
+            hasPendingCheckIn,
+            eventClock,
+        );
+        const isHistoryFavorite = favorites.includes(item.id);
+        const journeyState = getEventJourneyState(item, eventClock, {
+            isAttending: Boolean(viewerUid && item.attendees?.includes(viewerUid)),
+            isCreator: item.createdBy === viewerUid,
+            hasCheckedIn: hasConfirmedCheckIn,
+            hasPendingCheckIn,
+        });
+        const personalizedReason = !isUserEvent
+            ? discovery.reasons.find((reason) => reason === 'interest' || reason === 'history')
+            : undefined;
 
         useEffect(() => {
             if (isVerySoon) {
@@ -591,6 +706,21 @@ export default function AgendaScreen() {
             });
         };
 
+        const handleHistoryFavorite = async () => {
+            if (updatingHistoryFavorite) return;
+            setUpdatingHistoryFavorite(true);
+            Animated.sequence([
+                Animated.spring(favoriteCardScale, { toValue: 1.35, useNativeDriver: true }),
+                Animated.spring(favoriteCardScale, { toValue: 1, useNativeDriver: true }),
+            ]).start();
+            const favorited = await toggleFavorite(item.id);
+            setUpdatingHistoryFavorite(false);
+            if (favorited === null) return;
+            const message = favorited ? 'Evento adicionado aos favoritos.' : 'Evento removido dos favoritos.';
+            if (Platform.OS === 'android') ToastAndroid.show(message, ToastAndroid.SHORT);
+            else Alert.alert(favorited ? 'Adicionado aos favoritos' : 'Removido dos favoritos', message);
+        };
+
         let indicatorColor = item.type === 'online' ? '#10B981' : '#6366F1';
         if (isPopular) indicatorColor = '#F59E0B'; // Fogo / Laranja
         if (isInProgress) indicatorColor = '#059669';
@@ -613,11 +743,31 @@ export default function AgendaScreen() {
                     <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                         <View style={{ flex: 1, marginRight: 8, flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 6 }}>
                             <Text style={styles.eventTitle}>{item.title}</Text>
-                            {isInProgress && <View style={styles.badgeInProgress}><Text style={styles.badgeInProgressText}>EM ANDAMENTO</Text></View>}
+                            {isInProgress && <View style={styles.badgeInProgress}><Text style={styles.badgeInProgressText} numberOfLines={1}>EM ANDAMENTO</Text></View>}
+                            {isUserEvent && !isInProgress && <View style={styles.badgeJourney}><Text style={styles.badgeJourneyText} numberOfLines={1}>{journeyState.compactLabel}</Text></View>}
                             {isPopular && <View style={styles.badgePopular}><Text style={styles.badgePopularText}>🔥 Pop</Text></View>}
-                            {isVerySoon && <View style={styles.badgeSoon}><Text style={styles.badgeSoonText}>⏳ Em Breve</Text></View>}
+                            {personalizedReason && <View style={styles.badgeRecommended}><Text style={styles.badgeRecommendedText}>{DISCOVERY_REASON_LABELS[personalizedReason]}</Text></View>}
+                            {isVerySoon && !isUserEvent && <View style={styles.badgeSoon}><Text style={styles.badgeSoonText}>⏳ Em Breve</Text></View>}
                         </View>
                         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+                            {canToggleHistoryFavorite && (
+                                <TouchableOpacity
+                                    onPress={(event) => {
+                                        event.stopPropagation();
+                                        void handleHistoryFavorite();
+                                    }}
+                                    disabled={updatingHistoryFavorite}
+                                    hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                                    accessibilityRole="button"
+                                    accessibilityLabel={isHistoryFavorite ? 'Remover evento dos favoritos' : 'Adicionar evento aos favoritos'}
+                                >
+                                    <Animated.View style={{ transform: [{ scale: favoriteCardScale }] }}>
+                                        {updatingHistoryFavorite
+                                            ? <ActivityIndicator size="small" color="#EF4444" />
+                                            : <Ionicons name={isHistoryFavorite ? 'heart' : 'heart-outline'} size={21} color="#EF4444" />}
+                                    </Animated.View>
+                                </TouchableOpacity>
+                            )}
                             {activeTab === 'favorites' && (
                                 <TouchableOpacity
                                     onPress={(event) => {
@@ -657,6 +807,7 @@ export default function AgendaScreen() {
                         </View>
                         <Text style={styles.eventMetaText} numberOfLines={1}>{item.locationName || 'Local não definido'}</Text>
                     </View>
+                    {isUserEvent && <Text style={styles.eventJourneyHint} numberOfLines={2}>{journeyState.message}</Text>}
                 </View>
             </Pressable>
         );
@@ -666,7 +817,10 @@ export default function AgendaScreen() {
         <AnimatedEventCard item={item} onPress={() => setSelectedEvent(item)} />
     );
 
-    const renderRecommendationCard = ({ item }: { item: any }) => (
+    const renderRecommendationCard = ({ item }: { item: any }) => {
+        const discovery = getAgendaDiscovery(item);
+        const reason = discovery.primaryReason;
+        return (
         <Pressable
             style={({ pressed }) => [styles.recCard, pressed && styles.cardPressed]}
             onPress={() => router.push(`/event/${item.id}` as any)}
@@ -682,6 +836,11 @@ export default function AgendaScreen() {
                 </TouchableOpacity>
             </View>
             <Text style={styles.recTitle} numberOfLines={2}>{item.title}</Text>
+            {reason && (
+                <View style={styles.recReasonBadge}>
+                    <Text style={styles.recReasonText}>{DISCOVERY_REASON_LABELS[reason]}</Text>
+                </View>
+            )}
             <View style={styles.recFooter}>
                 <View style={[styles.recTypeChip, { backgroundColor: item.type === 'online' ? '#ECFDF5' : '#EEF2FF' }]}>
                     <Ionicons name={item.type === 'online' ? 'videocam-outline' : 'location-outline'} size={11} color={item.type === 'online' ? '#10B981' : '#6366F1'} />
@@ -690,11 +849,65 @@ export default function AgendaScreen() {
                 <Ionicons name="chevron-forward" size={16} color="#6366F1" />
             </View>
         </Pressable>
-    );
+        );
+    };
 
-    const selectedEventIsFavorite = Boolean(selectedEvent?.id && favorites.includes(selectedEvent.id));
+    const selectedEventSourceId = selectedEvent?.sourceEventId || selectedEvent?.id;
+    const selectedEventIsFavorite = Boolean(selectedEvent?.isFavoriteSnapshot || (selectedEventSourceId && favorites.includes(selectedEventSourceId)));
+    const selectedEventHasConfirmedCheckIn = Boolean(selectedEvent?.checkedIn?.includes(auth.currentUser?.uid));
+    const selectedEventHasPendingCheckIn = Boolean(selectedEvent?.pendingCheckIns?.some(
+        ({ userId }: { userId: string }) => userId === auth.currentUser?.uid
+    ));
+    const selectedEventCanBeFavorited = Boolean(
+        selectedEvent
+        && !selectedEvent.isFavoriteSnapshot
+        && canRequestFavoriteAttendedEvent(
+            selectedEvent,
+            selectedEventHasConfirmedCheckIn,
+            selectedEventHasPendingCheckIn,
+            eventClock,
+        )
+    );
+    const selectedEventCanBeCancelled = Boolean(
+        selectedEvent
+        && !selectedEvent.isFavoriteSnapshot
+        && selectedEvent.createdBy === auth.currentUser?.uid
+        && canCancelActiveEvent(selectedEvent, eventClock)
+    );
+    const selectedEventCanBeLeft = Boolean(
+        selectedEvent
+        && !selectedEvent.isFavoriteSnapshot
+        && selectedEvent.createdBy !== auth.currentUser?.uid
+        && selectedEvent.attendees?.includes(auth.currentUser?.uid)
+        && canLeaveActiveEvent(selectedEvent, eventClock)
+    );
     const favoriteWasJustAdded = favoriteActionState === 'added';
     const favoriteWasJustRemoved = favoriteActionState === 'removed';
+    const recommendationMarks = recommendations.reduce<Record<string, Record<string, boolean>>>((marks, recommendation) => {
+        if (!recommendation.date) return marks;
+        const existing = markedDates[recommendation.date] || { past: recommendation.date < getTodayStr(), hasEvent: false };
+        if (existing.mine) return marks;
+
+        const discovery = getAgendaDiscovery(recommendation);
+        const personalized = discovery.reasons.includes('interest') || discovery.reasons.includes('history');
+        const popular = discovery.reasons.includes('popular') && (showPopularOutsideInterests || personalized);
+        marks[recommendation.date] = {
+            ...existing,
+            popular: Boolean(existing.popular) || popular,
+            recommended: Boolean(existing.recommended) || personalized,
+            hasEvent: true,
+        };
+        return marks;
+    }, {});
+    const selectedRecommendation = recommendations.find((recommendation) => recommendation.date === selectedDate);
+    const selectedRecommendationDiscovery = selectedRecommendation
+        ? getAgendaDiscovery(selectedRecommendation)
+        : null;
+    const selectedRecommendationIsPersonalized = selectedRecommendationDiscovery
+        ? selectedRecommendationDiscovery.reasons.includes('interest') || selectedRecommendationDiscovery.reasons.includes('history')
+        : false;
+    const selectedRecommendationIsPopular = selectedRecommendationDiscovery?.reasons.includes('popular') === true
+        && (showPopularOutsideInterests || selectedRecommendationIsPersonalized);
 
     return (
         <View style={styles.container}>
@@ -720,19 +933,19 @@ export default function AgendaScreen() {
                 <View style={styles.tabContainer}>
                     <Pressable
                         style={({ pressed }) => [styles.tabBtn, activeTab === 'upcoming' && styles.tabBtnActive, pressed && { opacity: 0.85 }]}
-                        onPress={() => { setActiveTab('upcoming'); setSelectedDate(''); }}
+                        onPress={() => { setSelectedDate(''); setSelectedEvent(null); setActiveTab('upcoming'); }}
                     >
                         <Text style={[styles.tabText, activeTab === 'upcoming' && styles.tabTextActive]}>Próximos</Text>
                     </Pressable>
                     <Pressable
                         style={({ pressed }) => [styles.tabBtn, activeTab === 'history' && styles.tabBtnActive, pressed && { opacity: 0.85 }]}
-                        onPress={() => setActiveTab('history')}
+                        onPress={() => { setSelectedDate(''); setSelectedEvent(null); setActiveTab('history'); }}
                     >
                         <Text style={[styles.tabText, activeTab === 'history' && styles.tabTextActive]}>Histórico</Text>
                     </Pressable>
                     <Pressable
                         style={({ pressed }) => [styles.tabBtn, activeTab === 'favorites' && styles.tabBtnActive, pressed && { opacity: 0.85 }]}
-                        onPress={() => setActiveTab('favorites')}
+                        onPress={() => { setSelectedDate(''); setSelectedEvent(null); setActiveTab('favorites'); }}
                     >
                         <Text style={[styles.tabText, activeTab === 'favorites' && styles.tabTextActive]}>Favoritos</Text>
                         {favorites.length > 0 && (
@@ -763,17 +976,14 @@ export default function AgendaScreen() {
                             onDayPress={onDayPress}
                             markedDates={{
                                 ...markedDates,
-                                ...recommendations.reduce((acc, rec) => {
-                                    if (!rec.date) return acc;
-                                    const existing = markedDates[rec.date] || { past: rec.date < getTodayStr(), hasEvent: false };
-                                    if (!existing.mine) {
-                                        acc[rec.date] = { ...existing, recommended: true, hasEvent: true };
-                                    }
-                                    return acc;
-                                }, {}),
+                                ...recommendationMarks,
                                 [selectedDate]: {
                                     ...markedDates[selectedDate],
-                                    ...(recommendations.find(r => r.date === selectedDate) && !markedDates[selectedDate]?.mine ? { recommended: true, hasEvent: true } : {}),
+                                    ...(selectedRecommendation && !markedDates[selectedDate]?.mine ? {
+                                        popular: selectedRecommendationIsPopular,
+                                        recommended: selectedRecommendationIsPersonalized,
+                                        hasEvent: true,
+                                    } : {}),
                                     selected: true,
                                 }
                             }}
@@ -845,6 +1055,24 @@ export default function AgendaScreen() {
                                 <Text style={styles.detailsDate}>
                                     {selectedDate.split('-').reverse().join('/')}
                                 </Text>
+                                {selectedDate > getTodayStr() && (
+                                    <TouchableOpacity
+                                        style={styles.createOnDateButton}
+                                        onPress={() => router.push({
+                                            pathname: '/(drawer)/(tabs)/explore',
+                                            params: {
+                                                createEvent: '1',
+                                                date: selectedDate,
+                                                requestKey: String(Date.now()),
+                                            },
+                                        } as never)}
+                                        activeOpacity={0.78}
+                                        accessibilityRole="button"
+                                        accessibilityLabel={`Criar evento em ${selectedDate.split('-').reverse().join('/')}`}
+                                    >
+                                        <Ionicons name="add" size={19} color="#FFF" />
+                                    </TouchableOpacity>
+                                )}
                             </View>
                             {filteredEvents.filter(e => e.date === selectedDate).length > 0 ? (
                                 filteredEvents.filter(e => e.date === selectedDate).map(item => (
@@ -939,7 +1167,7 @@ export default function AgendaScreen() {
                             <Ionicons name="chevron-forward" size={16} color="#CBD5E1" style={{ marginLeft: 'auto' }} />
                         </Pressable>}
 
-                        {!selectedEvent?.isFavoriteSnapshot && selectedEvent?.status === 'completed' && selectedEvent?.checkedIn?.includes(auth.currentUser?.uid) && (
+                        {selectedEventCanBeFavorited && (
                             <Pressable
                                 style={({ pressed }) => [
                                     styles.modalOption,
@@ -974,6 +1202,24 @@ export default function AgendaScreen() {
                             </Pressable>
                         )}
 
+                        {selectedEvent?.isFavoriteSnapshot && (
+                            <Pressable
+                                style={({ pressed }) => [styles.modalOption, styles.modalOptionDivider, pressed && favoriteActionState !== 'saving' && styles.modalOptionPressed]}
+                                onPress={async () => {
+                                    const favorited = await toggleFavorite(selectedEventSourceId, true);
+                                    if (favorited === false) setSelectedEvent(null);
+                                }}
+                                disabled={favoriteActionState === 'saving'}
+                            >
+                                <View style={[styles.modalIconChip, { backgroundColor: '#FFF1F2' }]}>
+                                    {favoriteActionState === 'saving'
+                                        ? <ActivityIndicator size="small" color="#E11D48" />
+                                        : <Ionicons name="heart-dislike-outline" size={20} color="#E11D48" />}
+                                </View>
+                                <Text style={[styles.modalOptionText, { color: '#E11D48' }]}>Remover dos favoritos</Text>
+                            </Pressable>
+                        )}
+
                         {selectedEvent?.isFavoriteSnapshot && selectedEvent?.createdBy === auth.currentUser?.uid && (
                             <Pressable
                                 style={({ pressed }) => [styles.modalOption, styles.modalOptionDivider, pressed && styles.modalOptionPressed]}
@@ -998,7 +1244,7 @@ export default function AgendaScreen() {
                             </Pressable>
                         )}
 
-                        {!selectedEvent?.isFavoriteSnapshot && (selectedEvent?.createdBy === auth.currentUser?.uid || selectedEvent?.attendees?.includes(auth.currentUser?.uid)) && (selectedEvent?.createdBy === auth.currentUser?.uid ? (
+                        {selectedEventCanBeCancelled ? (
                             <Pressable
                                 style={({ pressed }) => [styles.modalOption, styles.modalOptionDivider, pressed && styles.modalOptionPressed]}
                                 onPress={() => handleDeleteEvent(selectedEvent)}
@@ -1008,7 +1254,7 @@ export default function AgendaScreen() {
                                 </View>
                                 <Text style={[styles.modalOptionText, { color: '#EF4444' }]}>Cancelar Evento</Text>
                             </Pressable>
-                        ) : (
+                        ) : selectedEventCanBeLeft ? (
                             <Pressable
                                 style={({ pressed }) => [styles.modalOption, styles.modalOptionDivider, pressed && styles.modalOptionPressed]}
                                 onPress={() => handleCancelRSVP(selectedEvent)}
@@ -1018,7 +1264,7 @@ export default function AgendaScreen() {
                                 </View>
                                 <Text style={[styles.modalOptionText, { color: '#EF4444' }]}>Cancelar Presença (Sair)</Text>
                             </Pressable>
-                        ))}
+                        ) : null}
 
                         <Pressable
                             style={({ pressed }) => [styles.modalCancel, pressed && { backgroundColor: '#E2E8F0' }]}
@@ -1029,6 +1275,13 @@ export default function AgendaScreen() {
                     </View>
                 </SafeAreaView>
             </Modal>
+            <ReputationFeedbackModal
+                visible={cancellationPenalty}
+                delta={-15}
+                title="Evento cancelado"
+                body="O evento foi cancelado e os participantes foram avisados. Como outras pessoas já haviam confirmado presença, sua reputação foi reduzida em 15 pontos."
+                onClose={() => setCancellationPenalty(false)}
+            />
             {showFavoriteRepeatDatePicker && (
                 <DateTimePicker
                     value={new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)}
@@ -1102,6 +1355,7 @@ const styles = StyleSheet.create({
     detailsHeader: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 16, paddingLeft: 4 },
     detailsIconChip: { width: 30, height: 30, borderRadius: 11, backgroundColor: '#EEF2FF', justifyContent: 'center', alignItems: 'center' },
     detailsDate: { fontSize: 17, fontWeight: '800', color: '#1E293B' },
+    createOnDateButton: { width: 34, height: 34, marginLeft: 'auto', borderRadius: 17, alignItems: 'center', justifyContent: 'center', backgroundColor: '#6366F1', elevation: 2, shadowColor: '#312E81', shadowOpacity: 0.18, shadowRadius: 4, shadowOffset: { width: 0, height: 2 } },
 
     // Calendar Day Cell (sinalizações customizadas)
     dayCell: { alignItems: 'center', justifyContent: 'flex-start', paddingTop: 2, paddingBottom: 4 },
@@ -1171,10 +1425,15 @@ const styles = StyleSheet.create({
 
     badgePopular: { backgroundColor: '#FEF3C7', paddingHorizontal: 7, paddingVertical: 3, borderRadius: 8 },
     badgePopularText: { fontSize: 10, fontWeight: 'bold', color: '#D97706' },
+    badgeRecommended: { backgroundColor: '#EDE9FE', paddingHorizontal: 7, paddingVertical: 3, borderRadius: 8 },
+    badgeRecommendedText: { fontSize: 10, fontWeight: 'bold', color: '#6D28D9' },
     badgeSoon: { backgroundColor: '#EEF2FF', paddingHorizontal: 7, paddingVertical: 3, borderRadius: 8 },
     badgeSoonText: { fontSize: 10, fontWeight: 'bold', color: '#6366F1' },
-    badgeInProgress: { backgroundColor: '#D1FAE5', paddingHorizontal: 7, paddingVertical: 3, borderRadius: 8 },
-    badgeInProgressText: { fontSize: 10, fontWeight: 'bold', color: '#047857' },
+    badgeInProgress: { flexShrink: 0, backgroundColor: '#D1FAE5', paddingHorizontal: 7, paddingVertical: 3, borderRadius: 8 },
+    badgeInProgressText: { fontSize: 10, lineHeight: 13, fontWeight: 'bold', color: '#047857' },
+    badgeJourney: { flexShrink: 0, backgroundColor: '#EEF2FF', paddingHorizontal: 7, paddingVertical: 3, borderRadius: 8 },
+    badgeJourneyText: { fontSize: 9, lineHeight: 12, fontWeight: '900', color: '#4338CA' },
+    eventJourneyHint: { marginTop: 9, color: '#64748B', fontSize: 11, lineHeight: 16 },
 
     emptyState: { alignItems: 'center', justifyContent: 'center', paddingVertical: 40, backgroundColor: '#fff', borderRadius: 20, borderWidth: 1, borderColor: '#F0F1F8', gap: 12 },
     emptyIconChip: { width: 56, height: 56, borderRadius: 20, justifyContent: 'center', alignItems: 'center' },
@@ -1214,6 +1473,8 @@ const styles = StyleSheet.create({
     recHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 },
     recDate: { fontSize: 12, fontWeight: 'bold', color: '#6366F1' },
     recTitle: { fontSize: 14, fontWeight: 'bold', color: '#1E293B', marginBottom: 14 },
+    recReasonBadge: { alignSelf: 'flex-start', backgroundColor: '#F5F3FF', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 8, marginBottom: 10 },
+    recReasonText: { color: '#6D28D9', fontSize: 10, fontWeight: '800' },
     recFooter: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
     recTypeChip: { flexDirection: 'row', alignItems: 'center', gap: 4, paddingHorizontal: 8, paddingVertical: 3, borderRadius: 8 },
     recTypeText: { fontSize: 11, fontWeight: '700' },

@@ -1,6 +1,7 @@
 import { Modal, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { CURRENT_TERMS_UPDATED_LABEL } from '@/src/constants/legal';
 
 type TermsModalProps = { visible: boolean; onClose: () => void };
 
@@ -22,32 +23,38 @@ export function TermsModal({ visible, onClose }: TermsModalProps) {
             <TouchableOpacity onPress={onClose} accessibilityLabel="Fechar termos"><Ionicons name="close" size={26} color="#6B7280" /></TouchableOpacity>
           </View>
           <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.content}>
-            <Text style={styles.updated}>Última atualização: agosto de 2026</Text>
+            <Text style={styles.updated}>Última atualização: {CURRENT_TERMS_UPDATED_LABEL}</Text>
             <Section title="1. Finalidade do Reunion Hub">
               O Reunion Hub ajuda pessoas adultas a descobrir eventos, locais comunitários e interesses em comum. O aplicativo facilita conexões; não garante a identidade, conduta, segurança, qualidade ou comparecimento de qualquer usuário, evento ou estabelecimento.
             </Section>
             <Section title="2. Conta e informações verdadeiras">
-              Você deve ter 18 anos ou mais, manter seus dados corretos e proteger sua conta. Não crie contas falsas, não se passe por outra pessoa, não tente obter privilégios administrativos e não use o aplicativo para fins ilegais, comerciais não autorizados ou enganosos.
+              Você deve ter 18 anos ou mais, manter seus dados corretos e proteger sua conta e senha. A criação de eventos exige e-mail verificado, e alterações feitas em Editar Perfil exigem a confirmação da senha atual. Não crie contas falsas, não se passe por outra pessoa, não tente obter privilégios administrativos e não use o aplicativo para fins ilegais, comerciais não autorizados ou enganosos. A senha pode ser alterada em Editar Perfil ou recuperada por e-mail na tela de entrada.
             </Section>
             <Section title="3. Eventos e encontros presenciais">
-              Antes de comparecer, confirme data, local e organizador. Prefira locais públicos, informe alguém de confiança sobre seu deslocamento e não se sinta obrigado a permanecer em situações desconfortáveis. Organizadores são responsáveis pela precisão do evento e por cancelá-lo quando necessário.
+              Antes de comparecer, confirme data, horários, local e organizador. Prefira locais públicos, informe alguém de confiança sobre seu deslocamento e não se sinta obrigado a permanecer em situações desconfortáveis. Organizadores são responsáveis pela precisão do evento e por cancelá-lo quando necessário. Um convite é apenas uma notificação e não confirma automaticamente a presença do convidado.
             </Section>
             <Section title="4. Conteúdo, respeito e moderação">
               É proibido publicar ou enviar conteúdo ofensivo, discriminatório, sexualmente explícito, violento, fraudulento, ilegal, que incentive autolesão, assédio, perseguição ou divulgação de dados pessoais de terceiros. Denuncie usuários e eventos suspeitos; podemos limitar, remover conteúdo, suspender contas ou colaborar com autoridades quando exigido por lei.
             </Section>
             <Section title="5. Mensagens, bloqueio e links">
-              Use mensagens com respeito. Nunca envie senhas, dados de cartão, dinheiro ou códigos de autenticação. Você pode bloquear usuários; bloqueios impedem novas conversas entre as partes. Links de eventos online são fornecidos por usuários: confirme o domínio antes de abri-los.
+              Use mensagens com respeito. Nunca envie senhas, dados de cartão, dinheiro ou códigos de autenticação. Você pode bloquear usuários; enquanto o bloqueio estiver ativo, novas mensagens entre as partes não serão permitidas. Links de eventos online são fornecidos por usuários: confirme o domínio antes de abri-los e avise o organizador pelo recurso do evento quando um link não funcionar.
             </Section>
             <Section title="6. Locais, hábitos e privacidade">
-              Ao marcar que frequenta um local, você compartilha essa informação com o app para formar comunidades e sugestões. A exibição no perfil público é opcional e fica desativada por padrão; você pode ativá-la ou ocultá-la em Perfil › Privacidade. Não publique endereço residencial, rotina detalhada ou dados de terceiros.
+              Ao marcar que frequenta um local, você compartilha no próprio local os dias e períodos escolhidos para formar comunidades e facilitar encontros. A exibição desses lugares no seu perfil público é opcional; você pode ativá-la ou ocultá-la em Perfil › Privacidade. Quando recomendações estão ativadas, uma localização aproximada e recente pode ser usada para selecionar eventos presenciais próximos; ela não é exibida publicamente e é removida ao desativar a preferência. Não publique endereço residencial, rotina excessivamente detalhada ou dados de terceiros.
             </Section>
             <Section title="7. Reputação e presença">
-              Check-ins, cancelamentos e faltas podem afetar a reputação. Quando existe ao menos um check-in confirmado, inscritos ausentes podem perder 20 pontos. Se ninguém fizer check-in, cada inscrito perde somente 1 ponto, pois o encontro não foi comprovado. Tentativas de manipular presença, reputação, eventos ou locais podem resultar em reversão, bloqueio de recursos ou suspensão de conta.
+              Check-ins, cancelamentos e faltas podem afetar a reputação. O check-in só pode ser solicitado entre o início e o término do evento. Participantes ficam pendentes até a revisão; o organizador precisa registrar o próprio check-in para aprovar ou rejeitar presenças e recebe, ao término, até 2 horas para concluir essa revisão. Se o organizador não fizer check-in ou deixar o prazo terminar, solicitações pendentes válidas podem ser aprovadas automaticamente. Quando existe ao menos um check-in confirmado, inscritos ausentes, inclusive o organizador, podem perder 20 pontos. Se ninguém fizer check-in, cada inscrito perde somente 1 ponto, pois o encontro não foi comprovado. Cancelar um evento pode reduzir a reputação do organizador quando já houver outros participantes. Contas abaixo do nível mínimo de confiança podem ficar impedidas de criar eventos e confirmar presença. Tentativas de manipular presença, reputação, eventos ou locais podem resultar em reversão, bloqueio de recursos ou suspensão.
             </Section>
-            <Section title="8. Dados e exclusão de conta">
-              Tratamos dados de conta, perfil, interesses, eventos, mensagens, localização quando autorizada e preferências necessárias ao funcionamento. Você pode solicitar exclusão no app; a exclusão remove sua conta e dados pessoais diretos, preservando apenas registros que precisem ser anonimizados para proteger outros participantes ou cumprir obrigações legais.
+            <Section title="8. Agenda, histórico e favoritos">
+              A Agenda organiza próximos eventos, histórico e favoritos. Eventos concluídos podem ser favoritados por quem teve presença confirmada. O favorito mantém uma referência do evento até ser removido; eventos comuns do histórico podem ser eliminados após o período de retenção do aplicativo. Se você não for o criador, repetir um favorito envia uma proposta ao organizador, sem criar automaticamente outro evento.
             </Section>
-            <Section title="9. Alterações e contato">
+            <Section title="9. Notificações e recomendações">
+              O aplicativo pode enviar mensagens, convites, atualizações de eventos, lembretes, resultados de check-in e alterações de reputação conforme suas preferências. Recomendações opcionais podem considerar interesses, popularidade, data e proximidade; desativá-las interrompe esse uso para novas sugestões. O sistema limita alertas promocionais para reduzir repetições, mas comunicações necessárias sobre eventos dos quais você participa ainda podem ser exibidas.
+            </Section>
+            <Section title="10. Dados e exclusão de conta">
+              Tratamos dados de conta, perfil, interesses, eventos, mensagens, localização quando autorizada e preferências necessárias ao funcionamento. Você pode excluir permanentemente sua conta pelo app após confirmar a senha atual; a exclusão remove a conta e os dados pessoais diretos, preservando apenas registros que precisem ser anonimizados para proteger outros participantes, manter a coerência de interações ou cumprir obrigações legais.
+            </Section>
+            <Section title="11. Alterações e contato">
               Podemos atualizar estes termos conforme o aplicativo evoluir. O uso contínuo após a atualização representa concordância com a versão vigente. Em caso de dúvida, denúncia urgente ou solicitação sobre dados, use os canais de suporte exibidos no perfil.
             </Section>
           </ScrollView>

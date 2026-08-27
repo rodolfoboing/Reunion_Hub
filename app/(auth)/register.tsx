@@ -4,13 +4,13 @@ import { router, Link } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { createUserWithEmailAndPassword, deleteUser, sendEmailVerification, updateProfile, User as FirebaseUser } from 'firebase/auth';
-import { doc, setDoc, collection, query, where, getDocs, limit } from 'firebase/firestore';
-import { auth, db } from '../../src/services/firebaseConfig';
+import { auth } from '../../src/services/firebaseConfig';
 import { StyledInput } from '../../src/components/StyledInput';
 import { StyledButton } from '../../src/components/StyledButton';
 import { TermsModal } from '../../src/components/TermsModal';
 import { STRINGS } from '../../src/constants/strings';
 import { authLog, getFirebaseErrorCode } from '../../src/utils/authError';
+import { createInitialUserProfile, isValidNickname, NicknameUnavailableError, normalizeNickname } from '@/src/services/profileService';
 
 export default function RegisterScreen() {
     const [nick, setNick] = useState('');
@@ -34,8 +34,8 @@ export default function RegisterScreen() {
         }
 
         const normalizedEmail = email.trim().toLowerCase();
-        const sanitizedNick = nick.trim().toLowerCase().replace(/\s+/g, '');
-        if (!/^[a-z0-9._-]{3,20}$/.test(sanitizedNick)) {
+        const sanitizedNick = normalizeNickname(nick);
+        if (!isValidNickname(sanitizedNick)) {
             Alert.alert('Erro', 'O nick deve ter de 3 a 20 caracteres: letras, números, ponto, hífen ou sublinhado.');
             return;
         }
@@ -56,35 +56,20 @@ export default function RegisterScreen() {
         let createdUser: FirebaseUser | null = null;
         let profileSaved = false;
         try {
-            // 0. Verificar se Nick já existe
-            const q = query(collection(db, 'users'), where('searchName', '==', sanitizedNick), limit(1));
-            const nickCheck = await getDocs(q);
-            if (!nickCheck.empty) {
-                Alert.alert('Nick Indisponível', STRINGS.AUTH_ERROR_NICK_EXISTS);
-                return;
-            }
-
-            // 1. Criar Auth
+            // 1. Criar a identidade no Authentication.
             const userCredential = await createUserWithEmailAndPassword(auth, normalizedEmail, password);
             const user = userCredential.user;
             createdUser = user;
 
             // 2. Atualizar Perfil
-            await updateProfile(user, { displayName: nick.trim() });
+            await updateProfile(user, { displayName: sanitizedNick });
 
-            // 3. Criar Documento no Firestore (Reputação inicial 0)
-            await setDoc(doc(db, 'users', user.uid), {
-                uid: user.uid,
-                displayName: nick.trim(),
+            // 3. Reservar o nick e criar o perfil na mesma transação. Isso também
+            // registra a versão e a data do aceite dos termos no servidor.
+            await createInitialUserProfile({
+                userId: user.uid,
                 nick: sanitizedNick,
-                searchName: sanitizedNick,
                 email: normalizedEmail,
-                reputation: 0,
-                eventsAttended: 0,
-                foundedPlacesCount: 0,
-                showPopularOutsideInterests: true,
-                isProfileComplete: false,
-                createdAt: new Date().toISOString(),
             });
             profileSaved = true;
 
@@ -108,7 +93,9 @@ export default function RegisterScreen() {
             }
             
             let msg = STRINGS.ERROR_DEFAULT;
-            if (code === 'auth/email-already-in-use') {
+            if (error instanceof NicknameUnavailableError) {
+                msg = STRINGS.AUTH_ERROR_NICK_EXISTS;
+            } else if (code === 'auth/email-already-in-use') {
                 msg = 'Este email já está em uso.';
             } else if (code === 'auth/weak-password') {
                 msg = 'A senha deve ter pelo menos 6 caracteres.';

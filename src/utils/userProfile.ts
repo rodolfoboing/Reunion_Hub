@@ -1,4 +1,5 @@
 import { User } from '@/src/types';
+import { Timestamp } from 'firebase/firestore';
 
 function stringValue(value: unknown): string | undefined {
     return typeof value === 'string' ? value : undefined;
@@ -28,6 +29,8 @@ export function toUserProfile(uid: string, data: Record<string, unknown>): User 
         bio: stringValue(data.bio),
         searchName: stringValue(data.searchName),
         createdAt: stringValue(data.createdAt),
+        termsVersion: stringValue(data.termsVersion),
+        termsAcceptedAt: data.termsAcceptedAt instanceof Timestamp ? data.termsAcceptedAt : undefined,
         isProfileComplete: booleanValue(data.isProfileComplete),
         expoPushToken: stringValue(data.expoPushToken),
         reputation: numberValue(data.reputation),

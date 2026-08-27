@@ -1,6 +1,6 @@
 export const CONFIG = {
     // Distância máxima para buscar eventos e locais próximos (em km)
-    NEARBY_RADIUS_KM: 25,
+    NEARBY_RADIUS_KM: 10,
     
     // Número mínimo de participantes para um evento ser considerado "Popular" (fogo/flame)
     POPULAR_ATTENDEES_COUNT: 3,

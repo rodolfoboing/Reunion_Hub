@@ -95,24 +95,27 @@ async function notifyCancelledEvents(db, events) {
     await batch.commit();
   }
 
-  const pushMessages = validDeliveries.flatMap((delivery) => {
-    const token = profiles.get(delivery.userId).expoPushToken;
-    if (typeof token !== 'string' || (!token.startsWith('ExponentPushToken') && !token.startsWith('ExpoPushToken'))) return [];
-    return [{
-      to: token,
-      sound: 'default',
-      title: delivery.title,
-      body: delivery.body,
-      data: { path: `/event/${delivery.eventId}`, meetingId: delivery.eventId, notificationType: 'event_cancelled' },
-    }];
-  });
-  for (let index = 0; index < pushMessages.length; index += PAGE_SIZE) {
-    const response = await fetch('https://exp.host/--/api/v2/push/send', {
-      method: 'POST',
-      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-      body: JSON.stringify(pushMessages.slice(index, index + PAGE_SIZE)),
-    });
-    if (!response.ok) throw new Error(`O serviço de push recusou o lote com status ${response.status}.`);
+  const devicesByUser = new Map();
+  await Promise.all(userIds.map(async (userId) => {
+    const devices = await db.collection('pushDevices').where('userId', '==', userId).limit(10).get();
+    devicesByUser.set(userId, devices.docs.map((device) => device.data()));
+  }));
+  const pushMessages = validDeliveries.flatMap((delivery) => (
+    (devicesByUser.get(delivery.userId) || []).flatMap((device) => {
+      if (device.platform !== 'android' || typeof device.nativePushToken !== 'string') return [];
+      return [{
+        token: device.nativePushToken,
+        notification: { title: delivery.title, body: delivery.body },
+        data: { path: `/event/${delivery.eventId}`, meetingId: delivery.eventId, notificationType: 'event_cancelled' },
+        android: {
+          priority: 'high',
+          notification: { channelId: 'events', sound: 'default' },
+        },
+      }];
+    })
+  ));
+  for (let index = 0; index < pushMessages.length; index += 500) {
+    await admin.messaging().sendEach(pushMessages.slice(index, index + 500));
   }
 }
 
@@ -197,11 +200,14 @@ async function cleanupProfile(db, bucket, profile) {
     notifications: 0,
     reports: 0,
     invitations: 0,
+    checkInReviews: 0,
     createdEvents: 0,
     activeAttendances: 0,
     conversations: 0,
     places: 0,
     blockedReferences: 0,
+    pushDevices: 0,
+    notificationSettings: 0,
   };
 
   counts.favorites = await processQueryInPages(
@@ -237,9 +243,25 @@ async function cleanupProfile(db, bucket, profile) {
     db.collection('eventInvitations').where('inviterId', '==', userId),
     (batch, document) => batch.delete(document.ref)
   );
+  counts.pushDevices = await processQueryInPages(
+    db,
+    db.collection('pushDevices').where('userId', '==', userId),
+    (batch, document) => batch.delete(document.ref)
+  );
+  await db.collection('pushTokens').doc(userId).delete().catch(() => undefined);
+  const notificationSettings = await db.collection('notificationSettings').doc(userId).get();
+  if (notificationSettings.exists) {
+    await notificationSettings.ref.delete();
+    counts.notificationSettings = 1;
+  }
   counts.invitations += await processQueryInPages(
     db,
     db.collection('eventInvitations').where('inviteeId', '==', userId),
+    (batch, document) => batch.delete(document.ref)
+  );
+  counts.checkInReviews = await processQueryInPages(
+    db,
+    db.collection('eventCheckInReviews').where('userId', '==', userId),
     (batch, document) => batch.delete(document.ref)
   );
 

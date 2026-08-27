@@ -1,3 +1,5 @@
+import type { Timestamp } from 'firebase/firestore';
+
 export interface User {
     uid: string;
     nick?: string;
@@ -7,6 +9,8 @@ export interface User {
     bio?: string;
     searchName?: string;
     createdAt?: string;
+    termsVersion?: string;
+    termsAcceptedAt?: Timestamp | null;
     isProfileComplete?: boolean;
     expoPushToken?: string;
     reputation?: number;
@@ -29,7 +33,10 @@ export interface Meeting {
     locationName?: string;
     date?: string;
     time?: string;
+    endDate?: string;
     endTime?: string;
+    startsAt?: Timestamp | null;
+    endsAt?: Timestamp | null;
     lat?: number;
     lng?: number;
     type?: 'in-person' | 'online';
@@ -43,14 +50,18 @@ export interface Meeting {
     attendees?: string[];
     checkedIn?: string[];
     pendingCheckIns?: CheckInRequest[];
+    checkInReviewStartedAt?: Timestamp | null;
+    checkInReviewDeadlineAt?: Timestamp | null;
+    checkInReviewCompletedAt?: Timestamp | null;
     suggestedInviteeIds?: string[];
-    status?: 'active' | 'completed' | 'cancelled';
+    status?: 'active' | 'awaiting_review' | 'completed' | 'cancelled';
     distance?: number; // local helper
 }
 
 export interface CheckInRequest {
     userId: string;
     displayName: string;
+    requestedAt?: Timestamp | null;
 }
 
 export interface FavoriteEventSnapshot extends Meeting {
@@ -89,6 +100,7 @@ export type CreateMeetingDraft = {
     locationName: string;
     date: string;
     time: string;
+    endDate: string;
     endTime: string;
     lat: number;
     lng: number;
@@ -112,9 +124,13 @@ export interface Notification {
     body: string;
     meetingId?: string;
     conversationId?: string;
+    path?: string;
     createdAt?: Timestamp | null;
     read: boolean;
     fromUserId?: string;
+    reputationDelta?: number;
+    detailTitle?: string;
+    detailBody?: string;
 }
 
 export interface EventInviteCandidate {
@@ -141,4 +157,3 @@ export interface Report {
     reason?: string;
     createdAt?: unknown;
 }
-import type { Timestamp } from 'firebase/firestore';

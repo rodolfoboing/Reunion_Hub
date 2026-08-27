@@ -1,23 +1,30 @@
 import { useLocalSearchParams, router, Stack } from 'expo-router';
-import { View, Text, StyleSheet, ScrollView, Alert, ActivityIndicator, TouchableOpacity, Linking } from 'react-native';
+import { View, Text, StyleSheet, ScrollView, Alert, ActivityIndicator, TouchableOpacity, Linking, Modal } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { doc, getDoc, onSnapshot } from 'firebase/firestore';
 import { httpsCallable } from 'firebase/functions';
 import { useFocusEffect } from '@react-navigation/native';
 import { db, auth, functions } from '../../src/services/firebaseConfig';
-import { CheckInRequest, Meeting } from '../../src/types';
+import { Meeting } from '../../src/types';
 import { StyledButton } from '@/src/components/StyledButton';
 import { ErrorState } from '@/src/components/ErrorState';
 import { FontAwesome } from '@expo/vector-icons';
 import { normalizeDate } from '../../src/utils/dateUtils';
-import { formatEventTimeRange, isEventInProgress, isEventRegistrationOpen, isEventToday } from '../../src/utils/eventSchedule';
+import { canManuallyCompleteEvent, canRequestFavoriteAttendedEvent, formatEventTimeRange, getCheckInReviewDeadline, getEventJourneyState, hasEventEnded, isEventInProgress, isEventRegistrationOpen, isEventToday } from '../../src/utils/eventSchedule';
 import { useEventClock } from '@/src/hooks/useEventClock';
-import { scheduleEventReminder, cancelEventReminder } from '../../src/utils/Notifications';
+import { scheduleEventReminder, cancelEventReminder, setActiveNotificationTarget } from '../../src/utils/Notifications';
 import { ReportReasonModal } from '@/src/components/ReportReasonModal';
 import { markRelatedNotificationsAsRead } from '@/src/services/notificationReadService';
 import { EventInviteModal } from '@/src/features/events/components/EventInviteModal';
 import { submitReport } from '@/src/services/reportService';
+import { ReputationFeedbackModal } from '@/src/components/ReputationFeedbackModal';
+
+type ReputationFeedback = {
+    delta: number;
+    title: string;
+    body: string;
+};
 
 // Helper para verificar se hoje é o dia do evento
 // Formata a data para exibição amigável
@@ -37,21 +44,34 @@ const formatDateDisplay = (dateString: string | undefined): string => {
 
 export default function MeetingDetailsScreen() {
     const eventClock = useEventClock();
-    const { id } = useLocalSearchParams<{ id?: string }>();
+    const { id, notificationType, notificationId } = useLocalSearchParams<{ id?: string; notificationType?: string; notificationId?: string }>();
     const eventId = typeof id === 'string' ? id : null;
     const [meeting, setMeeting] = useState<Meeting | null>(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(false);
     const [rsvpLoading, setRsvpLoading] = useState(false);
     const [checkInLoading, setCheckInLoading] = useState(false);
-    const [confirmingCheckInUserId, setConfirmingCheckInUserId] = useState<string | null>(null);
+    const [reviewLoading, setReviewLoading] = useState(false);
+    const [showCheckInReview, setShowCheckInReview] = useState(false);
+    const [checkInDecisions, setCheckInDecisions] = useState<Record<string, 'confirmed' | 'rejected'>>({});
     const [showReportReasonModal, setShowReportReasonModal] = useState(false);
     const [showInviteModal, setShowInviteModal] = useState(false);
     const [favoriteLoading, setFavoriteLoading] = useState(false);
     const [linkIssueLoading, setLinkIssueLoading] = useState(false);
     const [isFavorited, setIsFavorited] = useState(false);
     const [creatorName, setCreatorName] = useState('Usuário');
+    const [reputationFeedback, setReputationFeedback] = useState<ReputationFeedback | null>(null);
     const [retryKey, setRetryKey] = useState(0);
+    const shownNotificationContext = useRef<string | null>(null);
+    const shownReputationNotificationId = useRef<string | null>(null);
+    const cleanedReminderEventId = useRef<string | null>(null);
+    const promptedReviewEventId = useRef<string | null>(null);
+
+    useFocusEffect(useCallback(() => {
+        if (!eventId) return;
+        setActiveNotificationTarget({ meetingId: eventId });
+        return () => setActiveNotificationTarget(null);
+    }, [eventId]));
 
     useFocusEffect(useCallback(() => {
         if (!eventId) {
@@ -108,6 +128,66 @@ export default function MeetingDetailsScreen() {
         return () => { active = false; };
     }, [meeting?.createdBy, meeting?.creatorName, meeting?.id]);
 
+    useEffect(() => {
+        const uid = auth.currentUser?.uid;
+        if (!meeting || !uid) return;
+        if (cleanedReminderEventId.current !== meeting.id
+            && (meeting.status === 'cancelled' || meeting.status === 'completed' || hasEventEnded(meeting, eventClock))) {
+            cleanedReminderEventId.current = meeting.id;
+            cancelEventReminder(meeting.id, uid).catch(() => undefined);
+        }
+    }, [eventClock, meeting]);
+
+    useEffect(() => {
+        if (!meeting || notificationType !== 'event_link_issue' || meeting.createdBy !== auth.currentUser?.uid) return;
+        const contextKey = `${meeting.id}:${notificationType}`;
+        if (shownNotificationContext.current === contextKey) return;
+        shownNotificationContext.current = contextKey;
+        Alert.alert(
+            'Participante relatou problema no link',
+            'Uma pessoa informou que o link deste evento pode não estar funcionando. Alguns links só abrem perto do horário; confira o endereço e, se necessário, avise os participantes pelo chat.'
+        );
+    }, [meeting, notificationType]);
+
+    useEffect(() => {
+        const uid = auth.currentUser?.uid;
+        if (!uid || !meeting || typeof notificationId !== 'string' || shownReputationNotificationId.current === notificationId) return;
+        let active = true;
+        getDoc(doc(db, 'notifications', notificationId)).then((notificationSnapshot) => {
+            if (!active || !notificationSnapshot.exists()) return;
+            const notification = notificationSnapshot.data();
+            const delta = notification.reputationDelta;
+            if (notification.userId !== uid || typeof delta !== 'number' || !Number.isFinite(delta) || delta === 0) return;
+            shownReputationNotificationId.current = notificationId;
+            setReputationFeedback({
+                delta,
+                title: typeof notification.detailTitle === 'string' ? notification.detailTitle : notification.title,
+                body: typeof notification.detailBody === 'string' ? notification.detailBody : notification.body,
+            });
+        }).catch((notificationError) => {
+            console.error('[Event] reputation_notification_context_failed', {
+                notificationId,
+                code: notificationError instanceof Error ? notificationError.name : 'unknown',
+            });
+        });
+        return () => { active = false; };
+    }, [meeting, notificationId]);
+
+    useEffect(() => {
+        const uid = auth.currentUser?.uid;
+        if (!meeting || !uid || meeting.createdBy !== uid || meeting.status === 'completed' || meeting.status === 'cancelled') return;
+        const organizerCheckedIn = meeting.checkedIn?.includes(uid) === true;
+        const pendingParticipants = (meeting.pendingCheckIns || []).filter((request) => request.userId !== uid);
+        if (!organizerCheckedIn
+            || pendingParticipants.length === 0
+            || !hasEventEnded(meeting, eventClock)
+            || !canManuallyCompleteEvent(meeting, eventClock)) return;
+        if (promptedReviewEventId.current === meeting.id) return;
+        promptedReviewEventId.current = meeting.id;
+        setCheckInDecisions({});
+        setShowCheckInReview(true);
+    }, [eventClock, meeting, notificationType]);
+
     const handleReportLinkIssue = () => {
         if (!eventId || !meeting || !auth.currentUser || meeting.createdBy === auth.currentUser.uid) return;
         Alert.alert(
@@ -157,8 +237,17 @@ export default function MeetingDetailsScreen() {
                         setRsvpLoading(true);
                         try {
                             await httpsCallable(functions, 'rsvpToEvent')({ eventId });
-                            scheduleEventReminder({ id: eventId, title: meeting.title, date: meeting.date, time: meeting.time }, currentUser.uid)
-                                .catch(() => console.warn('[Event] local_reminder_schedule_failed'));
+                            scheduleEventReminder({
+                                id: eventId,
+                                title: meeting.title,
+                                date: meeting.date,
+                                time: meeting.time,
+                                endDate: meeting.endDate,
+                                endTime: meeting.endTime,
+                                type: meeting.type,
+                                isOrganizer: meeting.createdBy === currentUser.uid,
+                            }, currentUser.uid)
+                                .catch(() => undefined);
 
                             Alert.alert('Sucesso', 'Presença confirmada! Lembre-se das dicas de segurança e não esqueça de fazer check-in no dia do evento.');
                         } catch (error) {
@@ -189,8 +278,7 @@ export default function MeetingDetailsScreen() {
                         try {
                             const leaveEvent = httpsCallable<{ eventId: string }, { ok: boolean }>(functions, 'leaveEvent');
                             await leaveEvent({ eventId });
-                            cancelEventReminder(eventId, currentUser.uid)
-                                .catch(() => console.warn('[Event] local_reminder_cancel_failed'));
+                            cancelEventReminder(eventId, currentUser.uid).catch(() => undefined);
                             Alert.alert('Presença cancelada', 'Você saiu do evento e o organizador foi avisado.');
                         } catch {
                             console.error('[Event] attendance_cancellation_failed');
@@ -220,45 +308,81 @@ export default function MeetingDetailsScreen() {
 
         setCheckInLoading(true);
         try {
-            const requestCheckIn = httpsCallable<{ eventId: string }, { requested: boolean; alreadyConfirmed: boolean }>(functions, 'checkInToEvent');
+            const requestCheckIn = httpsCallable<{ eventId: string }, { requested: boolean; alreadyConfirmed: boolean; organizerConfirmed: boolean }>(functions, 'checkInToEvent');
             const result = await requestCheckIn({ eventId });
-            Alert.alert(
-                result.data.alreadyConfirmed ? 'Check-in já confirmado' : 'Solicitação enviada',
-                result.data.alreadyConfirmed
-                    ? 'Sua presença já foi confirmada neste evento.'
-                    : 'Aguarde a confirmação do organizador ou de outro participante. Os +10 pontos serão adicionados após a confirmação.'
-            );
+            if (result.data.organizerConfirmed && !result.data.alreadyConfirmed) {
+                setReputationFeedback({
+                    delta: 10,
+                    title: 'Check-in confirmado',
+                    body: 'Seu check-in como organizador foi confirmado e sua reputação aumentou em 10 pontos. Ao final do evento, você poderá revisar as solicitações dos participantes.',
+                });
+            } else {
+                Alert.alert(
+                    result.data.alreadyConfirmed ? 'Check-in registrado' : 'Solicitação enviada',
+                    result.data.alreadyConfirmed
+                        ? 'Sua presença já foi confirmada neste evento.'
+                        : 'O organizador poderá revisar sua presença ao final. Se ele não fizer check-in ou não revisar, sua solicitação será aprovada automaticamente no encerramento.'
+                );
+            }
 
         } catch (error) {
             console.error('Check-in error:', error);
-            Alert.alert('Erro', 'Falha ao fazer check-in. Tente novamente.');
+            Alert.alert(
+                'Check-in indisponível',
+                'Não foi possível solicitar o check-in. Confira o horário do evento e tente novamente.'
+            );
         } finally {
             setCheckInLoading(false);
         }
     };
 
-    const handleConfirmCheckIn = async (request: CheckInRequest) => {
-        if (!meeting || !eventId) return;
-        setConfirmingCheckInUserId(request.userId);
+    const handleReviewAndEndEvent = async () => {
+        if (!eventId || !meeting) return;
+        const requests = (meeting.pendingCheckIns || []).filter((request) => request.userId !== auth.currentUser?.uid);
+        const decisions: Array<{ userId: string; status: 'confirmed' | 'rejected' }> = [];
+        for (const request of requests) {
+            const status = checkInDecisions[request.userId];
+            if (!status) {
+                Alert.alert('Revisão incompleta', 'Marque se cada participante estava ou não presente.');
+                return;
+            }
+            decisions.push({ userId: request.userId, status });
+        }
+        setReviewLoading(true);
         try {
-            const confirmCheckIn = httpsCallable<{ eventId: string; targetUserId: string }, { confirmed: boolean }>(functions, 'confirmEventCheckIn');
-            const result = await confirmCheckIn({ eventId, targetUserId: request.userId });
-            Alert.alert(
-                result.data.confirmed ? 'Presença confirmada' : 'Check-in já confirmado',
-                result.data.confirmed ? `${request.displayName} recebeu os pontos de participação.` : 'Esta solicitação já foi processada.'
-            );
-        } catch (error) {
-            console.error('[Event] checkin_confirmation_failed');
-            Alert.alert('Não foi possível confirmar', 'Verifique se o evento ainda está em andamento e tente novamente.');
+            const reviewAndComplete = httpsCallable<{
+                eventId: string;
+                decisions: Array<{ userId: string; status: 'confirmed' | 'rejected' }>;
+            }, { noShows: number; confirmedCheckIns: number; rejectedCheckIns: number; callerReputationDelta: number }>(functions, 'reviewAndCompleteEvent');
+            const result = await reviewAndComplete({
+                eventId,
+                decisions,
+            });
+            setShowCheckInReview(false);
+            const reviewSummary = `${result.data.confirmedCheckIns} check-in(s) aprovado(s), ${result.data.rejectedCheckIns} rejeitado(s) e ${result.data.noShows} falta(s) processada(s).`;
+            if (result.data.callerReputationDelta < 0) {
+                setReputationFeedback({
+                    delta: result.data.callerReputationDelta,
+                    title: 'Evento encerrado',
+                    body: `${reviewSummary} Como sua própria presença não foi confirmada, sua reputação também foi reduzida.`,
+                });
+            } else {
+                Alert.alert('Evento encerrado', reviewSummary);
+            }
+        } catch {
+            console.error('[Event] checkin_batch_review_failed');
+            Alert.alert('Não foi possível concluir', 'O prazo pode ter terminado ou os dados mudaram. Atualize o evento e tente novamente.');
         } finally {
-            setConfirmingCheckInUserId(null);
+            setReviewLoading(false);
         }
     };
 
     const handleEndEvent = async () => {
         Alert.alert(
             'Encerrar Evento',
-            'Deseja encerrar definitivamente este evento? Se houve check-in, quem faltou perde 20 pontos. Se ninguém fez check-in, cada inscrito perde somente 1 ponto.',
+            meeting?.checkedIn?.includes(auth.currentUser?.uid || '')
+                ? 'Deseja encerrar definitivamente este evento? Solicitações pendentes precisam ser revisadas antes da conclusão.'
+                : 'Você não registrou seu check-in. As solicitações válidas dos participantes serão aprovadas automaticamente, e você não poderá rejeitá-las.',
             [
                 { text: 'Cancelar', style: 'cancel' },
                 {
@@ -268,12 +392,18 @@ export default function MeetingDetailsScreen() {
                         if (!eventId) return;
                         setLoading(true);
                         try {
-                            const completeEvent = httpsCallable<{ eventId: string }, { noShows: number; becameFounder: boolean; alreadyCompleted: boolean; noCheckIns: boolean }>(functions, 'completeEvent');
+                            const completeEvent = httpsCallable<{ eventId: string }, { noShows: number; becameFounder: boolean; alreadyCompleted: boolean; noCheckIns: boolean; confirmedCheckIns: number; callerReputationDelta: number }>(functions, 'completeEvent');
                             const result = await completeEvent({ eventId });
                             if (result.data.alreadyCompleted) {
                                 Alert.alert('Evento já encerrado', 'Este evento já havia sido finalizado.');
-                            } else if (result.data.noCheckIns) {
-                                Alert.alert('Evento encerrado', 'Ninguém registrou check-in. Como ninguém foi prejudicado, cada inscrito perdeu somente 1 ponto.');
+                            } else if (result.data.callerReputationDelta < 0) {
+                                setReputationFeedback({
+                                    delta: result.data.callerReputationDelta,
+                                    title: 'Evento encerrado sem presença confirmada',
+                                    body: result.data.noCheckIns
+                                        ? 'Ninguém registrou check-in. Como não houve presença comprovada e ninguém foi diretamente prejudicado, cada pessoa inscrita perdeu somente 1 ponto.'
+                                        : 'O evento foi encerrado, mas sua própria presença não teve check-in confirmado. Por isso, a penalidade de ausência foi aplicada à sua reputação.',
+                                });
                             } else if (result.data.becameFounder) {
                                 Alert.alert('🌟 Você é um Fundador!', 'Parabéns! Você realizou o primeiro evento neste local e agora tem o título de Fundador Oficial deste espaço!');
                             } else {
@@ -306,11 +436,17 @@ export default function MeetingDetailsScreen() {
                             const cancelEvent = httpsCallable<{ eventId: string }, { penalized: boolean }>(functions, 'cancelEvent');
                             const result = await cancelEvent({ eventId });
                             const uid = auth.currentUser?.uid;
-                            if (uid) cancelEventReminder(eventId, uid).catch(() => console.warn('[Event] local_reminder_cancel_failed'));
+                            if (uid) cancelEventReminder(eventId, uid).catch(() => undefined);
                             
-                            Alert.alert('Cancelado', result.data.penalized
-                                ? 'O evento foi cancelado, os participantes foram avisados e sua reputação foi atualizada.'
-                                : 'O evento foi cancelado. Como não havia outros participantes, sua reputação não foi alterada.');
+                            if (result.data.penalized) {
+                                setReputationFeedback({
+                                    delta: -15,
+                                    title: 'Evento cancelado',
+                                    body: 'O evento foi cancelado e os participantes foram avisados. Como outras pessoas já haviam confirmado presença, sua reputação foi reduzida em 15 pontos.',
+                                });
+                            } else {
+                                Alert.alert('Evento cancelado', 'Como não havia outros participantes, sua reputação não foi alterada.');
+                            }
                         } catch (e) {
                             Alert.alert('Erro', 'Falha ao cancelar evento.');
                         } finally {
@@ -337,7 +473,7 @@ export default function MeetingDetailsScreen() {
                 ? 'Este evento ficará disponível na sua aba Favoritos, mesmo quando o histórico comum for limpo.'
                 : 'O evento foi removido da sua aba Favoritos.');
         } catch {
-            Alert.alert('Não foi possível favoritar', 'Somente eventos concluídos com seu check-in confirmado podem ser favoritos.');
+            Alert.alert('Não foi possível favoritar', 'Somente eventos encerrados com seu check-in confirmado podem ser favoritos.');
         } finally {
             setFavoriteLoading(false);
         }
@@ -374,7 +510,7 @@ export default function MeetingDetailsScreen() {
     const hasCheckedIn = currentUid ? meeting.checkedIn?.includes(currentUid) : false;
     const pendingCheckIns = meeting.pendingCheckIns || [];
     const hasPendingCheckIn = currentUid ? pendingCheckIns.some((request) => request.userId === currentUid) : false;
-    const confirmableCheckIns = currentUid && isAttending
+    const confirmableCheckIns = currentUid && meeting.createdBy === currentUid && hasCheckedIn
         ? pendingCheckIns.filter((request) => request.userId !== currentUid)
         : [];
     const isToday = isEventToday(meeting, eventClock);
@@ -382,6 +518,25 @@ export default function MeetingDetailsScreen() {
     const isRegistrationOpen = isEventRegistrationOpen(meeting, eventClock);
     const isCreator = currentUid ? meeting.createdBy === currentUid : false;
     const isCompleted = meeting.status === 'completed';
+    const endedBySchedule = hasEventEnded(meeting, eventClock);
+    const canFavoriteEvent = canRequestFavoriteAttendedEvent(meeting, Boolean(hasCheckedIn), hasPendingCheckIn, eventClock);
+    const canCompleteManually = isCreator && canManuallyCompleteEvent(meeting, eventClock);
+    const checkInReviewDeadline = getCheckInReviewDeadline(meeting);
+    const checkInReviewDeadlineLabel = checkInReviewDeadline?.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+    const journeyState = getEventJourneyState(meeting, eventClock, {
+        isAttending,
+        isCreator,
+        hasCheckedIn,
+        hasPendingCheckIn,
+        pendingReviewCount: confirmableCheckIns.length,
+    });
+    const journeyPalette = {
+        neutral: { background: '#F3F4F6', border: '#D1D5DB', text: '#374151' },
+        info: { background: '#EEF2FF', border: '#C7D2FE', text: '#4338CA' },
+        success: { background: '#ECFDF5', border: '#A7F3D0', text: '#047857' },
+        warning: { background: '#FFFBEB', border: '#FDE68A', text: '#92400E' },
+        danger: { background: '#FEF2F2', border: '#FECACA', text: '#B91C1C' },
+    }[journeyState.tone];
 
     return (
         <>
@@ -390,12 +545,16 @@ export default function MeetingDetailsScreen() {
             <ScrollView contentContainerStyle={styles.content}>
                 <Text style={styles.theme}>{meeting.theme}</Text>
                 <Text style={styles.title}>{meeting.title}</Text>
-                {isInProgress && (
-                    <View style={styles.inProgressBanner}>
-                        <FontAwesome name="play-circle" size={16} color="#047857" />
-                        <Text style={styles.inProgressBannerText}>Evento em andamento</Text>
+                <View style={[styles.journeyCard, { backgroundColor: journeyPalette.background, borderColor: journeyPalette.border }]}>
+                    <View style={styles.journeyHeader}>
+                        <FontAwesome name={isInProgress ? 'play-circle' : endedBySchedule ? 'flag-checkered' : 'info-circle'} size={17} color={journeyPalette.text} />
+                        <View style={styles.journeyLabelContainer}>
+                            <Text style={[styles.journeyLabel, { color: journeyPalette.text }]}>{journeyState.label}</Text>
+                        </View>
                     </View>
-                )}
+                    <Text style={[styles.journeyTitle, { color: journeyPalette.text }]}>{journeyState.title}</Text>
+                    <Text style={styles.journeyMessage}>{journeyState.message}</Text>
+                </View>
 
                 {/* Criador do Evento */}
                 {meeting.createdBy && (
@@ -465,7 +624,7 @@ export default function MeetingDetailsScreen() {
                 </Text>
             </TouchableOpacity>
 
-            {isAttending && (!meeting.status || meeting.status === 'active') && (
+            {isAttending && !endedBySchedule && (!meeting.status || meeting.status === 'active') && (
                 <TouchableOpacity style={styles.inviteSection} onPress={() => setShowInviteModal(true)} activeOpacity={0.75}>
                     <View style={styles.inviteIcon}><FontAwesome name="user-plus" size={17} color="#4338CA" /></View>
                     <View style={styles.inviteContent}>
@@ -488,44 +647,40 @@ export default function MeetingDetailsScreen() {
 
             {confirmableCheckIns.length > 0 && (
                 <View style={styles.pendingCheckInsSection}>
-                    <Text style={styles.pendingCheckInsTitle}>Confirmações pendentes</Text>
-                    <Text style={styles.pendingCheckInsHint}>Confirme somente a presença de quem você encontrou no evento.</Text>
-                    {confirmableCheckIns.map((request) => (
-                        <View key={request.userId} style={styles.pendingCheckInRow}>
-                            <Text style={styles.pendingCheckInName} numberOfLines={1}>{request.displayName}</Text>
-                            <TouchableOpacity
-                                style={styles.confirmCheckInButton}
-                                onPress={() => handleConfirmCheckIn(request)}
-                                disabled={confirmingCheckInUserId === request.userId}
-                            >
-                                {confirmingCheckInUserId === request.userId
-                                    ? <ActivityIndicator size="small" color="#fff" />
-                                    : <Text style={styles.confirmCheckInButtonText}>Confirmar</Text>}
-                            </TouchableOpacity>
-                        </View>
-                    ))}
+                    <Text style={styles.pendingCheckInsTitle}>{confirmableCheckIns.length} check-in(s) para revisar</Text>
+                    <Text style={styles.pendingCheckInsHint}>
+                        {endedBySchedule && !canCompleteManually
+                            ? 'O prazo de duas horas terminou. As solicitações serão aprovadas automaticamente no próximo processamento.'
+                            : `Confirme quem realmente estava presente${checkInReviewDeadlineLabel ? ` até ${checkInReviewDeadlineLabel}` : ' dentro de duas horas'}. Depois do prazo, os check-ins pendentes serão aprovados automaticamente.`}
+                    </Text>
+                    {canCompleteManually && (
+                        <TouchableOpacity style={styles.openReviewButton} onPress={() => setShowCheckInReview(true)}>
+                            <Text style={styles.openReviewButtonText}>Revisar presenças e encerrar</Text>
+                        </TouchableOpacity>
+                    )}
                 </View>
             )}
 
             <View style={styles.footer}>
                 {/* Lógica de Exibição do Rodapé */}
                 {meeting.status === 'cancelled' ? (
-                    <View style={[styles.waitingCheckIn, { backgroundColor: '#fef2f2' }]}>
-                        <FontAwesome name="ban" size={24} color="#ef4444" />
-                        <Text style={[styles.waitingText, { color: '#ef4444' }]}>Evento Cancelado</Text>
-                        <Text style={styles.waitingSubtext}>Este evento foi cancelado pelo organizador e não ocorrerá mais.</Text>
-                    </View>
-                ) : isCompleted ? (
+                    null
+                ) : isCompleted || endedBySchedule ? (
                     <>
-                        <View style={styles.waitingCheckIn}>
-                            <FontAwesome name="flag-checkered" size={24} color="#6b7280" />
-                            <Text style={styles.waitingText}>Evento Encerrado</Text>
-                            <Text style={styles.waitingSubtext}>Este evento já foi finalizado pelo criador.</Text>
-                        </View>
-                        {hasCheckedIn && (
+                        {canFavoriteEvent && (
                             <TouchableOpacity style={styles.favoriteButton} onPress={handleFavoriteCompletedEvent} disabled={favoriteLoading}>
                                 {favoriteLoading ? <ActivityIndicator size="small" color="#BE123C" /> : <FontAwesome name={isFavorited ? 'heart' : 'heart-o'} size={16} color="#BE123C" />}
                                 <Text style={styles.favoriteButtonText}>{isFavorited ? 'Remover dos favoritos' : 'Adicionar aos favoritos'}</Text>
+                            </TouchableOpacity>
+                        )}
+                        {canCompleteManually && (
+                            <TouchableOpacity
+                                style={styles.endEventButton}
+                                onPress={confirmableCheckIns.length > 0 ? () => setShowCheckInReview(true) : handleEndEvent}
+                            >
+                                <Text style={styles.endEventButtonText}>
+                                    {confirmableCheckIns.length > 0 ? 'Revisar e encerrar evento' : 'Encerrar evento agora'}
+                                </Text>
                             </TouchableOpacity>
                         )}
                     </>
@@ -544,18 +699,8 @@ export default function MeetingDetailsScreen() {
                                 <Text style={styles.waitingText}>Confirmações encerradas</Text>
                                 <Text style={styles.waitingSubtext}>Não é mais possível entrar neste evento após o horário de início.</Text>
                             </View>
-                        ) : hasCheckedIn ? (
-                            <View style={styles.checkedInContainer}>
-                                <FontAwesome name="check-circle" size={24} color="#10b981" />
-                                <Text style={styles.checkedInText}>Check-in realizado! ✅</Text>
-                                <Text style={styles.checkedInSubtext}>Sua presença foi confirmada e os pontos foram adicionados.</Text>
-                            </View>
-                        ) : hasPendingCheckIn ? (
-                            <View style={styles.waitingCheckIn}>
-                                <FontAwesome name="hourglass-half" size={20} color="#D97706" />
-                                <Text style={styles.waitingText}>Aguardando confirmação</Text>
-                                <Text style={styles.waitingSubtext}>O organizador ou outro participante precisa confirmar sua presença.</Text>
-                            </View>
+                        ) : hasCheckedIn || hasPendingCheckIn ? (
+                            null
                         ) : isInProgress ? (
                             <StyledButton
                                 title="📍 Solicitar confirmação de check-in"
@@ -563,15 +708,7 @@ export default function MeetingDetailsScreen() {
                                 isLoading={checkInLoading}
                                 colors={['#10b981', '#34d399']}
                             />
-                        ) : (
-                            <View style={styles.waitingCheckIn}>
-                                <FontAwesome name="clock-o" size={20} color="#6b7280" />
-                                <Text style={styles.waitingText}>Presença confirmada</Text>
-                                <Text style={styles.waitingSubtext}>
-                                    O check-in poderá ser solicitado entre o início e o término do evento ({formatDateDisplay(meeting.date)})
-                                </Text>
-                            </View>
-                        )}
+                        ) : null}
 
                         {isAttending && !isCreator && !hasCheckedIn && isRegistrationOpen && (
                             <TouchableOpacity
@@ -618,11 +755,10 @@ export default function MeetingDetailsScreen() {
 
                         {isCreator && (
                             <View style={{ marginTop: 24 }}>
-                                <StyledButton
-                                    title="Encerrar Evento & Calcular Presenças"
-                                    onPress={handleEndEvent}
-                                    colors={['#ef4444', '#f87171']}
-                                />
+                                <View style={styles.autoCloseNotice}>
+                                    <FontAwesome name="info-circle" size={16} color="#4F46E5" />
+                                    <Text style={styles.autoCloseNoticeText}>Após o término, se você tiver feito check-in, receberá a lista para revisar em até duas horas. Sem seu check-in, as solicitações dos participantes serão aprovadas automaticamente.</Text>
+                                </View>
                                 <View style={{ height: 12 }} />
                                 <TouchableOpacity
                                     style={{ padding: 16, alignItems: 'center', borderWidth: 1, borderColor: '#ef4444', borderRadius: 12 }}
@@ -649,7 +785,51 @@ export default function MeetingDetailsScreen() {
                 onClose={() => setShowReportReasonModal(false)}
                 onSelectReason={submitEventReport}
             />
+            <ReputationFeedbackModal
+                visible={reputationFeedback !== null}
+                delta={reputationFeedback?.delta ?? 0}
+                title={reputationFeedback?.title ?? ''}
+                body={reputationFeedback?.body ?? ''}
+                onClose={() => setReputationFeedback(null)}
+            />
             {meeting && <EventInviteModal visible={showInviteModal} eventId={meeting.id} onClose={() => setShowInviteModal(false)} />}
+            <Modal visible={showCheckInReview} transparent animationType="slide" onRequestClose={() => !reviewLoading && setShowCheckInReview(false)}>
+                <SafeAreaView style={styles.reviewOverlay} edges={['bottom']}>
+                    <View style={styles.reviewSheet}>
+                        <Text style={styles.reviewTitle}>Quem realmente estava presente?</Text>
+                        <Text style={styles.reviewHint}>
+                            Revise todas as solicitações até {checkInReviewDeadlineLabel || 'duas horas após o término'}. Você pode rejeitar porque registrou seu próprio check-in. Sem revisão no prazo, todas serão aprovadas automaticamente.
+                        </Text>
+                        <ScrollView style={styles.reviewList} contentContainerStyle={styles.reviewListContent}>
+                            {confirmableCheckIns.map((request) => (
+                                <View key={request.userId} style={styles.reviewRow}>
+                                    <Text style={styles.reviewName} numberOfLines={1}>{request.displayName}</Text>
+                                    <TouchableOpacity
+                                        style={[styles.reviewChoice, styles.confirmChoice, checkInDecisions[request.userId] === 'confirmed' && styles.confirmChoiceSelected]}
+                                        onPress={() => setCheckInDecisions((current) => ({ ...current, [request.userId]: 'confirmed' }))}
+                                    >
+                                        <FontAwesome name="check" size={14} color={checkInDecisions[request.userId] === 'confirmed' ? '#FFF' : '#15803D'} />
+                                        <Text style={[styles.reviewChoiceText, checkInDecisions[request.userId] === 'confirmed' && styles.reviewChoiceTextSelected]}>Estava</Text>
+                                    </TouchableOpacity>
+                                    <TouchableOpacity
+                                        style={[styles.reviewChoice, styles.rejectChoice, checkInDecisions[request.userId] === 'rejected' && styles.rejectChoiceSelected]}
+                                        onPress={() => setCheckInDecisions((current) => ({ ...current, [request.userId]: 'rejected' }))}
+                                    >
+                                        <FontAwesome name="times" size={14} color={checkInDecisions[request.userId] === 'rejected' ? '#FFF' : '#B91C1C'} />
+                                        <Text style={[styles.reviewChoiceText, checkInDecisions[request.userId] === 'rejected' && styles.reviewChoiceTextSelected]}>Não estava</Text>
+                                    </TouchableOpacity>
+                                </View>
+                            ))}
+                        </ScrollView>
+                        <TouchableOpacity style={styles.finishReviewButton} onPress={handleReviewAndEndEvent} disabled={reviewLoading}>
+                            {reviewLoading ? <ActivityIndicator color="#FFF" /> : <Text style={styles.finishReviewButtonText}>Confirmar revisão e encerrar</Text>}
+                        </TouchableOpacity>
+                        <TouchableOpacity style={styles.reviewLaterButton} onPress={() => setShowCheckInReview(false)} disabled={reviewLoading}>
+                            <Text style={styles.reviewLaterButtonText}>Revisar depois</Text>
+                        </TouchableOpacity>
+                    </View>
+                </SafeAreaView>
+            </Modal>
         </>
     );
 }
@@ -660,8 +840,12 @@ const styles = StyleSheet.create({
     center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
     theme: { color: '#6366f1', fontWeight: 'bold', fontSize: 14, textTransform: 'uppercase', marginBottom: 4 },
     title: { fontSize: 28, fontWeight: 'bold', color: '#111', marginBottom: 16 },
-    inProgressBanner: { flexDirection: 'row', alignItems: 'center', alignSelf: 'flex-start', gap: 8, backgroundColor: '#D1FAE5', borderRadius: 10, paddingHorizontal: 12, paddingVertical: 8, marginBottom: 16 },
-    inProgressBannerText: { color: '#047857', fontSize: 13, fontWeight: '800' },
+    journeyCard: { borderWidth: 1, borderRadius: 16, padding: 15, marginBottom: 18 },
+    journeyHeader: { flexDirection: 'row', alignItems: 'center', gap: 7 },
+    journeyLabelContainer: { alignSelf: 'flex-start', paddingHorizontal: 2, paddingVertical: 1 },
+    journeyLabel: { fontSize: 11, lineHeight: 16, fontWeight: '900', includeFontPadding: true },
+    journeyTitle: { marginTop: 8, fontSize: 17, lineHeight: 22, fontWeight: '900' },
+    journeyMessage: { marginTop: 4, color: '#4B5563', fontSize: 13, lineHeight: 19 },
     infoRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
     infoText: { marginLeft: 8, color: '#374151', fontSize: 16 },
     section: { marginTop: 24 },
@@ -806,10 +990,31 @@ const styles = StyleSheet.create({
     pendingCheckInsSection: { marginTop: 18, padding: 16, borderRadius: 14, borderWidth: 1, borderColor: '#FDE68A', backgroundColor: '#FFFBEB' },
     pendingCheckInsTitle: { color: '#92400E', fontSize: 15, fontWeight: '800' },
     pendingCheckInsHint: { color: '#A16207', fontSize: 12, lineHeight: 17, marginTop: 4, marginBottom: 10 },
-    pendingCheckInRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingTop: 8 },
-    pendingCheckInName: { flex: 1, color: '#374151', fontSize: 14, fontWeight: '600' },
-    confirmCheckInButton: { minWidth: 88, minHeight: 36, borderRadius: 9, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 10, backgroundColor: '#16A34A' },
-    confirmCheckInButtonText: { color: '#fff', fontSize: 13, fontWeight: '800' },
+    openReviewButton: { minHeight: 42, borderRadius: 10, alignItems: 'center', justifyContent: 'center', backgroundColor: '#D97706', paddingHorizontal: 12 },
+    openReviewButtonText: { color: '#FFF', fontSize: 13, fontWeight: '800' },
+    endEventButton: { minHeight: 48, marginTop: 12, borderRadius: 12, alignItems: 'center', justifyContent: 'center', backgroundColor: '#DC2626', paddingHorizontal: 16 },
+    endEventButtonText: { color: '#FFF', fontSize: 14, fontWeight: '800' },
+    autoCloseNotice: { flexDirection: 'row', alignItems: 'center', gap: 8, padding: 12, borderRadius: 12, backgroundColor: '#EEF2FF' },
+    autoCloseNoticeText: { flex: 1, color: '#4338CA', fontSize: 12, lineHeight: 17, fontWeight: '600' },
+    reviewOverlay: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(15,23,42,0.55)' },
+    reviewSheet: { maxHeight: '82%', padding: 20, borderTopLeftRadius: 24, borderTopRightRadius: 24, backgroundColor: '#FFF' },
+    reviewTitle: { color: '#111827', fontSize: 21, fontWeight: '900' },
+    reviewHint: { color: '#6B7280', fontSize: 13, lineHeight: 19, marginTop: 6, marginBottom: 14 },
+    reviewList: { flexGrow: 0 },
+    reviewListContent: { gap: 10, paddingBottom: 8 },
+    reviewRow: { padding: 12, borderWidth: 1, borderColor: '#E5E7EB', borderRadius: 12, backgroundColor: '#F9FAFB' },
+    reviewName: { color: '#1F2937', fontSize: 15, fontWeight: '800', marginBottom: 10 },
+    reviewChoice: { minHeight: 40, borderRadius: 9, borderWidth: 1, flexDirection: 'row', gap: 6, alignItems: 'center', justifyContent: 'center', marginTop: 6 },
+    confirmChoice: { borderColor: '#86EFAC', backgroundColor: '#F0FDF4' },
+    confirmChoiceSelected: { borderColor: '#15803D', backgroundColor: '#15803D' },
+    rejectChoice: { borderColor: '#FCA5A5', backgroundColor: '#FEF2F2' },
+    rejectChoiceSelected: { borderColor: '#B91C1C', backgroundColor: '#B91C1C' },
+    reviewChoiceText: { color: '#374151', fontSize: 13, fontWeight: '800' },
+    reviewChoiceTextSelected: { color: '#FFF' },
+    finishReviewButton: { minHeight: 50, marginTop: 14, borderRadius: 12, alignItems: 'center', justifyContent: 'center', backgroundColor: '#4F46E5' },
+    finishReviewButtonText: { color: '#FFF', fontSize: 15, fontWeight: '900' },
+    reviewLaterButton: { minHeight: 44, alignItems: 'center', justifyContent: 'center' },
+    reviewLaterButtonText: { color: '#6B7280', fontSize: 14, fontWeight: '700' },
     cancelAttendanceButton: { minHeight: 46, marginTop: 12, borderRadius: 12, borderWidth: 1, borderColor: '#FECACA', backgroundColor: '#FEF2F2', alignItems: 'center', justifyContent: 'center', flexDirection: 'row', gap: 8 },
     cancelAttendanceButtonText: { color: '#B91C1C', fontSize: 14, fontWeight: '800' },
     linkIssueButton: { minHeight: 44, marginTop: 10, borderRadius: 12, borderWidth: 1, borderColor: '#FDE68A', backgroundColor: '#FFFBEB', alignItems: 'center', justifyContent: 'center', flexDirection: 'row', gap: 8, paddingHorizontal: 12 },

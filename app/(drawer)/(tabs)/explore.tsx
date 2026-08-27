@@ -1,9 +1,9 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, Image, FlatList, Dimensions, ActivityIndicator, Platform, ScrollView, Switch, Pressable, Modal, Alert, InteractionManager } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, Image, FlatList, Dimensions, ActivityIndicator, Platform, ScrollView, Switch, Pressable, Modal, Alert, InteractionManager, Linking } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons, FontAwesome } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
-import { router } from 'expo-router';
+import { router, useLocalSearchParams } from 'expo-router';
 import { useIsFocused } from '@react-navigation/native';
 import MapView, { Marker, PROVIDER_GOOGLE, PROVIDER_DEFAULT } from '../../../src/components/MapView';
 
@@ -17,7 +17,7 @@ import { doc, getDoc, collection, query, where, getDocs } from 'firebase/firesto
 import { db, auth } from '../../../src/services/firebaseConfig';
 import { functions } from '../../../src/services/firebaseConfig';
 import { httpsCallable } from 'firebase/functions';
-import { hasMatchingInterest, INTERESTS_OPTIONS } from '@/src/constants/Interests';
+import { hasMatchingInterest, INTERESTS_OPTIONS, normalizeInterests } from '@/src/constants/Interests';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const { width } = Dimensions.get('window');
@@ -32,6 +32,11 @@ function regionSearchKey(region: StoredMapRegion): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === 'object' && value !== null;
+}
+
+function getFirebaseErrorCode(error: unknown): string {
+    if (!isRecord(error) || typeof error.code !== 'string') return 'unknown';
+    return error.code;
 }
 
 const HABIT_WEEKDAYS: HabitWeekday[] = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
@@ -65,18 +70,16 @@ function parseStoredMapRegion(value: string): StoredMapRegion | null {
     }
 }
 
-import { getDateAfterDays, getTodayStr, normalizeDate } from '@/src/utils/dateUtils';
-import { isEventInProgress } from '@/src/utils/eventSchedule';
 import { useEventClock } from '@/src/hooks/useEventClock';
-import { CONFIG } from '@/src/constants/Config';
-import { getDistanceFromLatLonInKm } from '@/src/utils/distance';
+import { DISCOVERY_REASON_LABELS, getEventDiscovery } from '@/src/utils/eventDiscovery';
+import { hasEventEnded } from '@/src/utils/eventSchedule';
 import { ErrorState } from '@/src/components/ErrorState';
+import { getTodayStr, normalizeDate } from '@/src/utils/dateUtils';
+import { toUserProfile } from '@/src/utils/userProfile';
 
-const isEventLive = (date?: string, time?: string, endTime?: string, now?: Date) => isEventInProgress({ date, time, endTime }, now);
-
-// PNGs locais sÃ£o renderizados nativamente pelo mapa. NÃ£o use componentes React
+// PNGs locais são renderizados nativamente pelo mapa. Não use componentes React
 // como filhos de Marker: no Android + Fabric eles podem ser fotografados antes
-// de terminar a mediÃ§Ã£o, gerando pontos minÃºsculos ou imagens recortadas.
+// de terminar a medição, gerando pontos minúsculos ou imagens recortadas.
 const MAP_MARKER_IMAGES = {
     events: {
         general: {
@@ -165,10 +168,10 @@ const getEventMarkerCategory = (meeting: Pick<Meeting, 'theme' | 'interests'>): 
     return categoryKeywords.find(([, keywords]) => keywords.some((keyword) => eventText.includes(keyword)))?.[0] || 'general';
 };
 
-const getEventMarkerImage = (meeting: Pick<Meeting, 'theme' | 'interests'>, isLive: boolean, isPopular: boolean, blinkOn: boolean) => {
+const getEventMarkerImage = (meeting: Pick<Meeting, 'theme' | 'interests'>, isLive: boolean, isHighlighted: boolean, blinkOn: boolean) => {
     const categoryImages = MAP_MARKER_IMAGES.events[getEventMarkerCategory(meeting)];
     if (isLive) return blinkOn ? categoryImages.liveOn : categoryImages.liveOff;
-    if (isPopular) return blinkOn ? categoryImages.popularOn : categoryImages.popularOff;
+    if (isHighlighted) return blinkOn ? categoryImages.popularOn : categoryImages.popularOff;
     return categoryImages.normal;
 };
 
@@ -187,7 +190,7 @@ const CATEGORY_PALETTE = [
     { bg: '#EFF6FF', text: '#3B82F6' }, // azul
     { bg: '#ECFDF5', text: '#10B981' }, // esmeralda
     { bg: '#FFF7ED', text: '#F97316' }, // laranja
-    { bg: '#FFFBEB', text: '#D97706' }, // Ã¢mbar
+    { bg: '#FFFBEB', text: '#D97706' }, // âmbar
     { bg: '#F0FDFA', text: '#14B8A6' }, // teal
     { bg: '#FFF1F2', text: '#F43F5E' }, // rosa-avermelhado
 ];
@@ -218,9 +221,15 @@ const FILTER_CONFIG: { key: 'events' | 'communityPlaces' | 'osmPlaces' | 'google
 export default function ExploreScreen() {
     const eventClock = useEventClock();
     const isFocused = useIsFocused();
+    const { createEvent, date: requestedEventDate, requestKey } = useLocalSearchParams<{
+        createEvent?: string;
+        date?: string;
+        requestKey?: string;
+    }>();
     const [eventType, setEventType] = useState<'in-person' | 'online'>('in-person');
     const [viewMode, setViewMode] = useState<'map' | 'list'>('map');
     const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
+    const [userInterests, setUserInterests] = useState<string[]>([]);
 
     // Filtros do Mapa
     const [mapFilters, setMapFilters] = useState({
@@ -231,10 +240,13 @@ export default function ExploreScreen() {
     });
     const [mapInitialRegion, setMapInitialRegion] = useState<StoredMapRegion>(DEFAULT_MAP_REGION);
     const [searchRegion, setSearchRegion] = useState<StoredMapRegion>(DEFAULT_MAP_REGION);
+    const [storedRegionStatus, setStoredRegionStatus] = useState<'loading' | 'available' | 'missing'>('loading');
     const mapActive = isFocused && eventType === 'in-person' && viewMode === 'map';
     const {
         location,
         locationStatus,
+        locationIssue,
+        canAskLocationPermissionAgain,
         meetings,
         places,
         loading,
@@ -243,8 +255,25 @@ export default function ExploreScreen() {
         osmError,
         osmLoading,
         retry,
+        retryLocation,
         refreshPlace,
     } = useExploreData(mapFilters.osmPlaces, mapFilters.communityPlaces, isFocused, mapActive, searchRegion);
+    const locationWarningText = locationIssue === 'permission-denied'
+        ? canAskLocationPermissionAgain
+            ? 'Permita o acesso à localização e toque para tentar novamente.'
+            : 'A permissão de localização está bloqueada. Toque para abrir as configurações.'
+        : locationIssue === 'services-disabled'
+            ? 'O GPS está desativado. Toque para ativar e tentar novamente.'
+            : 'Não foi possível obter sua posição. Vá para uma área aberta e tente novamente.';
+    const handleLocationRecovery = () => {
+        if (locationIssue === 'permission-denied' && !canAskLocationPermissionAgain) {
+            Linking.openSettings().catch(() => {
+                console.warn('[Explore] app_settings_open_failed');
+            });
+            return;
+        }
+        void retryLocation();
+    };
     const toggleMapFilter = (key: keyof typeof mapFilters) => {
         setMapFilters(prev => ({ ...prev, [key]: !prev[key] }));
     };
@@ -260,7 +289,7 @@ export default function ExploreScreen() {
     const [repeatStartDate, setRepeatStartDate] = useState('');
     const [pickingLocation, setPickingLocation] = useState(false);
     const [newMeeting, setNewMeeting] = useState<CreateMeetingDraft>({
-        title: '', interests: [] as string[], description: '', locationName: '', date: '', time: '', endTime: '',
+        title: '', interests: [] as string[], description: '', locationName: '', date: '', time: '', endDate: '', endTime: '',
         lat: 0, lng: 0, type: 'in-person', meetingLink: '', placeId: '',
     });
 
@@ -273,6 +302,7 @@ export default function ExploreScreen() {
     const placeRequestId = useRef(0);
     const isExploreMounted = useRef(true);
     const pendingCreateEventTask = useRef<ReturnType<typeof InteractionManager.runAfterInteractions> | null>(null);
+    const handledCalendarCreateRequest = useRef<string | null>(null);
     const regionSearchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     useEffect(() => {
@@ -287,17 +317,90 @@ export default function ExploreScreen() {
 
     useEffect(() => {
         AsyncStorage.getItem(LAST_MAP_REGION_KEY).then((storedRegion) => {
-            if (!storedRegion) return;
+            if (!storedRegion) {
+                setStoredRegionStatus('missing');
+                return;
+            }
             const region = parseStoredMapRegion(storedRegion);
             if (region) {
                 setMapInitialRegion(region);
                 setSearchRegion(region);
+                setStoredRegionStatus('available');
             }
             else {
                 console.warn('[Explore] last_map_region_invalid');
+                setStoredRegionStatus('missing');
             }
-        }).catch(() => console.warn('[Explore] last_map_region_load_failed'));
+        }).catch(() => {
+            console.warn('[Explore] last_map_region_load_failed');
+            setStoredRegionStatus('missing');
+        });
     }, []);
+
+    useEffect(() => {
+        if (storedRegionStatus !== 'missing' || !location) return;
+        const currentRegion: StoredMapRegion = {
+            latitude: location.coords.latitude,
+            longitude: location.coords.longitude,
+            latitudeDelta: 0.02,
+            longitudeDelta: 0.02,
+        };
+        setMapInitialRegion(currentRegion);
+        setSearchRegion(currentRegion);
+        setStoredRegionStatus('available');
+        AsyncStorage.setItem(LAST_MAP_REGION_KEY, JSON.stringify(currentRegion)).catch(() => {
+            console.warn('[Explore] initial_location_region_save_failed');
+        });
+    }, [location, storedRegionStatus]);
+
+    useEffect(() => {
+        if (!isFocused || createEvent !== '1' || typeof requestedEventDate !== 'string') return;
+        const normalizedDate = normalizeDate(requestedEventDate);
+        const operationKey = `${requestKey || 'calendar'}:${requestedEventDate}`;
+        if (handledCalendarCreateRequest.current === operationKey) return;
+        handledCalendarCreateRequest.current = operationKey;
+
+        router.setParams({ createEvent: '', date: '', requestKey: '' });
+        if (!normalizedDate || normalizedDate <= getTodayStr()) {
+            console.warn('[Explore] calendar_create_date_invalid');
+            return;
+        }
+
+        setShowMapOnboarding(false);
+        pendingCreateEventTask.current?.cancel();
+        pendingCreateEventTask.current = InteractionManager.runAfterInteractions(() => {
+            if (!isExploreMounted.current) return;
+            setNewMeeting((current) => ({
+                ...current,
+                date: normalizedDate,
+                endDate: normalizedDate,
+                type: eventType,
+            }));
+            setModalVisible(true);
+            pendingCreateEventTask.current = null;
+        });
+    }, [createEvent, eventType, isFocused, requestKey, requestedEventDate]);
+
+    // Uma leitura pontual ao focar a tela mantém os interesses alinhados ao perfil
+    // sem sustentar outro listener do Firestore durante o uso do mapa.
+    useEffect(() => {
+        if (!isFocused) return;
+        const currentUid = auth.currentUser?.uid;
+        if (!currentUid) return;
+
+        let active = true;
+        getDoc(doc(db, 'users', currentUid)).then((snapshot) => {
+            if (active && snapshot.exists()) {
+                setUserInterests(normalizeInterests(snapshot.data().interests));
+            }
+        }).catch((error) => {
+            if (__DEV__) console.warn('[Explore] user_interests_load_failed', error);
+        });
+
+        return () => {
+            active = false;
+        };
+    }, [isFocused]);
 
     const handleMapRegionChange = (region: StoredMapRegion) => {
         AsyncStorage.setItem(LAST_MAP_REGION_KEY, JSON.stringify(region)).catch(() => {
@@ -316,6 +419,7 @@ export default function ExploreScreen() {
 
     useEffect(() => {
         const checkMapFirstTime = async () => {
+            if (createEvent === '1' || handledCalendarCreateRequest.current !== null) return;
             try {
                 const hasSeen = await AsyncStorage.getItem('@reunionhub_has_seen_map_onboarding');
                 if (hasSeen !== 'true') {
@@ -326,7 +430,7 @@ export default function ExploreScreen() {
             }
         };
         checkMapFirstTime();
-    }, []);
+    }, [createEvent]);
 
     const handleCloseMapOnboarding = async () => {
         try {
@@ -369,8 +473,7 @@ export default function ExploreScreen() {
                             profiles = [
                                 ...profiles,
                                 ...profilesSnapshot.docs
-                                    .filter((profile) => profile.data().shareFrequentedPlaces === true)
-                                    .map((profile) => ({ uid: profile.id, ...profile.data() } as User)),
+                                    .map((profile) => toUserProfile(profile.id, profile.data())),
                             ];
                         }
                     }
@@ -449,16 +552,27 @@ export default function ExploreScreen() {
                 vocations: selectedPlace.vocations || [],
                 schedule,
             });
-            const refreshedPlace = await refreshPlace(selectedPlace.id);
+            const currentUserId = auth.currentUser.uid;
+            const [refreshedPlace, currentUserSnapshot] = await Promise.all([
+                refreshPlace(selectedPlace.id),
+                getDoc(doc(db, 'users', currentUserId)),
+            ]);
             if (refreshedPlace) setSelectedPlace({
                 ...refreshedPlace,
                 currentUserHabitSchedule: schedule,
                 isCurrentUserFrequenting: true,
             });
+            if (currentUserSnapshot.exists()) {
+                const currentUserProfile = toUserProfile(currentUserSnapshot.id, currentUserSnapshot.data());
+                setFrequentersProfiles((currentProfiles) => {
+                    const withoutCurrentUser = currentProfiles.filter(({ uid }) => uid !== currentUserId);
+                    return [...withoutCurrentUser, currentUserProfile];
+                });
+            }
             Alert.alert("Sucesso", "Sua rotina foi salva neste local!");
         } catch (error) {
-            console.error(error);
-            Alert.alert("Erro", "NÃ£o foi possÃ­vel salvar a rotina.");
+            console.error('[Explore] place_habit_save_failed', { code: getFirebaseErrorCode(error) });
+            Alert.alert("Erro", "Não foi possível salvar a rotina.");
             throw error;
         }
     };
@@ -475,15 +589,17 @@ export default function ExploreScreen() {
                 currentUserHabitSchedule: undefined,
                 isCurrentUserFrequenting: false,
             });
-            Alert.alert('Rotina removida', 'VocÃª nÃ£o aparece mais como frequentador deste local.');
+            setFrequentersProfiles((currentProfiles) => currentProfiles.filter(({ uid }) => uid !== auth.currentUser?.uid));
+            Alert.alert('Rotina removida', 'Você não aparece mais como frequentador deste local.');
         } catch (error) {
             console.error('[Explore] place_habit_remove_failed', error);
-            Alert.alert('Erro', 'NÃ£o foi possÃ­vel remover sua rotina deste local.');
+            Alert.alert('Erro', 'Não foi possível remover sua rotina deste local.');
             throw error;
         }
     };
 
     const filteredMeetings = meetings.filter(m => {
+        if (m.status === 'cancelled' || m.status === 'completed' || hasEventEnded(m, eventClock)) return false;
         if (m.type !== eventType) return false;
         if (selectedCategory && !hasMatchingInterest([m.theme, ...(m.interests || [])], [selectedCategory])) return false;
         return true;
@@ -496,33 +612,34 @@ export default function ExploreScreen() {
         return true;
     }), [places, mapFilters.communityPlaces, mapFilters.osmPlaces]);
 
-    const isPopularNearbyMeeting = (meeting: Meeting) => {
-        if ((meeting.attendees?.length || 0) < CONFIG.POPULAR_ATTENDEES_COUNT || meeting.type !== 'in-person' || !location) return false;
-        const normalizedDate = normalizeDate(meeting.date);
-        if (!normalizedDate || normalizedDate < getTodayStr() || normalizedDate > getDateAfterDays(CONFIG.AGENDA_DISCOVERY_DAYS)) return false;
-        if (!Number.isFinite(Number(meeting.lat)) || !Number.isFinite(Number(meeting.lng))) return false;
-        return getDistanceFromLatLonInKm(
-            location.coords.latitude,
-            location.coords.longitude,
-            Number(meeting.lat),
-            Number(meeting.lng)
-        ) <= CONFIG.NEARBY_RADIUS_KM;
+    const userCoordinates = location
+        ? { latitude: location.coords.latitude, longitude: location.coords.longitude }
+        : null;
+    const getMeetingDiscovery = (meeting: Meeting) => getEventDiscovery(meeting, {
+        userCoordinates,
+        userInterests,
+        now: eventClock,
+    });
+    const isPopularMeeting = (meeting: Meeting) =>
+        getMeetingDiscovery(meeting).reasons.includes('popular');
+    const isInterestHighlightMeeting = (meeting: Meeting) => {
+        const discovery = getMeetingDiscovery(meeting);
+        return discovery.shouldAnimateOnMap && discovery.reasons.includes('interest');
     };
+    const shouldBlinkMeeting = (meeting: Meeting) => getMeetingDiscovery(meeting).shouldAnimateOnMap;
 
     const markerMeetingForPlace = (place: Place) => {
         if (!mapFilters.events) return undefined;
         const eventsAtPlace = filteredMeetings.filter((meeting) => isMeetingAtPlace(place, meeting));
-        return eventsAtPlace.find((meeting) => isEventLive(meeting.date, meeting.time, meeting.endTime, eventClock))
-            || eventsAtPlace.find(isPopularNearbyMeeting)
+        return eventsAtPlace.find((meeting) => getMeetingDiscovery(meeting).reasons.includes('in_progress'))
+            || eventsAtPlace.find(isPopularMeeting)
+            || eventsAtPlace.find(isInterestHighlightMeeting)
             || eventsAtPlace[0];
     };
 
-    // Um Ãºnico relÃ³gio alterna os PNGs dos eventos destacados. Isso mantÃ©m o
+    // Um único relógio alterna os PNGs dos eventos destacados. Isso mantém o
     // efeito de piscar sem criar Animated.Value, loop ou View dentro de cada Marker.
-    const hasBlinkingMapEvent = mapFilters.events && filteredMeetings.some((meeting) =>
-        isEventLive(meeting.date, meeting.time, meeting.endTime, eventClock)
-        || isPopularNearbyMeeting(meeting)
-    );
+    const hasBlinkingMapEvent = mapFilters.events && filteredMeetings.some(shouldBlinkMeeting);
     const [markerBlinkOn, setMarkerBlinkOn] = useState(true);
 
     useEffect(() => {
@@ -538,11 +655,15 @@ export default function ExploreScreen() {
         return () => clearInterval(blinkTimer);
     }, [hasBlinkingMapEvent, viewMode]);
 
-    const renderMeetingCard = ({ item }: { item: any }) => (
+    const renderMeetingCard = ({ item }: { item: Meeting }) => {
+        const discovery = getMeetingDiscovery(item);
+        const isLive = discovery.reasons.includes('in_progress');
+        const discoveryReason = isLive ? null : discovery.primaryReason;
+        return (
         <TouchableOpacity style={styles.card} onPress={() => router.push(`/event/${item.id}` as any)}>
             <View style={styles.cardHeader}>
                 <View style={styles.tagContainer}><Text style={styles.tagText}>{item.theme || 'Evento'}</Text></View>
-                <Text style={styles.dateText}>{item.date ? item.date.split('-').reverse().join('/') : ''} â€¢ {item.time}</Text>
+                <Text style={styles.dateText}>{item.date ? item.date.split('-').reverse().join('/') : ''} • {item.time}</Text>
             </View>
             <Text style={styles.cardTitle} numberOfLines={1}>{item.title}</Text>
             <View style={styles.cardFooter}>
@@ -550,15 +671,21 @@ export default function ExploreScreen() {
                     <Ionicons name={eventType === 'online' ? "videocam-outline" : "location-outline"} size={16} color="#6B7280" />
                     <Text style={styles.locationText} numberOfLines={1}>{item.locationName}</Text>
                 </View>
-                {isEventLive(item.date, item.time, item.endTime, eventClock) && (
+                {isLive && (
                     <View style={styles.liveBadge}>
                         <View style={styles.liveDot} />
                         <Text style={styles.liveText}>Ao vivo</Text>
                     </View>
                 )}
+                {discoveryReason && (
+                    <View style={styles.discoveryBadge}>
+                        <Text style={styles.discoveryBadgeText}>{DISCOVERY_REASON_LABELS[discoveryReason]}</Text>
+                    </View>
+                )}
             </View>
         </TouchableOpacity>
-    );
+        );
+    };
 
     if (loading) {
         return (
@@ -692,8 +819,8 @@ export default function ExploreScreen() {
             <View style={styles.content}>
                 {eventType === 'online' || viewMode === 'list' ? error ? (
                     <ErrorState
-                        title="NÃ£o foi possÃ­vel carregar os eventos"
-                        message="Confira sua conexÃ£o e tente novamente."
+                        title="Não foi possível carregar os eventos"
+                        message="Confira sua conexão e tente novamente."
                         onRetry={retry}
                     />
                 ) : (
@@ -746,13 +873,16 @@ export default function ExploreScreen() {
                             {visiblePlaces.map((place) => {
                                 const markerMeeting = markerMeetingForPlace(place);
                                 const hasActiveEvent = Boolean(markerMeeting);
-                                const isLive = markerMeeting ? isEventLive(markerMeeting.date, markerMeeting.time, markerMeeting.endTime, eventClock) : false;
-                                const isPopularNearby = markerMeeting ? isPopularNearbyMeeting(markerMeeting) : false;
+                                const discovery = markerMeeting ? getMeetingDiscovery(markerMeeting) : null;
+                                const isLive = discovery?.reasons.includes('in_progress') === true;
+                                const isPopular = discovery?.reasons.includes('popular') === true;
+                                const matchesInterestToday = discovery?.shouldAnimateOnMap === true && discovery.reasons.includes('interest');
+                                const isHighlighted = isPopular || matchesInterestToday;
                                 const hasFrequenters = (place.frequenters?.length || 0) > 0;
                                 const isDiscovered = Boolean(place.discovererId || place.discovererName);
                                 const isOsmPlace = place.id.startsWith('osm_');
                                 const markerImage = markerMeeting
-                                    ? getEventMarkerImage(markerMeeting, isLive, isPopularNearby, markerBlinkOn)
+                                    ? getEventMarkerImage(markerMeeting, isLive, isHighlighted, markerBlinkOn)
                                     : hasFrequenters
                                         ? MAP_MARKER_IMAGES.community
                                         : isDiscovered
@@ -768,7 +898,7 @@ export default function ExploreScreen() {
                                     title={place.name}
                                     image={markerImage}
                                     anchor={{ x: 0.5, y: 0.5 }}
-                                    zIndex={isLive ? 100 : isPopularNearby ? 80 : hasActiveEvent ? 40 : hasFrequenters ? 30 : 10}
+                                    zIndex={isLive ? 100 : isPopular ? 80 : matchesInterestToday ? 70 : hasActiveEvent ? 40 : hasFrequenters ? 30 : 10}
                                 />
                                 );
                             })}
@@ -779,27 +909,30 @@ export default function ExploreScreen() {
                                 && !isNaN(Number(meeting.lng))
                                 && !visiblePlaces.some((place) => isMeetingAtPlace(place, meeting))
                             ).map((meeting) => {
-                                const isLive = isEventLive(meeting.date, meeting.time, meeting.endTime, eventClock);
-                                const isPopularNearby = isPopularNearbyMeeting(meeting);
+                                const discovery = getMeetingDiscovery(meeting);
+                                const isLive = discovery.reasons.includes('in_progress');
+                                const isPopular = discovery.reasons.includes('popular');
+                                const matchesInterestToday = discovery.shouldAnimateOnMap && discovery.reasons.includes('interest');
+                                const isHighlighted = isPopular || matchesInterestToday;
                                 return (
                                 <Marker
                                     key={meeting.id}
                                     coordinate={{ latitude: Number(meeting.lat), longitude: Number(meeting.lng) }}
                                     onPress={() => router.push(`/event/${meeting.id}` as any)}
                                     title={meeting.title}
-                                    image={getEventMarkerImage(meeting, isLive, isPopularNearby, markerBlinkOn)}
+                                    image={getEventMarkerImage(meeting, isLive, isHighlighted, markerBlinkOn)}
                                     anchor={{ x: 0.5, y: 0.5 }}
-                                    zIndex={isLive ? 100 : isPopularNearby ? 80 : 1}
+                                    zIndex={isLive ? 100 : isPopular ? 80 : matchesInterestToday ? 70 : 1}
                                 />
                                 );
                             })}
                         </MapView>
                         <View style={styles.mapStatusContainer} pointerEvents="box-none">
                             {(locationStatus === 'denied' || locationStatus === 'error') && (
-                                <View style={styles.mapStatusWarning}>
+                                <TouchableOpacity style={styles.mapStatusWarning} onPress={handleLocationRecovery}>
                                     <Ionicons name="location-outline" size={15} color="#92400E" />
-                                    <Text style={styles.mapStatusWarningText}>LocalizaÃ§Ã£o indisponÃ­vel. O mapa e a regiÃ£o salva continuam funcionando.</Text>
-                                </View>
+                                    <Text style={styles.mapStatusWarningText}>{locationWarningText}</Text>
+                                </TouchableOpacity>
                             )}
                             {mapFilters.events && error && (
                                 <TouchableOpacity style={styles.mapStatusError} onPress={retry}>
@@ -816,28 +949,32 @@ export default function ExploreScreen() {
                             {mapFilters.osmPlaces && osmLoading && (
                                 <View style={styles.mapStatusInfo}>
                                     <ActivityIndicator size="small" color="#047857" />
-                                    <Text style={styles.mapStatusInfoText}>Buscando locais OSM nesta Ã¡rea...</Text>
+                                    <Text style={styles.mapStatusInfoText}>Buscando locais OSM nesta área...</Text>
                                 </View>
                             )}
                             {mapFilters.osmPlaces && osmError && !osmLoading && (
                                 <TouchableOpacity style={styles.mapStatusError} onPress={retry}>
                                     <Ionicons name="refresh" size={15} color="#B91C1C" />
-                                    <Text style={styles.mapStatusErrorText}>Overpass indisponÃ­vel. Tentar novamente</Text>
+                                    <Text style={styles.mapStatusErrorText}>Overpass indisponível. Tentar novamente</Text>
                                 </TouchableOpacity>
                             )}
                         </View>
                         <View style={styles.mapActions}>
                             <TouchableOpacity style={styles.fab} onPress={() => {
-                                if (location && mapRef.current) {
-                                    mapRef.current.animateToRegion({
-                                        latitude: location.coords.latitude,
-                                        longitude: location.coords.longitude,
-                                        latitudeDelta: 0.01,
-                                        longitudeDelta: 0.01,
-                                    }, 1000);
+                                if (!location) {
+                                    void retryLocation();
+                                    return;
                                 }
+                                mapRef.current?.animateToRegion({
+                                    latitude: location.coords.latitude,
+                                    longitude: location.coords.longitude,
+                                    latitudeDelta: 0.01,
+                                    longitudeDelta: 0.01,
+                                }, 1000);
                             }}>
-                                <Ionicons name="navigate" size={22} color="#6366F1" />
+                                {locationStatus === 'checking' && !location
+                                    ? <ActivityIndicator size="small" color="#6366F1" />
+                                    : <Ionicons name="navigate" size={22} color="#6366F1" />}
                             </TouchableOpacity>
                         </View>
                     </View>
@@ -888,9 +1025,12 @@ export default function ExploreScreen() {
                 place={selectedPlace}
                 loadingProfiles={loadingProfiles}
                 frequentersProfiles={frequentersProfiles}
-                placeEvents={selectedPlace ? meetings.filter(m => 
-                    m.placeId === selectedPlace.id || 
-                    (Math.abs(Number(m.lat) - selectedPlace.latitude) < 0.0001 && Math.abs(Number(m.lng) - selectedPlace.longitude) < 0.0001)
+                placeEvents={selectedPlace ? meetings.filter(m =>
+                    m.status !== 'cancelled'
+                    && m.status !== 'completed'
+                    && !hasEventEnded(m, eventClock)
+                    && (m.placeId === selectedPlace.id ||
+                    (Math.abs(Number(m.lat) - selectedPlace.latitude) < 0.0001 && Math.abs(Number(m.lng) - selectedPlace.longitude) < 0.0001))
                 ) : []}
                 onSaveHabit={handleSavePlaceHabit}
                 onRemoveHabit={handleRemovePlaceHabit}
@@ -929,7 +1069,7 @@ export default function ExploreScreen() {
                             Explorar Eventos e Locais
                         </Text>
                         <Text style={{ fontSize: 14, color: '#4b5563', textAlign: 'center', lineHeight: 22, marginBottom: 20 }}>
-                            Use os filtros acima para ver eventos da comunidade ou ative as marcaÃ§Ãµes de Locais Vagos (banco do Google Maps e Overpass) para conhecer novos lugares!
+                            Use os filtros acima para ver eventos da comunidade ou ative as marcações de Locais Vagos (banco do Google Maps e Overpass) para conhecer novos lugares!
                         </Text>
                         <TouchableOpacity 
                             onPress={handleCloseMapOnboarding} 
@@ -1046,6 +1186,8 @@ const styles = StyleSheet.create({
     liveBadge: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#FEF2F2', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10, gap: 5 },
     liveDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: '#EF4444' },
     liveText: { fontSize: 11, color: '#EF4444', fontWeight: 'bold' },
+    discoveryBadge: { backgroundColor: '#EEF2FF', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10 },
+    discoveryBadgeText: { fontSize: 10, color: '#4F46E5', fontWeight: '800' },
     actions: { position: 'absolute', bottom: 20, right: 20, alignItems: 'center' },
     createButton: { borderRadius: 30, shadowColor: "#6366F1", shadowOffset: { width: 0, height: 6 }, shadowOpacity: 0.35, shadowRadius: 12, elevation: 8 },
     gradientButton: { flexDirection: 'row', alignItems: 'center', paddingVertical: 13, paddingHorizontal: 20, borderRadius: 30 },

@@ -1,52 +1,75 @@
 import * as admin from 'firebase-admin';
 
-export type ExpoPushMessage = {
-    token: string;
+export type PushChannel = 'messages' | 'events' | 'recommendations';
+
+export type PushMessage = {
+    userId: string;
+    registrationPath?: string;
+    expoToken?: string;
+    nativeToken?: string;
+    platform?: string;
     title: string;
     body: string;
     data: Record<string, unknown>;
+    channel: PushChannel;
+    priority: 'normal' | 'high';
+    tag?: string;
+    collapseKey?: string;
+};
+
+export type PushDeliverySummary = {
+    requested: number;
+    deliveredToProvider: number;
+    rejected: number;
+    missingToken: number;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === 'object' && value !== null;
 }
 
-function isExpoPushToken(token: string): boolean {
-    return token.startsWith('ExponentPushToken') || token.startsWith('ExpoPushToken');
+function isExpoPushToken(token: string | undefined): token is string {
+    return typeof token === 'string' && (token.startsWith('ExponentPushToken') || token.startsWith('ExpoPushToken'));
 }
 
-async function removeInvalidPushTokens(
-    db: FirebaseFirestore.Firestore,
-    invalidTokens: string[]
-): Promise<void> {
-    const uniqueTokens = [...new Set(invalidTokens)];
-    for (let index = 0; index < uniqueTokens.length; index += 10) {
-        const tokenChunk = uniqueTokens.slice(index, index + 10);
-        const profiles = await db.collection('users').where('expoPushToken', 'in', tokenChunk).get();
-        if (profiles.empty) continue;
-
-        const batch = db.batch();
-        profiles.docs.forEach((profile) => {
-            // A consulta seleciona somente perfis que ainda possuem um dos tokens inválidos.
-            batch.update(profile.ref, { expoPushToken: admin.firestore.FieldValue.delete() });
-        });
-        await batch.commit();
-    }
-    if (uniqueTokens.length > 0) {
-        console.info('[PushNotification] invalid_tokens_removed', { tokenCount: uniqueTokens.length });
-    }
+function stringData(data: Record<string, unknown>): Record<string, string> {
+    return Object.fromEntries(Object.entries(data).flatMap(([key, value]) => {
+        if (typeof value === 'string') return [[key, value]];
+        if (typeof value === 'number' || typeof value === 'boolean') return [[key, String(value)]];
+        return [];
+    }));
 }
 
-export async function sendExpoPushMessages(
+async function clearInvalidToken(
     db: FirebaseFirestore.Firestore,
-    messages: ExpoPushMessage[]
+    message: PushMessage,
+    field: 'nativePushToken' | 'expoPushToken'
 ): Promise<void> {
-    const validMessages = messages.filter(({ token }) => isExpoPushToken(token));
-    if (validMessages.length === 0) return;
+    if (!message.registrationPath?.startsWith('pushDevices/')) return;
+    const tokenRef = db.doc(message.registrationPath);
+    const tokenSnapshot = await tokenRef.get();
+    if (!tokenSnapshot.exists) return;
 
-    const invalidTokens: string[] = [];
-    for (let index = 0; index < validMessages.length; index += 100) {
-        const chunk = validMessages.slice(index, index + 100);
+    const otherField = field === 'nativePushToken' ? 'expoPushToken' : 'nativePushToken';
+    const otherToken = tokenSnapshot.data()?.[otherField];
+    if (typeof otherToken !== 'string' || !otherToken) {
+        await tokenRef.delete();
+        return;
+    }
+    await tokenRef.update({ [field]: admin.firestore.FieldValue.delete() });
+}
+
+async function sendExpoFallback(
+    db: FirebaseFirestore.Firestore,
+    messages: PushMessage[]
+): Promise<{ delivered: number; rejected: number }> {
+    let delivered = 0;
+    let rejected = 0;
+    for (const message of messages) {
+        if (!isExpoPushToken(message.expoToken)) {
+            rejected += 1;
+            continue;
+        }
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 8000);
         try {
@@ -57,52 +80,96 @@ export async function sendExpoPushMessages(
                     'Accept-encoding': 'gzip, deflate',
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify(chunk.map(({ token, title, body, data }) => ({
-                    to: token,
+                body: JSON.stringify({
+                    to: message.expoToken,
                     sound: 'default',
-                    title,
-                    body,
-                    data,
-                }))),
+                    title: message.title,
+                    body: message.body,
+                    data: message.data,
+                    channelId: message.channel,
+                    priority: message.priority,
+                    collapseId: message.collapseKey,
+                }),
                 signal: controller.signal,
             });
-            if (!response.ok) {
-                console.warn('[PushNotification] request_rejected', { recipientCount: chunk.length, status: response.status });
+            const payload: unknown = await response.json().catch(() => null);
+            const ticket = isRecord(payload) && isRecord(payload.data) ? payload.data : null;
+            if (!response.ok || !ticket || ticket.status !== 'ok') {
+                rejected += 1;
+                const errorCode = ticket && isRecord(ticket.details) && typeof ticket.details.error === 'string'
+                    ? ticket.details.error
+                    : `HTTP_${response.status}`;
+                console.error('[PushNotification] expo_rejected', { userId: message.userId, errorCode });
+                if (errorCode === 'DeviceNotRegistered') await clearInvalidToken(db, message, 'expoPushToken');
                 continue;
             }
-
-            const payload: unknown = await response.json();
-            const tickets = isRecord(payload) && Array.isArray(payload.data) ? payload.data : [];
-            tickets.forEach((ticket, ticketIndex) => {
-                if (!isRecord(ticket) || ticket.status !== 'error' || !isRecord(ticket.details)) return;
-                if (ticket.details.error === 'DeviceNotRegistered') {
-                    const message = chunk[ticketIndex];
-                    if (message) invalidTokens.push(message.token);
-                }
-            });
+            delivered += 1;
         } catch (error: unknown) {
-            const timedOut = error instanceof Error && error.name === 'AbortError';
-            console.error(timedOut ? '[PushNotification] request_timeout' : '[PushNotification] request_failed', { recipientCount: chunk.length });
+            rejected += 1;
+            console.error(error instanceof Error && error.name === 'AbortError'
+                ? '[PushNotification] expo_timeout'
+                : '[PushNotification] expo_request_failed', { userId: message.userId });
         } finally {
             clearTimeout(timeout);
         }
     }
-
-    if (invalidTokens.length > 0) {
-        try {
-            await removeInvalidPushTokens(db, invalidTokens);
-        } catch {
-            console.error('[PushNotification] invalid_token_cleanup_failed', { tokenCount: invalidTokens.length });
-        }
-    }
+    return { delivered, rejected };
 }
 
-export async function sendExpoPushNotification(
+export async function sendPushMessages(
     db: FirebaseFirestore.Firestore,
-    pushTokens: string[],
-    title: string,
-    body: string,
-    data: Record<string, unknown> = {}
-): Promise<void> {
-    await sendExpoPushMessages(db, pushTokens.map((token) => ({ token, title, body, data })));
+    messages: PushMessage[]
+): Promise<PushDeliverySummary> {
+    const summary: PushDeliverySummary = {
+        requested: messages.length,
+        deliveredToProvider: 0,
+        rejected: 0,
+        missingToken: 0,
+    };
+    const expoFallback: PushMessage[] = [];
+    const nativeMessages = messages.filter((message) => message.platform === 'android' && typeof message.nativeToken === 'string' && message.nativeToken.length > 0);
+    const nativeRegistrationPaths = new Set(nativeMessages.map(({ registrationPath }) => registrationPath).filter((value): value is string => Boolean(value)));
+    messages.filter((message) => !message.registrationPath || !nativeRegistrationPaths.has(message.registrationPath)).forEach((message) => {
+        if (isExpoPushToken(message.expoToken)) expoFallback.push(message);
+        else summary.missingToken += 1;
+    });
+
+    for (let offset = 0; offset < nativeMessages.length; offset += 500) {
+        const chunk = nativeMessages.slice(offset, offset + 500);
+        const response = await admin.messaging().sendEach(chunk.map((message) => ({
+            token: message.nativeToken!,
+            notification: { title: message.title, body: message.body },
+            data: stringData(message.data),
+            android: {
+                priority: message.priority,
+                collapseKey: message.collapseKey,
+                notification: {
+                    channelId: message.channel,
+                    sound: 'default',
+                    tag: message.tag,
+                },
+            },
+        })));
+        for (let index = 0; index < response.responses.length; index += 1) {
+            const result = response.responses[index];
+            const message = chunk[index];
+            if (result.success) {
+                summary.deliveredToProvider += 1;
+                continue;
+            }
+            const errorCode = result.error?.code || 'messaging/unknown-error';
+            console.error('[PushNotification] fcm_rejected', { userId: message.userId, errorCode });
+            if (errorCode === 'messaging/registration-token-not-registered' || errorCode === 'messaging/invalid-registration-token') {
+                await clearInvalidToken(db, message, 'nativePushToken');
+            }
+            if (isExpoPushToken(message.expoToken)) expoFallback.push(message);
+            else summary.rejected += 1;
+        }
+    }
+
+    const expoResult = await sendExpoFallback(db, expoFallback);
+    summary.deliveredToProvider += expoResult.delivered;
+    summary.rejected += expoResult.rejected;
+    console.info('[PushNotification] delivery_completed', summary);
+    return summary;
 }

@@ -1,11 +1,10 @@
-import { View, Text, StyleSheet, ScrollView, Alert, TouchableOpacity, Image, TextInput, Linking, Switch, AppState } from 'react-native';
+import { View, Text, StyleSheet, ScrollView, Alert, TouchableOpacity, Image, TextInput, Linking, Switch, AppState, KeyboardAvoidingView, Platform, Modal } from 'react-native';
 import { Dispatch, SetStateAction, useEffect, useState } from 'react';
 import { auth, db, functions } from '../../src/services/firebaseConfig';
 import { httpsCallable } from 'firebase/functions';
-import { doc, setDoc, collection, query, where, getDocs, limit, onSnapshot } from 'firebase/firestore';
-import { updateProfile, sendEmailVerification } from 'firebase/auth';
+import { deleteField, doc, setDoc, onSnapshot, serverTimestamp } from 'firebase/firestore';
+import { EmailAuthProvider, reauthenticateWithCredential, sendEmailVerification, updatePassword, updateProfile } from 'firebase/auth';
 import { storage } from '../../src/services/firebaseConfig';
-import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import * as ImagePicker from 'expo-image-picker';
 import { FontAwesome } from '@expo/vector-icons';
 import { StyledButton } from '@/src/components/StyledButton';
@@ -17,6 +16,10 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { INTERESTS_OPTIONS, normalizeInterests } from '../../src/constants/Interests';
 import { User } from '../../src/types';
 import { toUserProfile } from '../../src/utils/userProfile';
+import { unregisterCurrentPushDevice } from '@/src/services/pushRegistrationService';
+import { setEventRemindersEnabled, setReengagementReminderEnabled } from '@/src/utils/Notifications';
+import { clearRecommendationLocationCache } from '@/src/services/recommendationLocationService';
+import { isValidNickname, NicknameUnavailableError, updateOwnProfile, uploadProfileImage } from '@/src/services/profileService';
 
 function profileLog(event: string, context: Record<string, boolean | number> = {}) {
     if (__DEV__) console.info(`[Profile] ${event}`, context);
@@ -36,6 +39,16 @@ export default function ProfileScreen() {
     const [editInterests, setEditInterests] = useState<string[]>([]);
     const [shareFrequentedPlaces, setShareFrequentedPlaces] = useState(false);
     const [showPopularOutsideInterests, setShowPopularOutsideInterests] = useState(true);
+    const [notifyMessages, setNotifyMessages] = useState(true);
+    const [notifyEventUpdates, setNotifyEventUpdates] = useState(true);
+    const [notifyEventReminders, setNotifyEventReminders] = useState(true);
+    const [notifyRecommendations, setNotifyRecommendations] = useState(false);
+    const [savedNotificationSettings, setSavedNotificationSettings] = useState({
+        notifyMessages: true,
+        notifyEventUpdates: true,
+        notifyEventReminders: true,
+        notifyRecommendations: false,
+    });
     const [editPhotoURL, setEditPhotoURL] = useState<string | null>(null);
     const [loading, setLoading] = useState(false);
     const [showTermsModal, setShowTermsModal] = useState(false);
@@ -43,6 +56,58 @@ export default function ProfileScreen() {
     const [isEmailVerified, setIsEmailVerified] = useState(auth.currentUser?.emailVerified ?? false);
     const [emailVerificationSent, setEmailVerificationSent] = useState(false);
     const [checkingEmailVerification, setCheckingEmailVerification] = useState(false);
+    const [showPasswordEditor, setShowPasswordEditor] = useState(false);
+    const [currentPassword, setCurrentPassword] = useState('');
+    const [newPassword, setNewPassword] = useState('');
+    const [confirmNewPassword, setConfirmNewPassword] = useState('');
+    const [changingPassword, setChangingPassword] = useState(false);
+    const [showProfileSaveConfirmation, setShowProfileSaveConfirmation] = useState(false);
+    const [profileConfirmationPassword, setProfileConfirmationPassword] = useState('');
+    const [showDeleteConfirmation, setShowDeleteConfirmation] = useState(false);
+    const [deleteConfirmationPassword, setDeleteConfirmationPassword] = useState('');
+
+    const resetPasswordEditor = () => {
+        setShowPasswordEditor(false);
+        setCurrentPassword('');
+        setNewPassword('');
+        setConfirmNewPassword('');
+    };
+
+    const resetProfileSaveConfirmation = () => {
+        setShowProfileSaveConfirmation(false);
+        setProfileConfirmationPassword('');
+    };
+
+    const reauthenticateCurrentUser = async (password: string): Promise<boolean> => {
+        const user = auth.currentUser;
+        if (!user?.email) {
+            Alert.alert('Confirmação indisponível', 'Não foi possível identificar o e-mail desta conta. Entre novamente e tente de novo.');
+            return false;
+        }
+        if (!user.providerData.some(provider => provider.providerId === EmailAuthProvider.PROVIDER_ID)) {
+            Alert.alert('Conta vinculada', 'Esta conta não usa senha do Firebase. Confirme sua identidade pelo provedor usado para entrar.');
+            return false;
+        }
+
+        const credential = EmailAuthProvider.credential(user.email, password);
+        await reauthenticateWithCredential(user, credential);
+        return true;
+    };
+
+    const showReauthenticationError = (error: unknown) => {
+        const code = getErrorCode(error);
+        if (code === 'auth/wrong-password' || code === 'auth/invalid-credential') {
+            Alert.alert('Senha atual incorreta', 'Confira a senha atual e tente novamente.');
+        } else if (code === 'auth/too-many-requests') {
+            Alert.alert('Muitas tentativas', 'Aguarde alguns minutos antes de tentar novamente.');
+        } else if (code === 'auth/network-request-failed') {
+            Alert.alert('Sem conexão', 'Verifique sua internet e tente novamente.');
+        } else if (code === 'auth/requires-recent-login') {
+            Alert.alert('Sessão expirada', 'Saia da conta, entre novamente e repita a alteração.');
+        } else {
+            Alert.alert('Não foi possível confirmar', 'Sua identidade não foi confirmada. Tente novamente.');
+        }
+    };
 
     useEffect(() => {
         const user = auth.currentUser;
@@ -63,6 +128,25 @@ export default function ProfileScreen() {
             }, (profileError) => {
                 console.error('[Profile] Erro ao atualizar perfil:', profileError);
             });
+    }, []);
+
+    useEffect(() => {
+        const user = auth.currentUser;
+        if (!user) return;
+        return onSnapshot(doc(db, 'notificationSettings', user.uid), (snapshot) => {
+            const data = snapshot.data();
+            const settings = {
+                notifyMessages: data?.notifyMessages !== false,
+                notifyEventUpdates: data?.notifyEventUpdates !== false,
+                notifyEventReminders: data?.notifyEventReminders !== false,
+                notifyRecommendations: data?.notifyRecommendations === true,
+            };
+            setSavedNotificationSettings(settings);
+            setNotifyMessages(settings.notifyMessages);
+            setNotifyEventUpdates(settings.notifyEventUpdates);
+            setNotifyEventReminders(settings.notifyEventReminders);
+            setNotifyRecommendations(settings.notifyRecommendations);
+        }, () => console.error('[Profile] notification_settings_load_failed'));
     }, []);
 
     const refreshEmailVerification = async () => {
@@ -100,12 +184,61 @@ export default function ProfileScreen() {
         setEditInterests(normalizeInterests(userProfile?.interests));
         setShareFrequentedPlaces(userProfile?.shareFrequentedPlaces === true);
         setShowPopularOutsideInterests(userProfile?.showPopularOutsideInterests !== false);
+        setNotifyMessages(savedNotificationSettings.notifyMessages);
+        setNotifyEventUpdates(savedNotificationSettings.notifyEventUpdates);
+        setNotifyEventReminders(savedNotificationSettings.notifyEventReminders);
+        setNotifyRecommendations(savedNotificationSettings.notifyRecommendations);
         setEditPhotoURL(userProfile?.photoURL || auth.currentUser?.photoURL || null);
+        resetPasswordEditor();
+        resetProfileSaveConfirmation();
         setIsEditing(true);
     };
 
     const cancelEditing = () => {
+        resetPasswordEditor();
+        resetProfileSaveConfirmation();
         setIsEditing(false);
+    };
+
+    const handleChangePassword = async () => {
+        if (!currentPassword) {
+            Alert.alert('Senha atual necessária', 'Digite sua senha atual para confirmar que esta conta é sua.');
+            return;
+        }
+        if (newPassword.length < 6) {
+            Alert.alert('Nova senha inválida', 'A nova senha deve ter pelo menos 6 caracteres.');
+            return;
+        }
+        if (newPassword === currentPassword) {
+            Alert.alert('Escolha outra senha', 'A nova senha deve ser diferente da senha atual.');
+            return;
+        }
+        if (newPassword !== confirmNewPassword) {
+            Alert.alert('Senhas diferentes', 'A confirmação não corresponde à nova senha.');
+            return;
+        }
+
+        setChangingPassword(true);
+        try {
+            const reauthenticated = await reauthenticateCurrentUser(currentPassword);
+            if (!reauthenticated || !auth.currentUser) return;
+            const user = auth.currentUser;
+            await updatePassword(user, newPassword);
+            resetPasswordEditor();
+            profileLog('password_changed');
+            Alert.alert('Senha alterada', 'Sua nova senha já está ativa.');
+        } catch (error) {
+            const code = getErrorCode(error);
+            console.error('[Profile] password_change_failed', { code });
+            setCurrentPassword('');
+            if (code === 'auth/weak-password') {
+                Alert.alert('Senha fraca', 'Use uma senha com pelo menos 6 caracteres.');
+            } else {
+                showReauthenticationError(error);
+            }
+        } finally {
+            setChangingPassword(false);
+        }
     };
 
     const toggleEditSelection = (item: string, list: string[], setList: Dispatch<SetStateAction<string[]>>) => {
@@ -130,73 +263,74 @@ export default function ProfileScreen() {
         }
     };
 
-    const uploadImageAsync = async (uri: string) => {
-        const response = await fetch(uri);
-        const blob = await response.blob();
-        
-        const fileRef = ref(storage, `avatars/${auth.currentUser?.uid}_${Date.now()}`);
-        await uploadBytes(fileRef, blob);
-        return await getDownloadURL(fileRef);
+    const requestProfileSave = () => {
+        if (!isValidNickname(editNick)) {
+            Alert.alert('Nick inválido', 'O nick deve ter de 3 a 20 caracteres: letras, números, ponto, hífen ou sublinhado.');
+            return;
+        }
+        setProfileConfirmationPassword('');
+        setShowProfileSaveConfirmation(true);
     };
 
     const saveProfile = async () => {
-        if (!auth.currentUser) return;
-
-        if (!editNick.trim()) {
-            Alert.alert('Erro', 'O Nickname não pode ser vazio.');
+        if (loading) return;
+        const user = auth.currentUser;
+        if (!user) return;
+        if (!profileConfirmationPassword) {
+            Alert.alert('Senha necessária', 'Digite sua senha atual antes de salvar o perfil.');
             return;
         }
 
         setLoading(true);
 
         try {
-            if (editNick.trim().length < 3) {
-                Alert.alert('Atenção', 'O Nickname deve ter pelo menos 3 caracteres.');
+            const reauthenticated = await reauthenticateCurrentUser(profileConfirmationPassword);
+            if (!reauthenticated) {
+                setProfileConfirmationPassword('');
                 return;
             }
+            resetProfileSaveConfirmation();
 
-            const searchName = editNick.trim().toLowerCase();
             profileLog('profile_save_started', { interestsCount: editInterests.length, hasPhoto: Boolean(editPhotoURL) });
 
-            // A busca normalizada é a fonte única de disponibilidade do nick.
-            if (searchName !== userProfile?.searchName) {
-                const usersRef = collection(db, 'users');
-                const q = query(usersRef, where('searchName', '==', searchName), limit(2));
-                const querySnapshot = await getDocs(q);
-
-                const isTaken = querySnapshot.docs.some(d => d.id !== auth.currentUser?.uid);
-                if (isTaken) {
-                    Alert.alert('Erro', 'Este Nickname já está em uso. Por favor, escolha outro.');
-                    return;
-                }
-            }
-
-            let finalPhotoURL = userProfile?.photoURL || auth.currentUser.photoURL || null;
+            let finalPhotoURL = userProfile?.photoURL || user.photoURL || null;
             if (editPhotoURL && editPhotoURL !== finalPhotoURL && !editPhotoURL.startsWith('http')) {
-                finalPhotoURL = await uploadImageAsync(editPhotoURL);
+                finalPhotoURL = await uploadProfileImage(storage, user.uid, editPhotoURL);
             }
 
             const normalizedInterests = normalizeInterests(editInterests);
 
-            await httpsCallable<{ enabled: boolean }, { ok: boolean }>(functions, 'setFrequentedPlacesPrivacy')({
-                enabled: shareFrequentedPlaces,
-            });
-
-            const docRef = doc(db, 'users', auth.currentUser.uid);
-            await setDoc(docRef, {
+            await updateOwnProfile({
+                userId: user.uid,
+                previousSearchName: userProfile?.searchName,
                 nick: editNick.trim(),
                 bio: editBio,
                 interests: normalizedInterests,
+                photoURL: finalPhotoURL,
                 showPopularOutsideInterests,
-                searchName: searchName,
-                displayName: editNick.trim(),
-                photoURL: finalPhotoURL
+            });
+
+            await httpsCallable<{ enabled: boolean }, { ok: boolean }>(functions, 'setFrequentedPlacesPrivacy')({
+                enabled: shareFrequentedPlaces,
+            });
+            await setDoc(doc(db, 'notificationSettings', user.uid), {
+                notifyMessages,
+                notifyEventUpdates,
+                notifyEventReminders,
+                notifyRecommendations,
+                ...(!notifyRecommendations ? { recommendationLocation: deleteField() } : {}),
+                updatedAt: serverTimestamp(),
             }, { merge: true });
+            await setEventRemindersEnabled(user.uid, notifyEventReminders);
+            await setReengagementReminderEnabled(user.uid, notifyRecommendations);
+            if (notifyRecommendations !== savedNotificationSettings.notifyRecommendations) {
+                await clearRecommendationLocationCache(user.uid);
+            }
 
             // O Firestore é a fonte do perfil público. A sessão do Auth é atualizada
             // depois, sem permitir que uma falha nela descarte a alteração persistida.
             try {
-                await updateProfile(auth.currentUser, {
+                await updateProfile(user, {
                     displayName: editNick.trim(),
                     photoURL: finalPhotoURL
                 });
@@ -204,12 +338,23 @@ export default function ProfileScreen() {
                 console.warn('[Profile] auth_profile_sync_failed', { code: getErrorCode(authProfileError) });
             }
 
+            resetPasswordEditor();
+            resetProfileSaveConfirmation();
             setIsEditing(false);
             profileLog('profile_saved', { interestsCount: normalizedInterests.length, hasPhoto: Boolean(finalPhotoURL) });
             Alert.alert('Sucesso', 'Perfil atualizado!');
         } catch (error) {
-            console.error('[Profile] profile_save_failed', { code: getErrorCode(error) });
-            Alert.alert('Erro', 'Falha ao salvar o perfil.');
+            const code = getErrorCode(error);
+            if (error instanceof NicknameUnavailableError) {
+                Alert.alert('Nick indisponível', 'Este nick já pertence a outra pessoa. Escolha outro.');
+            } else if (code?.startsWith('auth/')) {
+                console.warn('[Profile] profile_reauthentication_failed', { code });
+                setProfileConfirmationPassword('');
+                showReauthenticationError(error);
+            } else {
+                console.error('[Profile] profile_save_failed', { code });
+                Alert.alert('Erro', 'Sua identidade foi confirmada, mas houve uma falha ao salvar o perfil. Tente novamente.');
+            }
         } finally {
             setLoading(false);
         }
@@ -232,6 +377,12 @@ export default function ProfileScreen() {
     const handleLogout = async () => {
         try {
             profileLog('logout_started');
+            const uid = auth.currentUser?.uid;
+            if (uid) {
+                await unregisterCurrentPushDevice(uid).catch(() => {
+                    console.warn('[Profile] push_device_cleanup_failed');
+                });
+            }
             await auth.signOut();
             profileLog('logout_completed');
             router.replace('/login');
@@ -248,29 +399,56 @@ export default function ProfileScreen() {
             [
                 { text: "Cancelar", style: "cancel" },
                 {
-                    text: "Excluir Conta",
+                    text: "Continuar",
                     style: "destructive",
-                    onPress: async () => {
-                        try {
-                            const user = auth.currentUser;
-                            if (user) {
-                                setLoading(true);
-                                profileLog('account_deletion_started');
-                                await httpsCallable<Record<string, never>, { ok: boolean }>(functions, 'deleteMyAccount')({});
-                                await auth.signOut();
-                                profileLog('account_deletion_completed');
-                                router.replace('/login');
-                            }
-                        } catch (error) {
-                            console.error('[Profile] account_deletion_failed', { code: getErrorCode(error) });
-                            Alert.alert("Erro", "Ocorreu um erro ao tentar excluir a conta. Tente novamente mais tarde.");
-                        } finally {
-                            setLoading(false);
-                        }
+                    onPress: () => {
+                        setDeleteConfirmationPassword('');
+                        setShowDeleteConfirmation(true);
                     }
                 }
             ]
         );
+    };
+
+    const confirmAccountDeletion = async () => {
+        if (loading) return;
+        const user = auth.currentUser;
+        if (!user) return;
+        if (!deleteConfirmationPassword) {
+            Alert.alert('Senha necessária', 'Digite sua senha atual para excluir permanentemente a conta.');
+            return;
+        }
+
+        setLoading(true);
+        try {
+            const reauthenticated = await reauthenticateCurrentUser(deleteConfirmationPassword);
+            if (!reauthenticated) {
+                setDeleteConfirmationPassword('');
+                return;
+            }
+            await user.getIdToken(true);
+            setDeleteConfirmationPassword('');
+            profileLog('account_deletion_started');
+            await httpsCallable<Record<string, never>, { ok: boolean }>(functions, 'deleteMyAccount')({});
+            setShowDeleteConfirmation(false);
+            await auth.signOut().catch((signOutError: unknown) => {
+                console.warn('[Profile] account_deleted_local_signout_failed', { code: getErrorCode(signOutError) });
+            });
+            profileLog('account_deletion_completed');
+            router.replace('/login');
+        } catch (error) {
+            const code = getErrorCode(error);
+            setDeleteConfirmationPassword('');
+            if (code?.startsWith('auth/')) {
+                console.warn('[Profile] account_deletion_reauthentication_failed', { code });
+                showReauthenticationError(error);
+            } else {
+                console.error('[Profile] account_deletion_failed', { code });
+                Alert.alert('Conta não excluída', 'Nenhum novo pedido será necessário. Confirme sua senha e tente novamente mais tarde.');
+            }
+        } finally {
+            setLoading(false);
+        }
     };
 
     if (!auth.currentUser) {
@@ -284,7 +462,8 @@ export default function ProfileScreen() {
 
     return (
         <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
-            <ScrollView contentContainerStyle={styles.content}>
+            <KeyboardAvoidingView style={styles.container} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+            <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
             <View style={styles.header}>
                 <View style={[styles.avatar, (isEditing ? editPhotoURL : userProfile?.photoURL) && { backgroundColor: 'transparent' }]}>
                     {(isEditing ? editPhotoURL : userProfile?.photoURL) ? (
@@ -339,7 +518,7 @@ export default function ProfileScreen() {
                             <StyledButton title="Cancelar" onPress={cancelEditing} colors={['#9ca3af', '#d1d5db']} />
                         </View>
                         <View style={styles.topEditActionItem}>
-                            <StyledButton title="Salvar" onPress={saveProfile} isLoading={loading} />
+                            <StyledButton title="Salvar perfil" onPress={requestProfileSave} isLoading={loading} />
                         </View>
                     </View>
                 )}
@@ -395,6 +574,80 @@ export default function ProfileScreen() {
 
             )}
 
+            {isEditing && (
+                <View style={styles.section}>
+                    <View style={styles.securityHeader}>
+                        <View style={styles.securityIcon}>
+                            <FontAwesome name="lock" size={18} color="#4F46E5" />
+                        </View>
+                        <View style={styles.securityHeaderText}>
+                            <Text style={styles.sectionTitleCompact}>Segurança</Text>
+                            <Text style={styles.privacyDescription}>Sua senha atual será solicitada ao salvar qualquer mudança. Você também pode alterá-la abaixo.</Text>
+                        </View>
+                    </View>
+
+                    {!showPasswordEditor ? (
+                        <TouchableOpacity
+                            style={styles.passwordToggleButton}
+                            onPress={() => setShowPasswordEditor(true)}
+                            accessibilityRole="button"
+                            accessibilityLabel="Alterar senha"
+                        >
+                            <Text style={styles.passwordToggleText}>Alterar senha</Text>
+                            <FontAwesome name="angle-down" size={18} color="#4F46E5" />
+                        </TouchableOpacity>
+                    ) : (
+                        <View style={styles.passwordForm}>
+                            <Text style={styles.passwordLabel}>Senha atual</Text>
+                            <TextInput
+                                style={styles.passwordInput}
+                                value={currentPassword}
+                                onChangeText={setCurrentPassword}
+                                placeholder="Digite sua senha atual"
+                                secureTextEntry
+                                autoCapitalize="none"
+                                autoCorrect={false}
+                                textContentType="password"
+                                editable={!changingPassword}
+                            />
+                            <Text style={styles.passwordLabel}>Nova senha</Text>
+                            <TextInput
+                                style={styles.passwordInput}
+                                value={newPassword}
+                                onChangeText={setNewPassword}
+                                placeholder="Mínimo de 6 caracteres"
+                                secureTextEntry
+                                autoCapitalize="none"
+                                autoCorrect={false}
+                                textContentType="newPassword"
+                                editable={!changingPassword}
+                            />
+                            <Text style={styles.passwordLabel}>Confirmar nova senha</Text>
+                            <TextInput
+                                style={styles.passwordInput}
+                                value={confirmNewPassword}
+                                onChangeText={setConfirmNewPassword}
+                                placeholder="Digite a nova senha novamente"
+                                secureTextEntry
+                                autoCapitalize="none"
+                                autoCorrect={false}
+                                textContentType="newPassword"
+                                editable={!changingPassword}
+                            />
+                            <StyledButton title="Confirmar nova senha" onPress={handleChangePassword} isLoading={changingPassword} />
+                            <TouchableOpacity
+                                style={styles.passwordCancelButton}
+                                onPress={resetPasswordEditor}
+                                disabled={changingPassword}
+                                accessibilityRole="button"
+                            >
+                                <Text style={styles.passwordCancelText}>Cancelar alteração de senha</Text>
+                            </TouchableOpacity>
+                        </View>
+                    )}
+                </View>
+            )}
+
 
             <View style={styles.section}>
                 <Text style={styles.sectionTitle}>Interesses</Text>
@@ -427,8 +680,8 @@ export default function ProfileScreen() {
                 <Text style={styles.sectionTitle}>Privacidade</Text>
                 <View style={styles.privacyRow}>
                     <View style={styles.privacyTextContainer}>
-                        <Text style={styles.privacyTitle}>Mostrar lugares que frequento</Text>
-                        <Text style={styles.privacyDescription}>Permite que outras pessoas vejam os locais comunitários que você acompanha.</Text>
+                        <Text style={styles.privacyTitle}>Mostrar lugares no perfil</Text>
+                        <Text style={styles.privacyDescription}>Permite que outras pessoas vejam no seu perfil público quais locais comunitários você frequenta.</Text>
                     </View>
                     <Switch
                         value={shareFrequentedPlaces}
@@ -448,6 +701,35 @@ export default function ProfileScreen() {
                         trackColor={{ false: '#D1D5DB', true: '#A5B4FC' }}
                         thumbColor={showPopularOutsideInterests ? '#4F46E5' : '#F9FAFB'}
                     />
+                </View>
+                <Text style={[styles.sectionTitle, styles.notificationSectionTitle]}>Notificações</Text>
+                <View style={styles.privacyRow}>
+                    <View style={styles.privacyTextContainer}>
+                        <Text style={styles.privacyTitle}>Mensagens</Text>
+                        <Text style={styles.privacyDescription}>Receber alertas quando alguém enviar uma mensagem.</Text>
+                    </View>
+                    <Switch value={notifyMessages} onValueChange={setNotifyMessages} />
+                </View>
+                <View style={styles.privacyRow}>
+                    <View style={styles.privacyTextContainer}>
+                        <Text style={styles.privacyTitle}>Atualizações de eventos</Text>
+                        <Text style={styles.privacyDescription}>Convites, check-ins, cancelamentos e alterações de reputação.</Text>
+                    </View>
+                    <Switch value={notifyEventUpdates} onValueChange={setNotifyEventUpdates} />
+                </View>
+                <View style={styles.privacyRow}>
+                    <View style={styles.privacyTextContainer}>
+                        <Text style={styles.privacyTitle}>Lembretes de eventos</Text>
+                        <Text style={styles.privacyDescription}>Lembrete local duas horas antes dos eventos confirmados.</Text>
+                    </View>
+                    <Switch value={notifyEventReminders} onValueChange={setNotifyEventReminders} />
+                </View>
+                <View style={styles.privacyRow}>
+                    <View style={styles.privacyTextContainer}>
+                        <Text style={styles.privacyTitle}>Recomendações e novidades</Text>
+                        <Text style={styles.privacyDescription}>Receba eventos relevantes do dia, com intervalo mínimo de três dias, e um lembrete após sete dias sem abrir o app.</Text>
+                    </View>
+                    <Switch value={notifyRecommendations} onValueChange={setNotifyRecommendations} />
                 </View>
             </View>}
 
@@ -504,7 +786,7 @@ export default function ProfileScreen() {
                             <View style={[styles.menuIconContainer, { backgroundColor: '#fef2f2' }]}>
                                 <FontAwesome name="trash-o" size={16} color="#ef4444" />
                             </View>
-                            <Text style={[styles.menuText, { color: '#ef4444' }]}>Solicitar Exclusão da Conta</Text>
+                            <Text style={[styles.menuText, { color: '#ef4444' }]}>Excluir Conta Permanentemente</Text>
                         </View>
                         <FontAwesome name="angle-right" size={20} color="#9ca3af" />
                     </TouchableOpacity>
@@ -522,6 +804,108 @@ export default function ProfileScreen() {
             <TermsModal visible={showTermsModal} onClose={() => setShowTermsModal(false)} />
             <ManualModal visible={showManualModal} onClose={() => setShowManualModal(false)} />
             </ScrollView>
+            </KeyboardAvoidingView>
+
+            <Modal
+                visible={showProfileSaveConfirmation}
+                transparent
+                animationType="fade"
+                onRequestClose={() => {
+                    if (!loading) resetProfileSaveConfirmation();
+                }}
+            >
+                <KeyboardAvoidingView
+                    style={styles.confirmationOverlay}
+                    behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+                >
+                    <View style={styles.confirmationCard}>
+                        <View style={styles.confirmationIcon}>
+                            <FontAwesome name="shield" size={22} color="#4F46E5" />
+                        </View>
+                        <Text style={styles.confirmationTitle}>Confirme que é você</Text>
+                        <Text style={styles.confirmationDescription}>Digite sua senha atual para salvar as alterações do perfil.</Text>
+                        <TextInput
+                            style={styles.passwordInput}
+                            value={profileConfirmationPassword}
+                            onChangeText={setProfileConfirmationPassword}
+                            placeholder="Senha atual"
+                            placeholderTextColor="#9CA3AF"
+                            secureTextEntry
+                            autoCapitalize="none"
+                            autoCorrect={false}
+                            textContentType="password"
+                            editable={!loading}
+                            autoFocus
+                            onSubmitEditing={saveProfile}
+                            returnKeyType="done"
+                            accessibilityLabel="Senha atual para salvar o perfil"
+                        />
+                        <StyledButton title="Confirmar e salvar" onPress={saveProfile} isLoading={loading} />
+                        <TouchableOpacity
+                            style={styles.passwordCancelButton}
+                            onPress={resetProfileSaveConfirmation}
+                            disabled={loading}
+                            accessibilityRole="button"
+                            accessibilityLabel="Cancelar confirmação do perfil"
+                        >
+                            <Text style={styles.passwordCancelText}>Voltar à edição</Text>
+                        </TouchableOpacity>
+                    </View>
+                </KeyboardAvoidingView>
+            </Modal>
+
+            <Modal
+                visible={showDeleteConfirmation}
+                transparent
+                animationType="fade"
+                onRequestClose={() => {
+                    if (!loading) {
+                        setShowDeleteConfirmation(false);
+                        setDeleteConfirmationPassword('');
+                    }
+                }}
+            >
+                <KeyboardAvoidingView
+                    style={styles.confirmationOverlay}
+                    behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+                >
+                    <View style={styles.confirmationCard}>
+                        <View style={[styles.confirmationIcon, styles.deleteConfirmationIcon]}>
+                            <FontAwesome name="trash" size={22} color="#DC2626" />
+                        </View>
+                        <Text style={styles.confirmationTitle}>Última confirmação</Text>
+                        <Text style={styles.confirmationDescription}>Digite sua senha atual. Depois desta etapa, a conta e os dados vinculados serão excluídos permanentemente.</Text>
+                        <TextInput
+                            style={styles.passwordInput}
+                            value={deleteConfirmationPassword}
+                            onChangeText={setDeleteConfirmationPassword}
+                            placeholder="Senha atual"
+                            placeholderTextColor="#9CA3AF"
+                            secureTextEntry
+                            autoCapitalize="none"
+                            autoCorrect={false}
+                            textContentType="password"
+                            editable={!loading}
+                            autoFocus
+                            onSubmitEditing={confirmAccountDeletion}
+                            returnKeyType="done"
+                            accessibilityLabel="Senha atual para excluir a conta"
+                        />
+                        <StyledButton title="Excluir permanentemente" onPress={confirmAccountDeletion} isLoading={loading} colors={['#DC2626', '#EF4444']} />
+                        <TouchableOpacity
+                            style={styles.passwordCancelButton}
+                            onPress={() => {
+                                setShowDeleteConfirmation(false);
+                                setDeleteConfirmationPassword('');
+                            }}
+                            disabled={loading}
+                            accessibilityRole="button"
+                        >
+                            <Text style={styles.passwordCancelText}>Manter minha conta</Text>
+                        </TouchableOpacity>
+                    </View>
+                </KeyboardAvoidingView>
+            </Modal>
         </SafeAreaView>
     );
 }
@@ -554,6 +938,8 @@ const styles = StyleSheet.create({
     statLabel: { fontSize: 14, color: '#6b7280' },
     section: { width: '100%', marginBottom: 32 },
     sectionTitle: { fontSize: 18, fontWeight: 'bold', marginBottom: 16, color: '#1f2937' },
+    sectionTitleCompact: { fontSize: 18, fontWeight: 'bold', color: '#1f2937' },
+    notificationSectionTitle: { marginTop: 24 },
     privacyRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 16 },
     privacyTextContainer: { flex: 1 },
     privacyTitle: { fontSize: 15, fontWeight: '600', color: '#374151', marginBottom: 4 },
@@ -594,6 +980,22 @@ const styles = StyleSheet.create({
         padding: 12, fontSize: 14, color: '#1f2937', textAlignVertical: 'top', minHeight: 80,
         width: '100%', marginTop: 4
     },
+    securityHeader: { flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 14 },
+    securityIcon: { width: 38, height: 38, borderRadius: 12, backgroundColor: '#EEF2FF', alignItems: 'center', justifyContent: 'center' },
+    securityHeaderText: { flex: 1 },
+    passwordToggleButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderWidth: 1, borderColor: '#C7D2FE', backgroundColor: '#F5F7FF', borderRadius: 12, paddingHorizontal: 14, paddingVertical: 13 },
+    passwordToggleText: { color: '#4338CA', fontSize: 15, fontWeight: '700' },
+    passwordForm: { width: '100%' },
+    passwordLabel: { fontSize: 14, fontWeight: '700', color: '#4B5563', marginTop: 10, marginBottom: 5 },
+    passwordInput: { backgroundColor: '#F9FAFB', borderWidth: 1, borderColor: '#E5E7EB', borderRadius: 8, paddingHorizontal: 12, paddingVertical: 12, fontSize: 16, color: '#1F2937', width: '100%' },
+    passwordCancelButton: { alignItems: 'center', paddingVertical: 12 },
+    passwordCancelText: { color: '#6B7280', fontSize: 14, fontWeight: '600' },
+    confirmationOverlay: { flex: 1, backgroundColor: 'rgba(17, 24, 39, 0.55)', alignItems: 'center', justifyContent: 'center', padding: 24 },
+    confirmationCard: { width: '100%', maxWidth: 420, backgroundColor: '#FFFFFF', borderRadius: 20, padding: 22, alignItems: 'center' },
+    confirmationIcon: { width: 46, height: 46, borderRadius: 23, backgroundColor: '#EEF2FF', alignItems: 'center', justifyContent: 'center', marginBottom: 12 },
+    deleteConfirmationIcon: { backgroundColor: '#FEE2E2' },
+    confirmationTitle: { color: '#111827', fontSize: 20, fontWeight: '800', marginBottom: 6 },
+    confirmationDescription: { color: '#6B7280', fontSize: 14, lineHeight: 20, textAlign: 'center', marginBottom: 18 },
     editBtn: {
         flexDirection: 'row', alignItems: 'center', marginTop: 8,
         padding: 8, borderRadius: 20, backgroundColor: '#eff6ff'

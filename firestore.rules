@@ -55,7 +55,7 @@ service cloud.firestore {
       return [
         'displayName', 'nick', 'searchName', 'bio', 'interests', 'photoURL',
         'showPopularOutsideInterests', 'favorites',
-        'blockedUsers', 'isProfileComplete', 'expoPushToken'
+        'blockedUsers', 'isProfileComplete'
       ];
     }
 
@@ -67,10 +67,34 @@ service cloud.firestore {
           'uid', 'displayName', 'nick', 'searchName', 'email', 'reputation',
           'eventsAttended', 'foundedPlacesCount', 'showPopularOutsideInterests',
           'isProfileComplete', 'createdAt', 'interests', 'photoURL', 'bio',
-          'shareFrequentedPlaces', 'favorites', 'blockedUsers', 'expoPushToken'
-        ]);
+          'shareFrequentedPlaces', 'favorites', 'blockedUsers',
+          'termsVersion', 'termsAcceptedAt'
+        ])
+        && request.resource.data.searchName is string
+        && request.resource.data.searchName.matches('^[a-z0-9._-]{3,20}$')
+        && request.resource.data.termsVersion is string
+        && request.resource.data.termsAcceptedAt is timestamp
+        && existsAfter(/databases/$(database)/documents/nicknames/$(request.resource.data.searchName))
+        && getAfter(/databases/$(database)/documents/nicknames/$(request.resource.data.searchName)).data.uid == request.auth.uid;
       allow update: if isOwner(userId) && !isBanned()
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(editableUserFields());
+        && (
+          (
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(editableUserFields())
+            && (
+              !request.resource.data.diff(resource.data).affectedKeys().hasAny(['nick', 'searchName', 'displayName'])
+              || (
+                request.resource.data.searchName is string
+                && request.resource.data.searchName.matches('^[a-z0-9._-]{3,20}$')
+                && existsAfter(/databases/$(database)/documents/nicknames/$(request.resource.data.searchName))
+                && getAfter(/databases/$(database)/documents/nicknames/$(request.resource.data.searchName)).data.uid == request.auth.uid
+              )
+            )
+          )
+          || (
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['expoPushToken'])
+            && !request.resource.data.keys().hasAny(['expoPushToken'])
+          )
+        );
       allow delete: if false;
 
       match /favoriteEvents/{eventId} {
@@ -84,6 +108,81 @@ service cloud.firestore {
       }
     }
 
+    match /nicknames/{searchName} {
+      allow get: if isAuthenticated();
+      allow list: if false;
+      allow create: if isAuthenticated() && !isBanned()
+        && searchName.matches('^[a-z0-9._-]{3,20}$')
+        && request.resource.data.keys().hasOnly(['uid', 'updatedAt'])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.updatedAt == request.time;
+      allow update: if isAuthenticated() && !isBanned()
+        && searchName.matches('^[a-z0-9._-]{3,20}$')
+        && resource.data.uid == request.auth.uid
+        && request.resource.data.keys().hasOnly(['uid', 'updatedAt'])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.updatedAt == request.time;
+      allow delete: if isAuthenticated() && resource.data.uid == request.auth.uid;
+    }
+
+    match /pushTokens/{userId} {
+      allow read: if isOwner(userId);
+      allow create, update: if false;
+      allow delete: if isOwner(userId);
+    }
+
+    // Um documento por instalação permite vários celulares por conta. O ID é
+    // criado localmente e permanece no aparelho; ao trocar de conta, o mesmo
+    // documento muda de proprietário e deixa de receber dados da conta anterior.
+    match /pushDevices/{deviceId} {
+      allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      allow create, update: if isAuthenticated() && !isBanned()
+        && deviceId.size() >= 20
+        && deviceId.size() <= 100
+        && request.resource.data.keys().hasOnly([
+          'userId', 'expoPushToken', 'nativePushToken', 'platform', 'updatedAt'
+        ])
+        && request.resource.data.userId == request.auth.uid
+        && (!request.resource.data.keys().hasAny(['expoPushToken'])
+          || request.resource.data.expoPushToken == null
+          || (request.resource.data.expoPushToken is string && request.resource.data.expoPushToken.size() <= 300))
+        && (!request.resource.data.keys().hasAny(['nativePushToken'])
+          || request.resource.data.nativePushToken == null
+          || (request.resource.data.nativePushToken is string && request.resource.data.nativePushToken.size() <= 500))
+        && (!request.resource.data.keys().hasAny(['platform'])
+          || request.resource.data.platform == null
+          || request.resource.data.platform in ['android', 'ios'])
+        && request.resource.data.updatedAt == request.time;
+      allow delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
+    }
+
+    match /notificationSettings/{userId} {
+      allow read: if isOwner(userId);
+      allow create, update: if isOwner(userId) && !isBanned()
+        && request.resource.data.keys().hasOnly([
+          'notifyMessages', 'notifyEventUpdates', 'notifyEventReminders',
+          'notifyRecommendations', 'recommendationLocation', 'updatedAt'
+        ])
+        && request.resource.data.notifyMessages is bool
+        && request.resource.data.notifyEventUpdates is bool
+        && request.resource.data.notifyEventReminders is bool
+        && (!request.resource.data.keys().hasAny(['notifyRecommendations'])
+          || request.resource.data.notifyRecommendations is bool)
+        && (!request.resource.data.keys().hasAny(['recommendationLocation']) || (
+          request.resource.data.recommendationLocation is map
+          && request.resource.data.recommendationLocation.keys().hasOnly(['latitude', 'longitude', 'updatedAt'])
+          && request.resource.data.recommendationLocation.latitude is number
+          && request.resource.data.recommendationLocation.longitude is number
+          && request.resource.data.recommendationLocation.latitude >= -90
+          && request.resource.data.recommendationLocation.latitude <= 90
+          && request.resource.data.recommendationLocation.longitude >= -180
+          && request.resource.data.recommendationLocation.longitude <= 180
+          && request.resource.data.recommendationLocation.updatedAt is timestamp
+        ))
+        && request.resource.data.updatedAt == request.time;
+      allow delete: if isOwner(userId);
+    }
+
     match /meetings/{meetingId} {
       allow read: if true;
       allow create: if hasVerifiedEmail()
@@ -91,7 +190,7 @@ service cloud.firestore {
         && request.resource.data.createdBy == request.auth.uid
         && request.resource.data.keys().hasAll([
           'title', 'description', 'locationName', 'interests', 'date', 'time',
-          'endTime', 'type', 'createdBy', 'attendees'
+          'endDate', 'endTime', 'startsAt', 'endsAt', 'type', 'createdBy', 'attendees'
         ])
         && request.resource.data.title is string
         && request.resource.data.title.size() >= 3
@@ -101,9 +200,18 @@ service cloud.firestore {
         && request.resource.data.date >= '1900-01-01'
         && request.resource.data.time is string
         && request.resource.data.time.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$')
+        && request.resource.data.endDate is string
+        && request.resource.data.endDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && request.resource.data.endDate >= request.resource.data.date
         && request.resource.data.endTime is string
         && request.resource.data.endTime.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$')
-        && request.resource.data.endTime > request.resource.data.time
+        && (request.resource.data.endDate > request.resource.data.date
+          || request.resource.data.endTime > request.resource.data.time)
+        && request.resource.data.startsAt is timestamp
+        && request.resource.data.endsAt is timestamp
+        && request.resource.data.startsAt > request.time
+        && request.resource.data.endsAt >= request.resource.data.startsAt + duration.value(15, 'm')
+        && request.resource.data.endsAt <= request.resource.data.startsAt + duration.value(24, 'h')
         && request.resource.data.get('description', '') is string
         && request.resource.data.get('description', '').size() >= 1
         && request.resource.data.get('description', '').size() <= 2000

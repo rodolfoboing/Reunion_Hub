@@ -3,15 +3,15 @@ import { View, Text, StyleSheet, TouchableOpacity, Modal, TextInput, ScrollView,
 import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import DateTimePicker from '@react-native-community/datetimepicker';
-import { collection, doc, writeBatch, getDoc, serverTimestamp } from 'firebase/firestore';
+import { collection, doc, writeBatch, getDoc, serverTimestamp, Timestamp } from 'firebase/firestore';
 import { db, auth } from '@/src/services/firebaseConfig';
 import { INTERESTS_OPTIONS, normalizeInterests } from '@/src/constants/Interests';
 import { CONFIG } from '@/src/constants/Config';
-import { isEndTimeAfterStart } from '@/src/utils/eventSchedule';
+import { getEventDateTime, getEventDurationIssue } from '@/src/utils/eventSchedule';
 import { scheduleEventReminders } from '@/src/utils/Notifications';
 import type { EventReminder } from '@/src/utils/Notifications';
 import type { CreateMeetingDraft } from '@/src/types';
-import { getCurrentTimeStr, getTodayStr } from '@/src/utils/dateUtils';
+import { getCurrentTimeStr, getDateStr, getTodayStr } from '@/src/utils/dateUtils';
 
 const TITLE_MAX_LENGTH = 100;
 const LOCATION_MAX_LENGTH = 150;
@@ -20,6 +20,32 @@ const LINK_MAX_LENGTH = 500;
 
 function isValidHttpsUrl(value: string): boolean {
     return /^https:\/\/[^\s.]+(?:\.[^\s.]+)+(?:[/?#][^\s]*)?$/i.test(value);
+}
+
+function pickerDate(value: string): Date {
+    const parsed = /^\d{4}-\d{2}-\d{2}$/.test(value) ? new Date(`${value}T12:00:00`) : new Date();
+    return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+}
+
+function pickerTime(value: string): Date {
+    const result = new Date();
+    const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(value);
+    result.setSeconds(0, 0);
+    if (match) result.setHours(Number(match[1]), Number(match[2]), 0, 0);
+    return result;
+}
+
+function formatPickerDate(value: Date): string {
+    const year = value.getFullYear();
+    const month = String(value.getMonth() + 1).padStart(2, '0');
+    const day = String(value.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+}
+
+function formatPickerTime(value: Date): string {
+    const hours = String(value.getHours()).padStart(2, '0');
+    const minutes = String(value.getMinutes()).padStart(2, '0');
+    return `${hours}:${minutes}`;
 }
 
 interface CreateEventModalProps {
@@ -52,6 +78,7 @@ export function CreateEventModal({
     const [submitting, setSubmitting] = useState(false);
     const [showDatePicker, setShowDatePicker] = useState(false);
     const [showTimePicker, setShowTimePicker] = useState(false);
+    const [showEndDatePicker, setShowEndDatePicker] = useState(false);
     const [showEndTimePicker, setShowEndTimePicker] = useState(false);
     const [showRepeatStartDatePicker, setShowRepeatStartDatePicker] = useState(false);
     const [inviteAfterCreate, setInviteAfterCreate] = useState(false);
@@ -100,7 +127,7 @@ export function CreateEventModal({
         const description = newMeeting.description.trim();
         const locationName = newMeeting.locationName.trim();
         const meetingLink = newMeeting.meetingLink.trim();
-        const isFieldsMissing = !title || newMeeting.interests.length === 0 || !locationName || !description || !newMeeting.date || !newMeeting.time || !newMeeting.endTime;
+        const isFieldsMissing = !title || newMeeting.interests.length === 0 || !locationName || !description || !newMeeting.date || !newMeeting.time || !newMeeting.endDate || !newMeeting.endTime;
         if (isFieldsMissing) {
             Alert.alert('Atenção', 'Por favor, preencha todos os campos obrigatórios.');
             return;
@@ -109,8 +136,17 @@ export function CreateEventModal({
             Alert.alert('Nome muito curto', 'Use pelo menos 3 caracteres no nome do evento.');
             return;
         }
-        if (!isEndTimeAfterStart(newMeeting.time, newMeeting.endTime)) {
-            Alert.alert('Horário inválido', 'O horário de término deve ser posterior ao horário de início no mesmo dia.');
+        const durationIssue = getEventDurationIssue(newMeeting);
+        if (durationIssue === 'invalid') {
+            Alert.alert('Término inválido', 'A data e a hora de término precisam ser posteriores ao início.');
+            return;
+        }
+        if (durationIssue === 'too-short') {
+            Alert.alert('Evento muito curto', 'O evento precisa durar pelo menos 15 minutos.');
+            return;
+        }
+        if (durationIssue === 'too-long') {
+            Alert.alert('Evento muito longo', 'Um evento pode durar no máximo 24 horas. Crie outra edição caso precise continuar depois disso.');
             return;
         }
         if (title.length > TITLE_MAX_LENGTH || locationName.length > LOCATION_MAX_LENGTH || description.length > DESCRIPTION_MAX_LENGTH) {
@@ -158,27 +194,39 @@ export function CreateEventModal({
                             }
                             const creatorName = creatorData?.nick || creatorData?.displayName || auth.currentUser?.displayName || 'Usuário';
                             const normalizedInterests = normalizeInterests(newMeeting.interests);
-                            const baseDate = new Date(`${newMeeting.date}T${newMeeting.time}:00`);
-                            const repeatBaseDate = repeatCount > 0 ? new Date(`${repeatStartDate}T${newMeeting.time}:00`) : null;
+                            const baseStart = getEventDateTime(newMeeting.date, newMeeting.time);
+                            const baseEnd = getEventDateTime(newMeeting.endDate, newMeeting.endTime);
+                            const repeatBaseStart = repeatCount > 0 ? getEventDateTime(repeatStartDate, newMeeting.time) : null;
+                            if (!baseStart || !baseEnd || baseEnd <= baseStart || (repeatCount > 0 && !repeatBaseStart)) {
+                                Alert.alert('Data inválida', 'Revise as datas e os horários do evento.');
+                                return;
+                            }
+                            const durationMs = baseEnd.getTime() - baseStart.getTime();
                             const batch = writeBatch(db);
                             const seriesId = doc(collection(db, 'meetings')).id; // Gerar um ID de série
                             let firstEventId = '';
                             const createdEventReminders: EventReminder[] = [];
                             
                             for (let i = 0; i <= repeatCount; i++) {
-                                const currentEventDate = i === 0 || !repeatBaseDate
-                                    ? new Date(baseDate)
-                                    : new Date(repeatBaseDate);
-                                if (i > 1 && repeatBaseDate) currentEventDate.setDate(repeatBaseDate.getDate() + ((i - 1) * 7));
-
-                                const year = currentEventDate.getFullYear();
-                                const month = String(currentEventDate.getMonth() + 1).padStart(2, '0');
-                                const day = String(currentEventDate.getDate()).padStart(2, '0');
-                                const dateStr = `${year}-${month}-${day}`;
+                                const currentEventStart = i === 0 || !repeatBaseStart
+                                    ? new Date(baseStart)
+                                    : new Date(repeatBaseStart.getTime() + ((i - 1) * 7 * 24 * 60 * 60 * 1000));
+                                const currentEventEnd = new Date(currentEventStart.getTime() + durationMs);
+                                const dateStr = getDateStr(currentEventStart);
+                                const endDateStr = getDateStr(currentEventEnd);
                                 
                                 const newDocRef = doc(collection(db, 'meetings'));
                                 if (i === 0) firstEventId = newDocRef.id;
-                                createdEventReminders.push({ id: newDocRef.id, title: newMeeting.title, date: dateStr, time: newMeeting.time });
+                                createdEventReminders.push({
+                                    id: newDocRef.id,
+                                    title: newMeeting.title,
+                                    date: dateStr,
+                                    time: newMeeting.time,
+                                    endDate: endDateStr,
+                                    endTime: newMeeting.endTime,
+                                    type: eventType,
+                                    isOrganizer: true,
+                                });
                                 batch.set(newDocRef, {
                                     ...newMeeting,
                                     title,
@@ -186,6 +234,9 @@ export function CreateEventModal({
                                     locationName,
                                     interests: normalizedInterests,
                                     date: dateStr,
+                                    endDate: endDateStr,
+                                    startsAt: Timestamp.fromDate(currentEventStart),
+                                    endsAt: Timestamp.fromDate(currentEventEnd),
                                     theme: normalizedInterests[0],
                                     type: eventType,
                                     meetingLink: eventType === 'online' ? meetingLink : '',
@@ -203,9 +254,7 @@ export function CreateEventModal({
                             }
 
                             await batch.commit();
-                            scheduleEventReminders(createdEventReminders, creatorId).catch(() => {
-                                console.warn('[CreateEvent] local_reminder_schedule_failed');
-                            });
+                            scheduleEventReminders(createdEventReminders, creatorId).catch(() => undefined);
 
 
 
@@ -213,7 +262,7 @@ export function CreateEventModal({
                                 ? `Evento criado com ${repeatCount} repetições semanais!`
                                 : 'Seu evento foi criado e já está disponível para a comunidade!';
                             setNewMeeting({
-                                title: '', interests: [], description: '', locationName: '', date: '', time: '', endTime: '',
+                                title: '', interests: [], description: '', locationName: '', date: '', time: '', endDate: '', endTime: '',
                                 lat: 0, lng: 0, type: 'in-person', meetingLink: '', placeId: '',
                             });
                             setRepeatCount(0);
@@ -264,7 +313,7 @@ export function CreateEventModal({
                             </View>
                         </View>
                         <View style={styles.inputGroup}>
-                            <Text style={styles.inputLabel}>Data e Horário</Text>
+                            <Text style={styles.inputLabel}>Início</Text>
                             <View style={styles.row}>
                                 <TouchableOpacity style={[styles.input, { flex: 1, marginRight: 8, justifyContent: 'center' }]} onPress={() => setShowDatePicker(true)}>
                                     <Text style={{ color: newMeeting.date ? '#111827' : '#B6C0CE' }}>{newMeeting.date ? newMeeting.date.split('-').reverse().join('/') : 'Data (Dia/Mês)'}</Text>
@@ -275,38 +324,51 @@ export function CreateEventModal({
                             </View>
                         </View>
                         <View style={styles.inputGroup}>
-                            <TouchableOpacity style={[styles.input, { justifyContent: 'center' }]} onPress={() => setShowEndTimePicker(true)}>
-                                <Text style={{ color: newMeeting.endTime ? '#111827' : '#B6C0CE' }}>{newMeeting.endTime || 'Horário de término'}</Text>
-                            </TouchableOpacity>
+                            <Text style={styles.inputLabel}>Término</Text>
+                            <View style={styles.row}>
+                                <TouchableOpacity style={[styles.input, { flex: 1, marginRight: 8, justifyContent: 'center' }]} onPress={() => setShowEndDatePicker(true)}>
+                                    <Text style={{ color: newMeeting.endDate ? '#111827' : '#B6C0CE' }}>{newMeeting.endDate ? newMeeting.endDate.split('-').reverse().join('/') : 'Data de término'}</Text>
+                                </TouchableOpacity>
+                                <TouchableOpacity style={[styles.input, { flex: 1, justifyContent: 'center' }]} onPress={() => setShowEndTimePicker(true)}>
+                                    <Text style={{ color: newMeeting.endTime ? '#111827' : '#B6C0CE' }}>{newMeeting.endTime || 'Horário'}</Text>
+                                </TouchableOpacity>
+                            </View>
+                            <Text style={styles.helperText}>Duração permitida: de 15 minutos a 24 horas. O término pode ser no dia seguinte.</Text>
                         </View>
                         {showDatePicker && (
-                            <DateTimePicker value={new Date()} minimumDate={new Date()} mode="date" display={Platform.OS === 'ios' ? 'spinner' : 'default'} onChange={(_event, selectedDate) => {
+                            <DateTimePicker value={pickerDate(newMeeting.date)} minimumDate={new Date()} mode="date" display={Platform.OS === 'ios' ? 'spinner' : 'default'} onChange={(event, selectedDate) => {
                                 setShowDatePicker(false);
-                                if (selectedDate) {
-                                    const year = selectedDate.getFullYear();
-                                    const month = String(selectedDate.getMonth() + 1).padStart(2, '0');
-                                    const day = String(selectedDate.getDate()).padStart(2, '0');
-                                    setNewMeeting({ ...newMeeting, date: `${year}-${month}-${day}` });
+                                if (event.type !== 'dismissed' && selectedDate) {
+                                    const nextDate = formatPickerDate(selectedDate);
+                                    setNewMeeting((current) => ({
+                                        ...current,
+                                        date: nextDate,
+                                        endDate: !current.endDate || current.endDate < nextDate ? nextDate : current.endDate,
+                                    }));
+                                }
+                            }} />
+                        )}
+                        {showEndDatePicker && (
+                            <DateTimePicker value={pickerDate(newMeeting.endDate || newMeeting.date)} minimumDate={pickerDate(newMeeting.date)} mode="date" display={Platform.OS === 'ios' ? 'spinner' : 'default'} onChange={(event, selectedDate) => {
+                                setShowEndDatePicker(false);
+                                if (event.type !== 'dismissed' && selectedDate) {
+                                    setNewMeeting((current) => ({ ...current, endDate: formatPickerDate(selectedDate) }));
                                 }
                             }} />
                         )}
                         {showTimePicker && (
-                            <DateTimePicker value={new Date()} mode="time" display={Platform.OS === 'ios' ? 'spinner' : 'default'} is24Hour={true} onChange={(event, selectedDate) => {
+                            <DateTimePicker value={pickerTime(newMeeting.time)} mode="time" display={Platform.OS === 'ios' ? 'spinner' : 'default'} is24Hour={true} onChange={(event, selectedDate) => {
                                 setShowTimePicker(false);
-                                if (selectedDate) {
-                                    const hours = String(selectedDate.getHours()).padStart(2, '0');
-                                    const minutes = String(selectedDate.getMinutes()).padStart(2, '0');
-                                    setNewMeeting({ ...newMeeting, time: `${hours}:${minutes}` });
+                                if (event.type !== 'dismissed' && selectedDate) {
+                                    setNewMeeting((current) => ({ ...current, time: formatPickerTime(selectedDate) }));
                                 }
                             }} />
                         )}
                         {showEndTimePicker && (
-                            <DateTimePicker value={new Date()} mode="time" display={Platform.OS === 'ios' ? 'spinner' : 'default'} is24Hour={true} onChange={(_event, selectedDate) => {
+                            <DateTimePicker value={pickerTime(newMeeting.endTime)} mode="time" display={Platform.OS === 'ios' ? 'spinner' : 'default'} is24Hour={true} onChange={(event, selectedDate) => {
                                 setShowEndTimePicker(false);
-                                if (selectedDate) {
-                                    const hours = String(selectedDate.getHours()).padStart(2, '0');
-                                    const minutes = String(selectedDate.getMinutes()).padStart(2, '0');
-                                    setNewMeeting({ ...newMeeting, endTime: `${hours}:${minutes}` });
+                                if (event.type !== 'dismissed' && selectedDate) {
+                                    setNewMeeting((current) => ({ ...current, endTime: formatPickerTime(selectedDate) }));
                                 }
                             }} />
                         )}
@@ -358,13 +420,10 @@ export function CreateEventModal({
                             </View>
                         )}
                         {showRepeatStartDatePicker && (
-                            <DateTimePicker value={new Date()} minimumDate={new Date()} mode="date" display={Platform.OS === 'ios' ? 'spinner' : 'default'} onChange={(_event, selectedDate) => {
+                            <DateTimePicker value={pickerDate(repeatStartDate)} minimumDate={new Date()} mode="date" display={Platform.OS === 'ios' ? 'spinner' : 'default'} onChange={(event, selectedDate) => {
                                 setShowRepeatStartDatePicker(false);
-                                if (!selectedDate) return;
-                                const year = selectedDate.getFullYear();
-                                const month = String(selectedDate.getMonth() + 1).padStart(2, '0');
-                                const day = String(selectedDate.getDate()).padStart(2, '0');
-                                setRepeatStartDate(`${year}-${month}-${day}`);
+                                if (event.type === 'dismissed' || !selectedDate) return;
+                                setRepeatStartDate(formatPickerDate(selectedDate));
                             }} />
                         )}
                         <TouchableOpacity

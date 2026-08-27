@@ -13,6 +13,8 @@ expo-env.d.ts
 .kotlin/
 *.orig.*
 *.jks
+*.keystore
+keystore.properties
 *.p8
 *.p12
 *.key
@@ -43,24 +45,27 @@ firebase-debug.log
 
 
 
-# environment variables
-.env
+# environment variables locais ou secretas
 .env.local
 .env.development.local
 .env.test.local
 .env.production.local
 *.env
 
+# Configuração local usada nos builds; mantenha fora do repositório.
+.env
+
 # keys and secrets
 *.key
 *.pem
 credentials.json
 GoogleService-Info.plist
+google-services.json
 *firebase-adminsdk*.json
 service-account*.json
 
-# ignore firebase config if it contains keys (optional, but safer to use .env)
-# firebaseConfig.js
+# Configuração de cliente do Firebase pode ser versionada. Chaves
+# administrativas continuam bloqueadas pelos padrões acima.
 
 
 # project configs with keys

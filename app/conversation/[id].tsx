@@ -10,6 +10,8 @@ import { Message } from '../../src/types';
 import { ReportReasonModal } from '@/src/components/ReportReasonModal';
 import { markRelatedNotificationsAsRead } from '@/src/services/notificationReadService';
 import { submitReport } from '@/src/services/reportService';
+import { setActiveNotificationTarget } from '@/src/utils/Notifications';
+import { useFocusEffect } from '@react-navigation/native';
 
 function getErrorMessage(error: unknown): string {
     return error instanceof Error ? error.message : '';
@@ -52,6 +54,13 @@ export default function ChatScreen() {
     const [showOptionsModal, setShowOptionsModal] = useState(false);
     const [showReportReasonModal, setShowReportReasonModal] = useState(false);
     const [otherUserExists, setOtherUserExists] = useState(true);
+    const [otherUserName, setOtherUserName] = useState(typeof name === 'string' && name.trim() ? name : 'Chat');
+
+    useFocusEffect(React.useCallback(() => {
+        if (!id) return;
+        setActiveNotificationTarget({ conversationId: id });
+        return () => setActiveNotificationTarget(null);
+    }, [id]));
 
     useEffect(() => {
         if (!id || !auth.currentUser) return;
@@ -107,6 +116,15 @@ export default function ChatScreen() {
 
         const unsubscribeOtherUser = onSnapshot(doc(db, 'users', otherUid), (userSnap) => {
             setOtherUserExists(userSnap.exists());
+            if (userSnap.exists()) {
+                const profile = userSnap.data();
+                const currentName = typeof profile.nick === 'string' && profile.nick.trim()
+                    ? profile.nick
+                    : typeof profile.displayName === 'string' && profile.displayName.trim()
+                        ? profile.displayName
+                        : 'Usuário';
+                setOtherUserName(currentName);
+            }
         });
 
         return () => unsubscribeOtherUser();
@@ -134,8 +152,13 @@ export default function ChatScreen() {
             pendingMessageRef.current = null;
             setInputText('');
         } catch (error) {
-            console.error("Error sending message: ", error);
             const message = getErrorMessage(error);
+            const isExpectedBlock = message.includes('bloqueou você') || message.includes('Você bloqueou');
+            if (isExpectedBlock) {
+                if (__DEV__) console.info('[Conversation] message_rejected_by_block');
+            } else {
+                console.error('[Conversation] message_send_failed');
+            }
             Alert.alert(
                 'Mensagem não enviada',
                 message.includes('bloqueou você')
@@ -177,7 +200,7 @@ export default function ChatScreen() {
         if (!conversationData || !auth.currentUser) return;
         const otherUid = conversationData.participants.find((participant) => participant !== auth.currentUser?.uid);
         if (!otherUid) return;
-        const otherName = conversationData.participantNames?.[otherUid] || 'Usuário';
+        const otherName = otherUserName || conversationData.participantNames?.[otherUid] || 'Usuário';
 
         Alert.alert('Bloquear Usuário', `Tem certeza que deseja bloquear ${otherName}?`, [
             { text: 'Cancelar', style: 'cancel' },
@@ -273,7 +296,7 @@ export default function ChatScreen() {
         <SafeAreaView style={styles.container}>
             <Stack.Screen
                 options={{
-                    title: otherUserExists ? (name as string || 'Chat') : 'Usuário Excluído',
+                    title: otherUserExists ? otherUserName : 'Usuário Excluído',
                     headerBackTitle: 'Voltar',
                     headerRight: () => (
                         <TouchableOpacity onPress={() => setShowOptionsModal(true)} style={{ padding: 8 }}>

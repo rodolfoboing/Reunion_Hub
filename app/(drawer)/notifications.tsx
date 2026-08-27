@@ -1,14 +1,19 @@
 import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import { collection, doc, limit, onSnapshot, orderBy, query, updateDoc, where, writeBatch } from 'firebase/firestore';
+import { collection, doc, limit, onSnapshot, orderBy, query, updateDoc, where } from 'firebase/firestore';
 import { useEffect, useMemo, useState } from 'react';
 import { ActivityIndicator, FlatList, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { auth, db } from '../../src/services/firebaseConfig';
 import { Notification } from '../../src/types';
+import { markAllNotificationsAsRead } from '@/src/services/notificationReadService';
 
-const getIconName = (type: string): keyof typeof Ionicons.glyphMap => {
+const getIconName = (type: string, reputationDelta?: number): keyof typeof Ionicons.glyphMap => {
+    if (typeof reputationDelta === 'number' && reputationDelta !== 0) return 'star-outline';
     if (type === 'chat') return 'chatbubble-outline';
+    if (type.startsWith('checkin_')) return 'checkmark-circle-outline';
+    if (type === 'repeat_proposal') return 'repeat-outline';
+    if (type.startsWith('report_')) return 'shield-checkmark-outline';
     if (type.includes('event')) return 'calendar-outline';
     return 'notifications-outline';
 };
@@ -80,20 +85,26 @@ export default function NotificationsScreen() {
             router.push(`/conversation/${notification.conversationId}` as never);
             return;
         }
+        if (notification.type === 'repeat_proposal') {
+            router.push('/(drawer)/(tabs)/agenda' as never);
+            return;
+        }
         if (notification.meetingId) {
             router.push({
                 pathname: '/event/[id]',
-                params: { id: notification.meetingId, notificationType: notification.type },
+                params: { id: notification.meetingId, notificationType: notification.type, notificationId: notification.id },
             } as never);
+            return;
+        }
+        if (notification.path) {
+            router.push(notification.path as never);
         }
     };
 
     const markAllAsRead = async () => {
-        if (unreadNotifications.length === 0) return;
+        if (notifications.length === 0) return;
         try {
-            const batch = writeBatch(db);
-            unreadNotifications.forEach((notification) => batch.update(doc(db, 'notifications', notification.id), { read: true }));
-            await batch.commit();
+            await markAllNotificationsAsRead();
         } catch (batchError) {
             console.error('[Notifications] Erro ao marcar todas como lidas:', batchError);
         }
@@ -102,14 +113,21 @@ export default function NotificationsScreen() {
     const renderItem = ({ item }: { item: Notification }) => (
         <TouchableOpacity style={[styles.card, !item.read && styles.unreadCard]} onPress={() => openNotification(item)} activeOpacity={0.75}>
             <View style={[styles.iconContainer, !item.read && styles.unreadIconContainer]}>
-                <Ionicons name={getIconName(item.type)} size={22} color={item.read ? '#6B7280' : '#4F46E5'} />
+                <Ionicons name={getIconName(item.type, item.reputationDelta)} size={22} color={item.read ? '#6B7280' : '#4F46E5'} />
             </View>
             <View style={styles.contentContainer}>
                 <View style={styles.headerRow}>
                     <Text style={[styles.cardTitle, !item.read && styles.unreadText]} numberOfLines={1}>{item.title}</Text>
                     <Text style={styles.timeText}>{formatTime(item.createdAt)}</Text>
                 </View>
-                <Text style={styles.cardBody} numberOfLines={2}>{item.body}</Text>
+                {typeof item.reputationDelta === 'number' && item.reputationDelta !== 0 && (
+                    <View style={[styles.reputationBadge, item.reputationDelta > 0 ? styles.reputationGain : styles.reputationLoss]}>
+                        <Text style={[styles.reputationBadgeText, item.reputationDelta > 0 ? styles.reputationGainText : styles.reputationLossText]}>
+                            {item.reputationDelta > 0 ? '+' : ''}{item.reputationDelta} pontos
+                        </Text>
+                    </View>
+                )}
+                <Text style={styles.cardBody} numberOfLines={3}>{item.body}</Text>
             </View>
             {!item.read && <View style={styles.dot} />}
         </TouchableOpacity>
@@ -122,8 +140,8 @@ export default function NotificationsScreen() {
                     <Text style={styles.headerTitle}>Notificações</Text>
                     {unreadNotifications.length > 0 && <Text style={styles.headerSubtitle}>{unreadNotifications.length} não lida(s)</Text>}
                 </View>
-                <TouchableOpacity disabled={unreadNotifications.length === 0} onPress={markAllAsRead} style={styles.readAllButton}>
-                    <Text style={[styles.readAllText, unreadNotifications.length === 0 && styles.readAllTextDisabled]}>Ler todas</Text>
+                <TouchableOpacity disabled={notifications.length === 0} onPress={markAllAsRead} style={styles.readAllButton}>
+                    <Text style={[styles.readAllText, notifications.length === 0 && styles.readAllTextDisabled]}>Ler todas</Text>
                 </TouchableOpacity>
             </View>
 
@@ -163,6 +181,12 @@ const styles = StyleSheet.create({
     cardTitle: { fontSize: 15, fontWeight: '600', color: '#374151', flex: 1, marginRight: 8 },
     unreadText: { color: '#111827', fontWeight: '800' },
     cardBody: { fontSize: 13, color: '#6B7280', lineHeight: 19 },
+    reputationBadge: { alignSelf: 'flex-start', borderRadius: 999, paddingHorizontal: 9, paddingVertical: 3, marginBottom: 5 },
+    reputationGain: { backgroundColor: '#DCFCE7' },
+    reputationLoss: { backgroundColor: '#FEE2E2' },
+    reputationBadgeText: { fontSize: 11, fontWeight: '900' },
+    reputationGainText: { color: '#15803D' },
+    reputationLossText: { color: '#B91C1C' },
     timeText: { fontSize: 11, color: '#9CA3AF' },
     dot: { width: 8, height: 8, borderRadius: 4, backgroundColor: '#4F46E5', marginLeft: 8 },
     center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 24 },

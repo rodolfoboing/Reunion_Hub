@@ -46,7 +46,7 @@ module.exports = {
     ],
     android: {
       package: 'com.rodolfoboing.reunionhub',
-      versionCode: 3,
+      versionCode: 4,
       adaptiveIcon: {
         foregroundImage: './assets/images/adaptive-icon.png',
         backgroundColor: '#ffffff',

@@ -54,7 +54,7 @@ service cloud.firestore {
     function editableUserFields() {
       return [
         'displayName', 'nick', 'searchName', 'bio', 'interests', 'photoURL',
-        'showPopularOutsideInterests', 'favorites',
+        'showPopularOutsideInterests', 'shareFrequentedPlaces', 'favorites',
         'blockedUsers', 'isProfileComplete'
       ];
     }

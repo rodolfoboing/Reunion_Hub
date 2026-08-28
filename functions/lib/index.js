@@ -1152,33 +1152,17 @@ exports.removePlaceHabit = smallFunction.https.onCall(async (data, context) => {
     console.info('[PlaceHabit] removed');
     return { ok: true };
 });
+// Compatibilidade temporaria com APKs anteriores. As versoes atuais salvam esta
+// preferencia junto do perfil; esta ponte faz somente uma escrita e nao percorre
+// nem altera os locais frequentados. Remover apos os builds antigos serem retirados.
 exports.setFrequentedPlacesPrivacy = smallFunction.https.onCall(async (data, context) => {
     const uid = requireAuthenticated(context);
-    if (!(0, validation_1.isRecord)(data) || typeof data.enabled !== 'boolean') {
-        throw new functions.https.HttpsError('invalid-argument', 'A preferência de privacidade é obrigatória.');
+    if (!data || typeof data !== 'object' || typeof data.enabled !== 'boolean') {
+        throw new functions.https.HttpsError('invalid-argument', 'A preferencia de privacidade e obrigatoria.');
     }
     const enabled = data.enabled;
-    const userRef = db.collection('users').doc(uid);
-    const habitsSnapshot = await userRef.collection('placeHabits').limit(50).get();
-    const batch = db.batch();
-    batch.set(userRef, { shareFrequentedPlaces: enabled }, { merge: true });
-    // A preferência controla somente a seção "Lugares que frequenta" do perfil.
-    // A presença no próprio local continua pública, pois é o dado comunitário
-    // necessário para mostrar dias/períodos e reunir pessoas naquele espaço.
-    // Este lote também repara hábitos antigos que foram removidos de `places`.
-    habitsSnapshot.docs.forEach((habitDocument) => {
-        const schedule = habitDocument.data().schedule;
-        const placeRef = db.collection('places').doc(habitDocument.id);
-        batch.set(placeRef, {
-            frequenters: admin.firestore.FieldValue.arrayUnion(uid),
-            [`habitSchedules.${uid}`]: (0, validation_1.isRecord)(schedule)
-                ? schedule
-                : admin.firestore.FieldValue.delete(),
-            [`habits.${uid}`]: admin.firestore.FieldValue.delete(),
-        }, { merge: true });
-    });
-    await batch.commit();
-    console.info('[PlaceHabit] privacy_updated', { enabled, habitCount: habitsSnapshot.size });
+    await db.collection('users').doc(uid).set({ shareFrequentedPlaces: enabled }, { merge: true });
+    console.info('[ProfilePrivacy] compatibility_preference_updated');
     return { ok: true };
 });
 exports.checkInToEvent = smallFunction.https.onCall(async (data, context) => {
@@ -1827,7 +1811,7 @@ exports.dailyEventRecommendations = dailyFunction.pubsub
         if (!profile.exists || !profileData || profileData.banned === true)
             return [];
         const settings = settingsByUserId.get(profile.id);
-        if ((settings === null || settings === void 0 ? void 0 : settings.notifyRecommendations) !== true)
+        if (!(0, recommendations_1.isNotificationPreferenceEnabled)(settings === null || settings === void 0 ? void 0 : settings.notifyRecommendations))
             return [];
         const user = {
             userId: profile.id,

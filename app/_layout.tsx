@@ -100,7 +100,7 @@ export default function RootLayout() {
           setEventRemindersEnabled(user.uid, snapshot.data()?.notifyEventReminders !== false).catch(() => {
             console.warn('[RootLayout] reminder_preference_sync_failed');
           });
-          setReengagementReminderEnabled(user.uid, snapshot.data()?.notifyRecommendations === true).catch(() => {
+          setReengagementReminderEnabled(user.uid, snapshot.data()?.notifyRecommendations !== false).catch(() => {
             console.warn('[RootLayout] reengagement_preference_sync_failed');
           });
         }, () => console.error('[RootLayout] reminder_preference_load_failed'));

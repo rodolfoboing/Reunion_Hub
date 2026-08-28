@@ -20,6 +20,7 @@ import { unregisterCurrentPushDevice } from '@/src/services/pushRegistrationServ
 import { setEventRemindersEnabled, setReengagementReminderEnabled } from '@/src/utils/Notifications';
 import { clearRecommendationLocationCache } from '@/src/services/recommendationLocationService';
 import { isValidNickname, NicknameUnavailableError, updateOwnProfile, uploadProfileImage } from '@/src/services/profileService';
+import { DEFAULT_NOTIFICATION_SETTINGS } from '@/src/constants/userPreferences';
 
 function profileLog(event: string, context: Record<string, boolean | number> = {}) {
     if (__DEV__) console.info(`[Profile] ${event}`, context);
@@ -37,18 +38,13 @@ export default function ProfileScreen() {
     const [editBio, setEditBio] = useState('');
     const [editNick, setEditNick] = useState('');
     const [editInterests, setEditInterests] = useState<string[]>([]);
-    const [shareFrequentedPlaces, setShareFrequentedPlaces] = useState(false);
+    const [shareFrequentedPlaces, setShareFrequentedPlaces] = useState(true);
     const [showPopularOutsideInterests, setShowPopularOutsideInterests] = useState(true);
     const [notifyMessages, setNotifyMessages] = useState(true);
     const [notifyEventUpdates, setNotifyEventUpdates] = useState(true);
     const [notifyEventReminders, setNotifyEventReminders] = useState(true);
-    const [notifyRecommendations, setNotifyRecommendations] = useState(false);
-    const [savedNotificationSettings, setSavedNotificationSettings] = useState({
-        notifyMessages: true,
-        notifyEventUpdates: true,
-        notifyEventReminders: true,
-        notifyRecommendations: false,
-    });
+    const [notifyRecommendations, setNotifyRecommendations] = useState(true);
+    const [savedNotificationSettings, setSavedNotificationSettings] = useState({ ...DEFAULT_NOTIFICATION_SETTINGS });
     const [editPhotoURL, setEditPhotoURL] = useState<string | null>(null);
     const [loading, setLoading] = useState(false);
     const [showTermsModal, setShowTermsModal] = useState(false);
@@ -139,7 +135,7 @@ export default function ProfileScreen() {
                 notifyMessages: data?.notifyMessages !== false,
                 notifyEventUpdates: data?.notifyEventUpdates !== false,
                 notifyEventReminders: data?.notifyEventReminders !== false,
-                notifyRecommendations: data?.notifyRecommendations === true,
+                notifyRecommendations: data?.notifyRecommendations !== false,
             };
             setSavedNotificationSettings(settings);
             setNotifyMessages(settings.notifyMessages);
@@ -182,7 +178,7 @@ export default function ProfileScreen() {
         setEditBio(userProfile?.bio || '');
         setEditNick(userProfile?.nick || auth.currentUser?.displayName?.replace(/\s/g, '').toLowerCase() || '');
         setEditInterests(normalizeInterests(userProfile?.interests));
-        setShareFrequentedPlaces(userProfile?.shareFrequentedPlaces === true);
+        setShareFrequentedPlaces(userProfile?.shareFrequentedPlaces !== false);
         setShowPopularOutsideInterests(userProfile?.showPopularOutsideInterests !== false);
         setNotifyMessages(savedNotificationSettings.notifyMessages);
         setNotifyEventUpdates(savedNotificationSettings.notifyEventUpdates);
@@ -308,10 +304,7 @@ export default function ProfileScreen() {
                 interests: normalizedInterests,
                 photoURL: finalPhotoURL,
                 showPopularOutsideInterests,
-            });
-
-            await httpsCallable<{ enabled: boolean }, { ok: boolean }>(functions, 'setFrequentedPlacesPrivacy')({
-                enabled: shareFrequentedPlaces,
+                shareFrequentedPlaces,
             });
             await setDoc(doc(db, 'notificationSettings', user.uid), {
                 notifyMessages,
@@ -690,6 +683,11 @@ export default function ProfileScreen() {
                         thumbColor={shareFrequentedPlaces ? '#4F46E5' : '#F9FAFB'}
                     />
                 </View>
+                <Text style={styles.privacyHint}>Esta opção altera somente a lista exibida no seu perfil. Seus dias e períodos continuam visíveis ao abrir o próprio local.</Text>
+            </View>}
+
+            {isEditing && <View style={styles.section}>
+                <Text style={styles.sectionTitle}>Descoberta e recomendações</Text>
                 <View style={styles.privacyRow}>
                     <View style={styles.privacyTextContainer}>
                         <Text style={styles.privacyTitle}>Eventos populares fora dos meus interesses</Text>
@@ -702,25 +700,28 @@ export default function ProfileScreen() {
                         thumbColor={showPopularOutsideInterests ? '#4F46E5' : '#F9FAFB'}
                     />
                 </View>
-                <Text style={[styles.sectionTitle, styles.notificationSectionTitle]}>Notificações</Text>
+            </View>}
+
+            {isEditing && <View style={styles.section}>
+                <Text style={styles.sectionTitle}>Notificações</Text>
                 <View style={styles.privacyRow}>
                     <View style={styles.privacyTextContainer}>
                         <Text style={styles.privacyTitle}>Mensagens</Text>
-                        <Text style={styles.privacyDescription}>Receber alertas quando alguém enviar uma mensagem.</Text>
+                        <Text style={styles.privacyDescription}>Receber notificações push quando alguém enviar uma mensagem.</Text>
                     </View>
                     <Switch value={notifyMessages} onValueChange={setNotifyMessages} />
                 </View>
                 <View style={styles.privacyRow}>
                     <View style={styles.privacyTextContainer}>
                         <Text style={styles.privacyTitle}>Atualizações de eventos</Text>
-                        <Text style={styles.privacyDescription}>Convites, check-ins, cancelamentos e alterações de reputação.</Text>
+                        <Text style={styles.privacyDescription}>Receber push de convites, check-ins, cancelamentos e alterações de reputação.</Text>
                     </View>
                     <Switch value={notifyEventUpdates} onValueChange={setNotifyEventUpdates} />
                 </View>
                 <View style={styles.privacyRow}>
                     <View style={styles.privacyTextContainer}>
                         <Text style={styles.privacyTitle}>Lembretes de eventos</Text>
-                        <Text style={styles.privacyDescription}>Lembrete local duas horas antes dos eventos confirmados.</Text>
+                        <Text style={styles.privacyDescription}>Lembretes locais duas horas antes, no início e no término dos eventos confirmados.</Text>
                     </View>
                     <Switch value={notifyEventReminders} onValueChange={setNotifyEventReminders} />
                 </View>
@@ -731,6 +732,7 @@ export default function ProfileScreen() {
                     </View>
                     <Switch value={notifyRecommendations} onValueChange={setNotifyRecommendations} />
                 </View>
+                <Text style={styles.privacyHint}>Desativar um push ou lembrete não apaga avisos importantes do sino. Eles permanecem no app para você consultar quando entrar.</Text>
             </View>}
 
             {!isEditing && (
@@ -939,7 +941,6 @@ const styles = StyleSheet.create({
     section: { width: '100%', marginBottom: 32 },
     sectionTitle: { fontSize: 18, fontWeight: 'bold', marginBottom: 16, color: '#1f2937' },
     sectionTitleCompact: { fontSize: 18, fontWeight: 'bold', color: '#1f2937' },
-    notificationSectionTitle: { marginTop: 24 },
     privacyRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 16 },
     privacyTextContainer: { flex: 1 },
     privacyTitle: { fontSize: 15, fontWeight: '600', color: '#374151', marginBottom: 4 },

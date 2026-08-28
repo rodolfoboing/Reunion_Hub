@@ -1,6 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { doc, getDoc, serverTimestamp, setDoc } from 'firebase/firestore';
 import { db } from '@/src/services/firebaseConfig';
+import { DEFAULT_NOTIFICATION_SETTINGS } from '@/src/constants/userPreferences';
 
 const LOCATION_CACHE_KEY_PREFIX = '@reunionhub_recommendation_location:';
 const LOCATION_REFRESH_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -47,9 +48,10 @@ export async function updateRecommendationLocation(userId: string, coordinates: 
 
     const settingsRef = doc(db, 'notificationSettings', userId);
     const settingsSnapshot = await getDoc(settingsRef);
-    if (!settingsSnapshot.exists() || settingsSnapshot.data()?.notifyRecommendations !== true) return;
+    if (settingsSnapshot.data()?.notifyRecommendations === false) return;
 
     await setDoc(settingsRef, {
+        ...(!settingsSnapshot.exists() ? DEFAULT_NOTIFICATION_SETTINGS : {}),
         recommendationLocation: {
             latitude,
             longitude,

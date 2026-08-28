@@ -2,11 +2,18 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
     canSendDailyRecommendation,
+    isNotificationPreferenceEnabled,
     recommendationCooldownNotificationIds,
     selectDailyRecommendation,
 } = require('../lib/recommendations');
 
 const nowMs = Date.parse('2026-08-22T12:00:00.000Z');
+
+test('enables notifications by default and preserves an explicit opt-out', () => {
+    assert.equal(isNotificationPreferenceEnabled(undefined), true);
+    assert.equal(isNotificationPreferenceEnabled(true), true);
+    assert.equal(isNotificationPreferenceEnabled(false), false);
+});
 
 function event(overrides = {}) {
     return {

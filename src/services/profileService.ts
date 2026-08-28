@@ -12,6 +12,7 @@ import {
 } from 'firebase/firestore';
 import { db } from './firebaseConfig';
 import { CURRENT_TERMS_VERSION } from '@/src/constants/legal';
+import { DEFAULT_NOTIFICATION_SETTINGS } from '@/src/constants/userPreferences';
 
 const NICK_PATTERN = /^[a-z0-9._-]{3,20}$/;
 const CONVERSATION_NAME_SYNC_LIMIT = 400;
@@ -53,6 +54,7 @@ export async function createInitialUserProfile(input: {
     await assertNoLegacyNicknameOwner(searchName, input.userId);
     const userRef = doc(db, 'users', input.userId);
     const nicknameRef = doc(db, 'nicknames', searchName);
+    const notificationSettingsRef = doc(db, 'notificationSettings', input.userId);
 
     await runTransaction(db, async (transaction) => {
         const nicknameSnapshot = await transaction.get(nicknameRef);
@@ -74,10 +76,15 @@ export async function createInitialUserProfile(input: {
             eventsAttended: 0,
             foundedPlacesCount: 0,
             showPopularOutsideInterests: true,
+            shareFrequentedPlaces: true,
             isProfileComplete: false,
             createdAt: new Date().toISOString(),
             termsVersion: CURRENT_TERMS_VERSION,
             termsAcceptedAt: serverTimestamp(),
+        });
+        transaction.set(notificationSettingsRef, {
+            ...DEFAULT_NOTIFICATION_SETTINGS,
+            updatedAt: serverTimestamp(),
         });
     });
 }
@@ -110,6 +117,7 @@ export async function updateOwnProfile(input: {
     interests: string[];
     photoURL: string | null;
     showPopularOutsideInterests: boolean;
+    shareFrequentedPlaces: boolean;
 }): Promise<{ nickChanged: boolean }> {
     const searchName = normalizeNickname(input.nick);
     if (!isValidNickname(searchName)) throw new Error('invalid-nickname');
@@ -145,6 +153,7 @@ export async function updateOwnProfile(input: {
             interests: input.interests,
             photoURL: input.photoURL,
             showPopularOutsideInterests: input.showPopularOutsideInterests,
+            shareFrequentedPlaces: input.shareFrequentedPlaces,
         }, { merge: true });
         if (previousNicknameRef && previousNicknameSnapshot?.data()?.uid === input.userId) {
             transaction.delete(previousNicknameRef);

@@ -1,10 +1,14 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.selectDailyRecommendation = exports.distanceInKm = exports.canSendDailyRecommendation = exports.recommendationCooldownNotificationIds = exports.DAILY_RECOMMENDATION_COOLDOWN_DAYS = exports.DAILY_RECOMMENDATION_RADIUS_KM = void 0;
+exports.selectDailyRecommendation = exports.distanceInKm = exports.canSendDailyRecommendation = exports.recommendationCooldownNotificationIds = exports.isNotificationPreferenceEnabled = exports.DAILY_RECOMMENDATION_COOLDOWN_DAYS = exports.DAILY_RECOMMENDATION_RADIUS_KM = void 0;
 // Deve representar o mesmo conceito de "perto" usado no aplicativo.
 // O código das Functions não importa arquivos externos ao próprio rootDir.
 exports.DAILY_RECOMMENDATION_RADIUS_KM = 10;
 exports.DAILY_RECOMMENDATION_COOLDOWN_DAYS = 3;
+function isNotificationPreferenceEnabled(value) {
+    return value !== false;
+}
+exports.isNotificationPreferenceEnabled = isNotificationPreferenceEnabled;
 function normalizedInterest(value) {
     return value.trim().toLocaleLowerCase('pt-BR');
 }

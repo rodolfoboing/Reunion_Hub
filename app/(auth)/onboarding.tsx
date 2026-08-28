@@ -134,6 +134,16 @@ export default function CompleteProfileScreen() {
                 </View>
             </View>
 
+            <View style={styles.preferencesNotice}>
+                <FontAwesome name="sliders" size={22} color="#4F46E5" />
+                <View style={styles.preferencesNoticeText}>
+                    <Text style={styles.preferencesNoticeTitle}>Você mantém o controle</Text>
+                    <Text style={styles.preferencesNoticeBody}>
+                        Notificações, recomendações e a exibição dos lugares que você frequenta começam ativas. Em Perfil › Editar perfil, você pode desativar cada opção quando quiser. Recomendações presenciais usam apenas uma localização aproximada e recente.
+                    </Text>
+                </View>
+            </View>
+
             <StyledButton
                 title="Salvar e Continuar"
                 onPress={handleSave}
@@ -172,5 +182,12 @@ const styles = StyleSheet.create({
     chipSelected: { backgroundColor: '#e0e7ff', borderColor: '#6366f1' },
     chipText: { color: '#4b5563' },
     chipTextSelected: { color: '#4338ca', fontWeight: 'bold' },
+    preferencesNotice: {
+        flexDirection: 'row', alignItems: 'flex-start', gap: 12, backgroundColor: '#EEF2FF',
+        borderWidth: 1, borderColor: '#C7D2FE', borderRadius: 14, padding: 16, marginBottom: 24,
+    },
+    preferencesNoticeText: { flex: 1 },
+    preferencesNoticeTitle: { color: '#3730A3', fontSize: 15, fontWeight: '700', marginBottom: 5 },
+    preferencesNoticeBody: { color: '#4B5563', fontSize: 13, lineHeight: 19 },
 });
 

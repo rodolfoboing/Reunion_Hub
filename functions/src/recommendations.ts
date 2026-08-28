@@ -27,6 +27,10 @@ export type RecommendationEvent = {
     attendees: string[];
 };
 
+export function isNotificationPreferenceEnabled(value: unknown): boolean {
+    return value !== false;
+}
+
 function normalizedInterest(value: string): string {
     return value.trim().toLocaleLowerCase('pt-BR');
 }

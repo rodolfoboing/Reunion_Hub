@@ -69,7 +69,7 @@ export default function UserProfileScreen() {
                 if (!cancelled) setProfile({ ...userData, interests: normalizeInterests(userData.interests) });
 
                 // A preferência controla a visibilidade pública, não a do próprio dono.
-                if (!isOwnProfile && userData.shareFrequentedPlaces !== true) {
+                if (!isOwnProfile && userData.shareFrequentedPlaces === false) {
                     if (!cancelled) setFrequentedPlaces([]);
                     return;
                 }

@@ -317,6 +317,12 @@ function requireHabitSchedule(data) {
 function stringIds(value) {
     return Array.isArray(value) ? value.filter((item) => typeof item === 'string') : [];
 }
+// Mesmo critério usado por banUser e deleteMyAccount para decidir quais eventos
+// de um usuário ainda merecem aviso/cancelamento: sem status (legado) ou 'active'.
+// Eventos 'completed'/'awaiting_review'/'cancelled' ficam de fora (ver §10/§9).
+function isEventStillActive(status) {
+    return !status || status === 'active';
+}
 async function notifyCancelledEvents(events) {
     const deliveries = events.flatMap(({ eventId, event }) => {
         const creatorId = typeof event.createdBy === 'string' ? event.createdBy : '';
@@ -1772,10 +1778,13 @@ function recommendationEventFrom(eventDocument) {
         attendees: stringIds(event.attendees),
     };
 }
-// Uma execução diária e limitada. O trabalho é proporcional aos aparelhos com
-// push ativo, não ao total histórico de usuários, eventos ou notificações.
+// Duas execuções diárias (Brasil, fuso único) em vez de uma: pegam eventos
+// criados ao longo do dia sem aumentar notificação por pessoa — o cooldown de
+// 3 dias abaixo (recommendations.ts) já bloqueia uma 2ª notificação no mesmo
+// dia se a 1ª execução já tiver notificado. O trabalho continua proporcional
+// aos aparelhos com push ativo, não ao histórico de usuários/eventos.
 exports.dailyEventRecommendations = dailyFunction.pubsub
-    .schedule('0 9 * * *')
+    .schedule('0 7,13 * * *')
     .timeZone('America/Sao_Paulo')
     .onRun(async () => {
     const today = dateInSaoPaulo();
@@ -1935,12 +1944,18 @@ async function openCheckInReviewWindow(eventRef, now) {
         };
     });
 }
-async function processCompletedEventForSchedule(eventId, eventRef, completionDeliveries) {
+async function processCompletedEventForSchedule(eventId, eventRef, completionDeliveries, legacySettlementSummaries) {
     const result = await completeEventTransaction(eventRef);
     if (result.alreadyCompleted)
         return false;
     if (result.reputationApplied) {
         completionDeliveries.push(...completedEventDeliveries(eventId, result));
+    }
+    else {
+        // Evento anterior à fronteira de migração (eventLifecycle.ts): sem
+        // reputação recalculada, mas ainda avisa quem participou — mesmo
+        // fallback que closeExpiredEventsDaily e settleMyExpiredEvents já usam.
+        legacySettlementSummaries.push(...historySettlementSummariesFor(result));
     }
     return true;
 }
@@ -1969,6 +1984,7 @@ exports.processEventCheckInReviews = dailyFunction.pubsub
     ]);
     const reviewDeliveries = [];
     const completionDeliveries = [];
+    const legacySettlementSummaries = [];
     let reviewsOpened = 0;
     let completed = 0;
     for (const eventDocument of endedActiveEvents.docs) {
@@ -1989,7 +2005,7 @@ exports.processEventCheckInReviews = dailyFunction.pubsub
                 });
                 continue;
             }
-            if (await processCompletedEventForSchedule(eventDocument.id, eventDocument.ref, completionDeliveries)) {
+            if (await processCompletedEventForSchedule(eventDocument.id, eventDocument.ref, completionDeliveries, legacySettlementSummaries)) {
                 completed += 1;
             }
         }
@@ -2002,7 +2018,7 @@ exports.processEventCheckInReviews = dailyFunction.pubsub
     }
     for (const eventDocument of expiredReviewWindows.docs) {
         try {
-            if (await processCompletedEventForSchedule(eventDocument.id, eventDocument.ref, completionDeliveries)) {
+            if (await processCompletedEventForSchedule(eventDocument.id, eventDocument.ref, completionDeliveries, legacySettlementSummaries)) {
                 completed += 1;
             }
         }
@@ -2013,6 +2029,8 @@ exports.processEventCheckInReviews = dailyFunction.pubsub
             });
         }
     }
+    // Duas entregas independentes em try/catch separados: uma falhar não pode
+    // impedir a outra de rodar (elas não dependem uma da outra).
     try {
         await deliverEventNotifications([...reviewDeliveries, ...completionDeliveries]);
     }
@@ -2020,6 +2038,14 @@ exports.processEventCheckInReviews = dailyFunction.pubsub
         console.error('[CheckInReviewSchedule] notification_delivery_failed', {
             reviewCount: reviewDeliveries.length,
             completionCount: completionDeliveries.length,
+        });
+    }
+    try {
+        await deliverHistorySettlementSummaries(legacySettlementSummaries, dateInSaoPaulo());
+    }
+    catch (_b) {
+        console.error('[CheckInReviewSchedule] legacy_settlement_delivery_failed', {
+            legacySettlementCount: legacySettlementSummaries.length,
         });
     }
     console.info('[CheckInReviewSchedule] run_completed', {
@@ -2068,14 +2094,19 @@ exports.closeExpiredEventsDaily = dailyFunction.pubsub
             console.error('[EventAutoClose] completion_failed', { eventId: eventDocument.id });
         }
     }
+    // Duas entregas independentes em try/catch separados: uma falhar não pode
+    // impedir a outra de rodar (elas não dependem uma da outra).
     try {
         await deliverEventNotifications(completionDeliveries);
-        await deliverHistorySettlementSummaries(legacySettlementSummaries, dateInSaoPaulo());
     }
     catch (_b) {
-        console.error('[EventAutoClose] notification_delivery_failed', {
-            recipientCount: completionDeliveries.length + legacySettlementSummaries.length,
-        });
+        console.error('[EventAutoClose] notification_delivery_failed', { recipientCount: completionDeliveries.length });
+    }
+    try {
+        await deliverHistorySettlementSummaries(legacySettlementSummaries, dateInSaoPaulo());
+    }
+    catch (_c) {
+        console.error('[EventAutoClose] legacy_settlement_delivery_failed', { recipientCount: legacySettlementSummaries.length });
     }
     const canRunMaintenance = activeCandidates.size < 50;
     const cleaned = canRunMaintenance ? await cleanUpOldEventHistory() : 0;
@@ -2148,7 +2179,11 @@ exports.removeReportedEvent = smallFunction.https.onCall(async (data, context) =
         if (!eventSnap.exists)
             return { removed: false, cancelledEvent: null };
         const event = eventSnap.data();
-        if (event.status === 'cancelled')
+        // Só remove evento ainda ativo (mesma regra de banUser): um evento já
+        // concluído já processou reputação e não deve ser reescrito, e um
+        // evento em revisão de check-in ficaria órfão da rotina de 5 min, que
+        // só varre status 'active'/'awaiting_review'.
+        if (event.status && event.status !== 'active')
             return { removed: false, cancelledEvent: null };
         transaction.update(eventRef, { status: 'cancelled', moderationRemoved: true });
         return { removed: true, cancelledEvent: { eventId, event } };
@@ -2165,7 +2200,11 @@ exports.removeReportedEvent = smallFunction.https.onCall(async (data, context) =
     console.info('[Moderation] reported_event_removed', { removed: result.removed });
     return { ok: true, removed: result.removed };
 });
-exports.banUser = smallFunction.https.onCall(async (data, context) => {
+// Faz tantas operações em cascata (cancela eventos, notifica participantes e
+// denunciantes, revoga Auth, limpa 8+ coleções) quanto deleteMyAccount — por
+// isso usa o mesmo runWith de timeout maior (accountFunction), não o padrão
+// curto de smallFunction.
+exports.banUser = accountFunction.https.onCall(async (data, context) => {
     var _a;
     const moderatorId = await requireStaff(context);
     const targetUserId = (0, validation_1.requireDocumentIdField)(data, 'targetUserId', 128);
@@ -2192,10 +2231,7 @@ exports.banUser = smallFunction.https.onCall(async (data, context) => {
     // A conta continua marcada como banida para impedir nova sessão; as demais
     // relações do usuário saem do app por consultas limitadas e sob demanda.
     const createdEvents = await db.collection('meetings').where('createdBy', '==', targetUserId).limit(200).get();
-    const eventsToCancel = createdEvents.docs.filter((eventDocument) => {
-        const status = eventDocument.data().status;
-        return !status || status === 'active';
-    });
+    const eventsToCancel = createdEvents.docs.filter((eventDocument) => isEventStillActive(eventDocument.data().status));
     if (eventsToCancel.length > 0) {
         const batch = db.batch();
         eventsToCancel.forEach((eventDocument) => batch.update(eventDocument.ref, { status: 'cancelled', moderationRemoved: true }));
@@ -2251,6 +2287,34 @@ exports.deleteMyAccount = accountFunction.https.onCall(async (_data, context) =>
         ? userSnapshot.data().searchName
         : null;
     console.info('[AccountDeletion] started');
+    // Os eventos deste usuário serão apagados de vez (não só cancelados), então
+    // o aviso aos participantes só pode ser enviado agora, com os dados ainda
+    // disponíveis — mesmo texto/idempotência de notifyCancelledEvents (banUser
+    // usa a mesma função quando cancela, em vez de apagar, os eventos do alvo).
+    // Pagina em blocos de 200: a exclusão logo abaixo (processQueryInBatches) não
+    // tem teto, então o aviso também não pode ter, senão quem criou mais de 200
+    // eventos teria os excedentes apagados sem ninguém ser notificado.
+    let createdEventsCursor;
+    while (true) {
+        let createdEventsQuery = db.collection('meetings').where('createdBy', '==', uid).orderBy('__name__').limit(200);
+        if (createdEventsCursor)
+            createdEventsQuery = createdEventsQuery.startAfter(createdEventsCursor);
+        const createdEventsSnapshot = await createdEventsQuery.get();
+        if (createdEventsSnapshot.empty)
+            break;
+        const eventsToNotify = createdEventsSnapshot.docs.filter((eventDocument) => isEventStillActive(eventDocument.data().status));
+        if (eventsToNotify.length > 0) {
+            try {
+                await notifyCancelledEvents(eventsToNotify.map((eventDocument) => ({ eventId: eventDocument.id, event: eventDocument.data() })));
+            }
+            catch (_c) {
+                console.error('[AccountDeletion] attendee_notification_failed', { eventCount: eventsToNotify.length });
+            }
+        }
+        if (createdEventsSnapshot.size < 200)
+            break;
+        createdEventsCursor = createdEventsSnapshot.docs[createdEventsSnapshot.docs.length - 1];
+    }
     // Cada atualização remove o documento do resultado da própria consulta. Isso evita
     // paginação frágil e mantém cada lote bem abaixo do limite de 500 operações.
     await processQueryInBatches(db.collection('meetings').where('createdBy', '==', uid), (batch, document) => batch.delete(document.ref));

@@ -329,24 +329,34 @@ export default function HomeScreen() {
     const eventIsInProgress = discovery.reasons.includes('in_progress');
     const discoveryReason = eventIsInProgress ? null : discovery.primaryReason;
     const isNearbyCard = typeof distance === 'number';
+    // "Perto de você" já é dito pelo ícone + distância acima; repetir como selo
+    // é redundante. Nos cards de proximidade, o selo mostra quando o evento
+    // acontece (mesmo vocabulário/selo de "Seus Próximos Eventos" e da Agenda).
+    const journeyState = isNearbyCard && !eventIsInProgress ? getEventJourneyState(item, eventClock) : null;
+    const { day, month } = formatEventDate(item.date);
     return (
       <TouchableOpacity style={[styles.eventCard, eventIsInProgress && styles.eventCardInProgress]} onPress={() => router.push(`/event/${item.id}` as never)}>
         <View style={styles.eventHeader}>
           <FontAwesome name={isNearbyCard ? 'map-marker' : 'calendar'} size={14} color={eventIsInProgress ? '#059669' : isNearbyCard ? '#ec4899' : '#6366f1'} />
           <Text style={[styles.eventDate, isNearbyCard && styles.nearbyEventDate, eventIsInProgress && styles.eventDateInProgress]}>
-            {isNearbyCard ? `A ${distance.toFixed(1)} km daqui` : item.date || 'Data a definir'}
+            {isNearbyCard ? `A ${distance.toFixed(1)} km daqui` : item.date ? `${day} ${month}` : 'Data a definir'}
           </Text>
         </View>
         <View style={styles.eventTitleRow}>
           <Text style={styles.eventTitle} numberOfLines={1}>{item.title}</Text>
-          {eventIsInProgress && <View style={styles.inProgressBadge}><Text style={styles.inProgressBadgeText} numberOfLines={1}>EM ANDAMENTO</Text></View>}
-          {discoveryReason && (
+          {eventIsInProgress ? (
+            <View style={styles.inProgressBadge}><Text style={styles.inProgressBadgeText} numberOfLines={1}>EM ANDAMENTO</Text></View>
+          ) : isNearbyCard ? (
+            journeyState && (
+              <View style={styles.journeyBadge}><Text style={styles.journeyBadgeText} numberOfLines={1}>{journeyState.compactLabel}</Text></View>
+            )
+          ) : discoveryReason ? (
             <View style={[styles.discoveryTag, { backgroundColor: DISCOVERY_REASON_COLORS[discoveryReason].background }]}>
               <Text style={[styles.discoveryTagText, { color: DISCOVERY_REASON_COLORS[discoveryReason].text }]}>
                 {DISCOVERY_REASON_LABELS[discoveryReason]}
               </Text>
             </View>
-          )}
+          ) : null}
         </View>
         <Text style={styles.eventLoc} numberOfLines={1}>{item.locationName || 'Local a definir'}</Text>
       </TouchableOpacity>

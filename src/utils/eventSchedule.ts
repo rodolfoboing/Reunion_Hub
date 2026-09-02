@@ -13,7 +13,7 @@ export const CHECK_IN_REVIEW_WINDOW_MS = 2 * 60 * 60 * 1000;
 
 export type EventDurationIssue = 'invalid' | 'too-short' | 'too-long' | null;
 
-export type EventJourneyPhase = 'cancelled' | 'completed' | 'awaiting_processing' | 'in_progress' | 'starting_soon' | 'upcoming';
+export type EventJourneyPhase = 'cancelled' | 'completed' | 'awaiting_processing' | 'in_progress' | 'starting_soon' | 'today' | 'upcoming';
 export type EventJourneyTone = 'neutral' | 'info' | 'success' | 'warning' | 'danger';
 
 export type EventJourneyState = {
@@ -262,6 +262,20 @@ export function getEventJourneyState(
             message: options.isAttending || options.isCreator
                 ? `Confira ${event.time ? `o horário (${event.time}) e ` : ''}o local ou link. O check-in será liberado no início.`
                 : 'As confirmações de presença ficam disponíveis somente até o horário de início.',
+            tone: 'info',
+        };
+    }
+
+    // Mesmo dia, mas ainda fora da janela de "começa em breve" (2h): "AGENDADO"
+    // não comunica isso — sem essa distinção, um evento daqui a 3 dias e um
+    // evento hoje à noite mostravam o mesmo selo (Início, Agenda e o card do evento
+    // usam esta mesma função, então a correção vale para os três de uma vez).
+    if (isEventToday(event, now)) {
+        return {
+            phase: 'today', label: 'HOJE', compactLabel: 'HOJE', title: options.isAttending || options.isCreator ? 'Você tem evento hoje' : 'Evento acontece hoje',
+            message: options.isAttending || options.isCreator
+                ? `O check-in ficará disponível no período: ${formatEventTimeRange(event)}.`
+                : 'Confirme presença antes do início para participar.',
             tone: 'info',
         };
     }

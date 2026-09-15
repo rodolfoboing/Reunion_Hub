@@ -17,7 +17,7 @@ import { useEventClock } from '../../../src/hooks/useEventClock';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { ManualModal } from '../../../src/components/ManualModal';
 import { normalizeInterests } from '../../../src/constants/Interests';
-import { DISCOVERY_REASON_LABELS, DiscoveryReason, getEventDiscovery, isMeetingNearby } from '../../../src/utils/eventDiscovery';
+import { DISCOVERY_REASON_BADGE_LABELS, DiscoveryReason, getDiscoveryBadgeReason, getEventDiscovery, isMeetingNearby, isNewMeeting, shouldSuggestEvent } from '../../../src/utils/eventDiscovery';
 
 import { getDistanceFromLatLonInKm } from '../../../src/utils/distance';
 
@@ -46,8 +46,8 @@ const formatEventDate = (dateString: string | undefined) => {
         month: MONTH_NAMES[monthIndex] || '---'
       };
     }
-  } catch (e) {
-    console.warn('[Index] Erro ao analisar data:', dateString, e);
+  } catch {
+    // Sem log: roda no caminho de render de cada card e já tem fallback seguro.
   }
 
   return { day: '--', month: '---' };
@@ -277,13 +277,11 @@ export default function HomeScreen() {
 
         // Uma única lista de descoberta: primeiro correspondências de interesse e,
         // se o usuário permitiu, populares fora das tags. O rótulo deixa clara a origem.
-        const highlightsForProfile = upcomingHighlights.filter((meeting) => {
-          const discovery = getEventDiscovery(meeting, { userCoordinates, userInterests });
-          const matchesInterests = discovery.reasons.includes('interest');
-          const isPopular = discovery.reasons.includes('popular');
-          return discovery.isRecommended
-            && (matchesInterests || (isPopular && userProfile?.showPopularOutsideInterests === true));
-        });
+        // A regra vem de shouldSuggestEvent — a mesma usada pela Agenda e pelo Explorar.
+        const highlightsForProfile = upcomingHighlights.filter((meeting) => shouldSuggestEvent(
+          getEventDiscovery(meeting, { userCoordinates, userInterests }),
+          userProfile?.showPopularOutsideInterests !== false,
+        ));
 
         const sortedHighlights = [...highlightsForProfile].sort((a, b) => {
           const matchA = getEventDiscovery(a, { userCoordinates, userInterests }).reasons.includes('interest') ? 1 : 0;
@@ -327,36 +325,61 @@ export default function HomeScreen() {
       now: eventClock,
     });
     const eventIsInProgress = discovery.reasons.includes('in_progress');
-    const discoveryReason = eventIsInProgress ? null : discovery.primaryReason;
     const isNearbyCard = typeof distance === 'number';
-    // "Perto de você" já é dito pelo ícone + distância acima; repetir como selo
-    // é redundante. Nos cards de proximidade, o selo mostra quando o evento
-    // acontece (mesmo vocabulário/selo de "Seus Próximos Eventos" e da Agenda).
-    const journeyState = isNearbyCard && !eventIsInProgress ? getEventJourneyState(item, eventClock) : null;
+    // Cada seção já declara por que o evento está ali: "Eventos do seu interesse"
+    // diz `interest`/`history`, "Eventos perto de você" diz `nearby`. Repetir isso
+    // no selo não informava nada e ocupava o espaço do estado temporal — o card
+    // dizia "Seu interesse" em vez de "HOJE".
+    const impliedReasons: DiscoveryReason[] = isNearbyCard ? ['nearby'] : ['interest', 'history'];
+    const badgeReason = getDiscoveryBadgeReason(discovery, impliedReasons);
+    // O selo temporal agora vale para as duas seções, com o mesmo vocabulário de
+    // "Seus Próximos Eventos" e da Agenda.
+    const journeyState = eventIsInProgress ? null : getEventJourneyState(item, eventClock);
     const { day, month } = formatEventDate(item.date);
     return (
       <TouchableOpacity style={[styles.eventCard, eventIsInProgress && styles.eventCardInProgress]} onPress={() => router.push(`/event/${item.id}` as never)}>
+        {/* Linha 1 = contexto (quando/onde) + POR QUE. Linha 2 = título + QUANDO.
+            Um eixo por linha: no card de 220px os dois selos juntos não cabiam. */}
         <View style={styles.eventHeader}>
-          <FontAwesome name={isNearbyCard ? 'map-marker' : 'calendar'} size={14} color={eventIsInProgress ? '#059669' : isNearbyCard ? '#ec4899' : '#6366f1'} />
-          <Text style={[styles.eventDate, isNearbyCard && styles.nearbyEventDate, eventIsInProgress && styles.eventDateInProgress]}>
-            {isNearbyCard ? `A ${distance.toFixed(1)} km daqui` : item.date ? `${day} ${month}` : 'Data a definir'}
+          {/* O ícone indica o TIPO do evento, não a seção. Antes era calendário ou
+              alfinete conforme a lista em que o card estava, então um evento online
+              aparecia com ícone de calendário e nada dizia que era online — só
+              abrindo o evento dava para saber. */}
+          <FontAwesome
+            name={item.type === 'online' ? 'video-camera' : 'map-marker'}
+            size={14}
+            color={eventIsInProgress ? '#059669' : isNearbyCard ? '#ec4899' : '#6366f1'}
+          />
+          <Text style={[styles.eventDate, isNearbyCard && styles.nearbyEventDate, eventIsInProgress && styles.eventDateInProgress]} numberOfLines={1}>
+            {item.date ? `${day} ${month}` : 'Data a definir'}
           </Text>
+          {badgeReason && (
+            <View style={[styles.discoveryTag, { backgroundColor: DISCOVERY_REASON_COLORS[badgeReason].background }]}>
+              <Text style={[styles.discoveryTagText, { color: DISCOVERY_REASON_COLORS[badgeReason].text }]} numberOfLines={1}>
+                {DISCOVERY_REASON_BADGE_LABELS[badgeReason]}
+              </Text>
+            </View>
+          )}
         </View>
         <View style={styles.eventTitleRow}>
           <Text style={styles.eventTitle} numberOfLines={1}>{item.title}</Text>
           {eventIsInProgress ? (
             <View style={styles.inProgressBadge}><Text style={styles.inProgressBadgeText} numberOfLines={1}>EM ANDAMENTO</Text></View>
-          ) : isNearbyCard ? (
-            journeyState && (
-              <View style={styles.journeyBadge}><Text style={styles.journeyBadgeText} numberOfLines={1}>{journeyState.compactLabel}</Text></View>
-            )
-          ) : discoveryReason ? (
-            <View style={[styles.discoveryTag, { backgroundColor: DISCOVERY_REASON_COLORS[discoveryReason].background }]}>
-              <Text style={[styles.discoveryTagText, { color: DISCOVERY_REASON_COLORS[discoveryReason].text }]}>
-                {DISCOVERY_REASON_LABELS[discoveryReason]}
-              </Text>
-            </View>
+          ) : journeyState ? (
+            <View style={styles.journeyBadge}><Text style={styles.journeyBadgeText} numberOfLines={1}>{journeyState.compactLabel}</Text></View>
           ) : null}
+        </View>
+        {/* A distância saiu do cabeçalho para cá: lá ela ocupava o lugar da data,
+            e o card da seção "perto de você" nunca dizia QUANDO o evento era. */}
+        <View style={styles.eventMetaRow}>
+          <FontAwesome name="users" size={11} color="#6b7280" />
+          <Text style={styles.eventMetaText}>{item.attendees?.length || 0}</Text>
+          {isNearbyCard && (
+            <Text style={styles.eventMetaText}>{`· a ${distance.toFixed(1)} km`}</Text>
+          )}
+          {isNewMeeting(item, eventClock) && (
+            <View style={styles.newBadge}><Text style={styles.newBadgeText}>NOVO</Text></View>
+          )}
         </View>
         <Text style={styles.eventLoc} numberOfLines={1}>{item.locationName || 'Local a definir'}</Text>
       </TouchableOpacity>
@@ -445,6 +468,68 @@ export default function HomeScreen() {
       ) : (
         <>
           <View style={styles.section}>
+            <Text style={styles.sectionTitle}>Seus Próximos Eventos</Text>
+            {visibleMyEvents.length === 0 ? (
+              <View style={styles.emptyStateContainer}>
+                <Text style={styles.emptyText}>Você ainda não confirmou presença em nenhum evento.</Text>
+              </View>
+            ) : (
+              /* Rolagem horizontal como as outras duas seções: empilhada, com
+                 muitos compromissos ela crescia sem limite e empurrava
+                 "Eventos do seu interesse" e "perto de você" para fora da tela.
+                 A caixa de data continua, porque é o sinal visual que diferencia
+                 compromisso seu de sugestão — só passou a ficar no topo do card. */
+              <FlatList
+                horizontal
+                data={visibleMyEvents}
+                keyExtractor={event => event.id}
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.horizontalList}
+                renderItem={({ item: event }) => {
+                  const { day, month } = formatEventDate(event.date);
+                  const eventIsToday = isEventToday(event, eventClock);
+                  const eventIsInProgress = isEventInProgress(event, eventClock);
+                  const eventJourney = getEventJourneyState(event, eventClock, {
+                    isAttending: Boolean(currentUid && event.attendees?.includes(currentUid)),
+                    isCreator: event.createdBy === currentUid,
+                    hasCheckedIn: Boolean(currentUid && event.checkedIn?.includes(currentUid)),
+                    hasPendingCheckIn: Boolean(currentUid && event.pendingCheckIns?.some(({ userId }) => userId === currentUid)),
+                  });
+                  return (
+                    <TouchableOpacity
+                      style={[styles.upcomingCard, eventIsToday && styles.listCardToday, eventIsInProgress && styles.listCardInProgress]}
+                      onPress={() => router.push(`/event/${event.id}` as any)}
+                    >
+                      <View style={styles.upcomingHeader}>
+                        <View style={[styles.dateBox, styles.dateBoxStacked, eventIsToday && styles.dateBoxToday, eventIsInProgress && styles.dateBoxInProgress]}>
+                          <Text style={styles.dateDay}>{day}</Text>
+                          <Text style={styles.dateMonth}>{month}</Text>
+                        </View>
+                        {eventIsInProgress ? (
+                          <View style={styles.inProgressBadge}><Text style={styles.inProgressBadgeText} numberOfLines={1}>EM ANDAMENTO</Text></View>
+                        ) : (
+                          <View style={styles.journeyBadge}><Text style={styles.journeyBadgeText} numberOfLines={1}>{eventJourney.compactLabel}</Text></View>
+                        )}
+                      </View>
+                      <Text style={styles.listTitle} numberOfLines={2}>{event.title}</Text>
+                      {/* Confirmados na MESMA linha do horário: uma linha própria
+                          devolveria ao card a altura que acabamos de tirar dele. */}
+                      <View style={styles.upcomingTimeRow}>
+                        <Text style={[styles.listTime, styles.upcomingTimeText]} numberOfLines={1}>{formatEventTimeRange(event)}</Text>
+                        <View style={styles.upcomingAttendees}>
+                          <FontAwesome name="users" size={11} color="#6b7280" />
+                          <Text style={styles.eventMetaText}>{event.attendees?.length || 0}</Text>
+                        </View>
+                      </View>
+                      <Text style={styles.listTime} numberOfLines={1}>{event.locationName || 'Local a definir'}</Text>
+                    </TouchableOpacity>
+                  );
+                }}
+              />
+            )}
+          </View>
+
+          <View style={styles.section}>
             <View style={styles.sectionHeader}>
               <Text style={styles.sectionTitle}>Eventos do seu interesse</Text>
             </View>
@@ -470,43 +555,6 @@ export default function HomeScreen() {
                 </Text>
               }
             />
-          </View>
-
-          <View style={styles.section}>
-            <Text style={styles.sectionTitle}>Seus Próximos Eventos</Text>
-            {visibleMyEvents.length === 0 ? (
-              <View style={styles.emptyStateContainer}>
-                <Text style={styles.emptyText}>Você ainda não confirmou presença em nenhum evento.</Text>
-              </View>
-            ) : (
-              visibleMyEvents.map(event => {
-                const { day, month } = formatEventDate(event.date);
-                const eventIsToday = isEventToday(event, eventClock);
-                const eventIsInProgress = isEventInProgress(event, eventClock);
-                const eventJourney = getEventJourneyState(event, eventClock, {
-                  isAttending: Boolean(currentUid && event.attendees?.includes(currentUid)),
-                  isCreator: event.createdBy === currentUid,
-                  hasCheckedIn: Boolean(currentUid && event.checkedIn?.includes(currentUid)),
-                  hasPendingCheckIn: Boolean(currentUid && event.pendingCheckIns?.some(({ userId }) => userId === currentUid)),
-                });
-                return (
-                  <TouchableOpacity key={event.id} style={[styles.listCard, eventIsToday && styles.listCardToday, eventIsInProgress && styles.listCardInProgress]} onPress={() => router.push(`/event/${event.id}` as any)}>
-                    <View style={[styles.dateBox, eventIsToday && styles.dateBoxToday, eventIsInProgress && styles.dateBoxInProgress]}>
-                      <Text style={styles.dateDay}>{day}</Text>
-                      <Text style={styles.dateMonth}>{month}</Text>
-                    </View>
-                    <View style={styles.listContent}>
-                      <View style={styles.listTitleRow}>
-                        <Text style={styles.listTitle}>{event.title}</Text>
-                        {eventIsInProgress && <View style={styles.inProgressBadge}><Text style={styles.inProgressBadgeText} numberOfLines={1}>EM ANDAMENTO</Text></View>}
-                        {!eventIsInProgress && <View style={styles.journeyBadge}><Text style={styles.journeyBadgeText} numberOfLines={1}>{eventJourney.compactLabel}</Text></View>}
-                      </View>
-                      <Text style={styles.listTime}>{formatEventTimeRange(event)} • {event.locationName || 'Local a definir'}</Text>
-                    </View>
-                  </TouchableOpacity>
-                );
-              })
-            )}
           </View>
 
           <View style={styles.section}>
@@ -668,14 +716,18 @@ const styles = StyleSheet.create({
   },
   eventCardInProgress: { borderWidth: 1, borderColor: '#34D399', backgroundColor: '#ECFDF5' },
   eventHeader: { flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
-  eventDate: { marginLeft: 6, color: '#6366f1', fontSize: 12, fontWeight: 'bold' },
+  eventDate: { flex: 1, marginLeft: 6, color: '#6366f1', fontSize: 12, fontWeight: 'bold' },
   nearbyEventDate: { color: '#ec4899' },
   eventDateInProgress: { color: '#047857' },
   eventTitle: { flex: 1, fontSize: 16, fontWeight: 'bold', color: '#1f2937', marginBottom: 4 },
   eventTitleRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  discoveryTag: { borderRadius: 7, paddingHorizontal: 6, paddingVertical: 2, backgroundColor: '#EEF2FF' },
+  discoveryTag: { flexShrink: 0, borderRadius: 7, paddingHorizontal: 6, paddingVertical: 2, backgroundColor: '#EEF2FF' },
   discoveryTagText: { color: '#4F46E5', fontSize: 9, fontWeight: '800' },
   eventLoc: { fontSize: 12, color: '#6b7280' },
+  eventMetaRow: { flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 6, marginBottom: 2 },
+  eventMetaText: { fontSize: 11, color: '#6b7280', fontWeight: '600' },
+  newBadge: { backgroundColor: '#FEF3C7', paddingHorizontal: 6, paddingVertical: 1, borderRadius: 5, marginLeft: 2 },
+  newBadgeText: { fontSize: 9, fontWeight: '800', color: '#B45309', letterSpacing: 0.5 },
   journeyBadge: { flexShrink: 0, borderRadius: 7, paddingHorizontal: 7, paddingVertical: 3, backgroundColor: '#EEF2FF' },
   journeyBadgeText: { color: '#4338CA', fontSize: 9, lineHeight: 12, fontWeight: '900' },
 
@@ -693,24 +745,43 @@ const styles = StyleSheet.create({
     elevation: 2,
   },
 
-  listCard: {
-    flexDirection: 'row', backgroundColor: '#fff', borderRadius: 12, padding: 16, marginBottom: 12,
-    shadowColor: '#000', shadowOpacity: 0.05, shadowRadius: 2, elevation: 1, alignItems: 'center'
+  // Mesma largura e margem do `eventCard` das outras duas seções, para as três
+  // rolarem no mesmo ritmo. `minHeight` mantém os cards alinhados quando um
+  // título ocupa duas linhas e o vizinho ocupa uma.
+  // Sem `minHeight`: ele forçava 150px e, com título de uma linha, sobrava espaço
+  // vazio embaixo — o que dava o aspecto estufado. O card agora acompanha o
+  // conteúdo, como já faziam os das outras duas seções.
+  upcomingCard: {
+    width: 220, backgroundColor: '#fff', borderRadius: 16, padding: 13, marginRight: 16,
+    shadowColor: '#000', shadowOpacity: 0.05, shadowRadius: 8, elevation: 3, marginBottom: 10,
   },
+  upcomingHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 8 },
+  upcomingTimeRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  // `flexShrink` no horário: quando a faixa é longa, ela encolhe e trunca em vez
+  // de empurrar a contagem para fora dos 220px do card.
+  upcomingTimeText: { flexShrink: 1 },
+  upcomingAttendees: { flexDirection: 'row', alignItems: 'center', gap: 3, flexShrink: 0 },
+  // A caixa de data deixa de ter margem à direita: no card vertical ela divide a
+  // linha com o selo de estado, não precede um bloco de texto ao lado.
+  dateBoxStacked: { marginRight: 0 },
+  // `listCard`, `listContent` e `listTitleRow` saíram junto com a lista vertical
+  // que a seção usava; estes dois continuam, aplicados ao card horizontal.
   listCardToday: { borderWidth: 1, borderColor: '#FBBF24', backgroundColor: '#FFFBEB' },
   listCardInProgress: { borderColor: '#34D399', backgroundColor: '#ECFDF5' },
+  // Caixa de data compacta: ela sozinha ocupava ~48px de altura (10 de padding
+  // em cima e embaixo mais duas linhas grandes), e era a maior parte do excesso.
   dateBox: {
-    backgroundColor: '#f3f4f6', borderRadius: 8, padding: 10, alignItems: 'center', justifyContent: 'center',
-    marginRight: 16, minWidth: 55
+    backgroundColor: '#f3f4f6', borderRadius: 8, paddingVertical: 5, paddingHorizontal: 9,
+    alignItems: 'center', justifyContent: 'center', marginRight: 16, minWidth: 46
   },
   dateBoxToday: { backgroundColor: '#FEF3C7' },
   dateBoxInProgress: { backgroundColor: '#D1FAE5' },
-  dateDay: { fontSize: 18, fontWeight: 'bold', color: '#1f2937' },
-  dateMonth: { fontSize: 10, color: '#6b7280', fontWeight: 'bold', textTransform: 'uppercase' },
-  listContent: { flex: 1 },
-  listTitleRow: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 6 },
-  listTitle: { fontSize: 16, fontWeight: 'bold', color: '#1f2937', marginBottom: 2 },
-  listTime: { fontSize: 12, color: '#6b7280' },
+  dateDay: { fontSize: 16, lineHeight: 19, fontWeight: 'bold', color: '#1f2937' },
+  dateMonth: { fontSize: 9, lineHeight: 12, color: '#6b7280', fontWeight: 'bold', textTransform: 'uppercase' },
+  // lineHeight explícito nas três: sem ele o Android reserva folga extra por
+  // linha, e com quatro linhas empilhadas isso somava vários pixels invisíveis.
+  listTitle: { fontSize: 15, lineHeight: 19, fontWeight: 'bold', color: '#1f2937', marginBottom: 3 },
+  listTime: { fontSize: 12, lineHeight: 16, color: '#6b7280' },
   todayEventBadge: { backgroundColor: '#FEF3C7', borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 },
   todayEventBadgeText: { color: '#B45309', fontSize: 9, fontWeight: '800' },
   inProgressBadge: { flexShrink: 0, backgroundColor: '#059669', borderRadius: 6, paddingHorizontal: 7, paddingVertical: 3 },

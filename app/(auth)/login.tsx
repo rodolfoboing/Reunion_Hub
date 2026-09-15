@@ -37,6 +37,12 @@ export default function LoginScreen() {
             let msg = STRINGS.ERROR_DEFAULT;
             if (code === 'auth/invalid-credential' || code === 'auth/user-not-found' || code === 'auth/wrong-password') {
                 msg = STRINGS.AUTH_ERROR_INVALID_CREDS;
+            } else if (code === 'auth/user-disabled') {
+                // banUser desativa a conta no Auth; sem este caso a pessoa banida
+                // recebia "erro inesperado" e não entendia o que aconteceu.
+                msg = STRINGS.AUTH_ERROR_ACCOUNT_DISABLED;
+            } else if (code === 'auth/too-many-requests') {
+                msg = STRINGS.AUTH_ERROR_TOO_MANY_ATTEMPTS;
             } else if (code === 'auth/network-request-failed') {
                 msg = STRINGS.ERROR_NETWORK;
             }

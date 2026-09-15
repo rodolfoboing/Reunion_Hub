@@ -3,6 +3,7 @@ import { View, Text, StyleSheet, ScrollView, Alert, Image, TouchableOpacity, Tex
 import { router } from 'expo-router';
 import { auth, db } from '../../src/services/firebaseConfig';
 import { doc, updateDoc } from 'firebase/firestore';
+import { createInitialUserProfile, NicknameUnavailableError } from '@/src/services/profileService';
 import { updateProfile } from 'firebase/auth';
 import { storage } from '../../src/services/firebaseConfig';
 import * as ImagePicker from 'expo-image-picker';
@@ -14,6 +15,9 @@ import { INTERESTS_OPTIONS, normalizeInterests } from '../../src/constants/Inter
 import { uploadProfileImage } from '@/src/services/profileService';
 import { getFirebaseErrorCode } from '@/src/utils/authError';
 
+const BIO_MAX_LENGTH = 300;
+const MAX_INTERESTS = 10;
+
 export default function CompleteProfileScreen() {
     const [bio, setBio] = useState('');
     const [selectedInterests, setSelectedInterests] = useState<string[]>([]);
@@ -21,47 +25,83 @@ export default function CompleteProfileScreen() {
     const [loading, setLoading] = useState(false);
 
     const pickImage = async () => {
-        // No permissions request is necessary for launching the image library
-        let result = await ImagePicker.launchImageLibraryAsync({
-            mediaTypes: ['images'],
-            allowsEditing: true,
-            aspect: [1, 1],
-            quality: 0.5,
-        });
+        try {
+            // launchImageLibraryAsync não exige pedido de permissão explícito,
+            // mas ainda pode lançar (galeria bloqueada, picker indisponível).
+            const result = await ImagePicker.launchImageLibraryAsync({
+                mediaTypes: ['images'],
+                allowsEditing: true,
+                aspect: [1, 1],
+                quality: 0.5,
+            });
 
-        if (!result.canceled) {
-            setImage(result.assets[0].uri);
+            if (!result.canceled) {
+                setImage(result.assets[0].uri);
+            }
+        } catch (error) {
+            console.error('[Onboarding] image_pick_failed', { code: getFirebaseErrorCode(error) });
+            Alert.alert('Não foi possível abrir a galeria', 'Verifique a permissão de fotos do app e tente novamente.');
         }
     };
 
     const toggleSelection = (item: string, list: string[], setList: Dispatch<SetStateAction<string[]>>) => {
         if (list.includes(item)) {
             setList(list.filter(i => i !== item));
-        } else {
-            setList([...list, item]);
+            return;
         }
+        if (list.length >= MAX_INTERESTS) {
+            Alert.alert('Limite de interesses', `Escolha até ${MAX_INTERESTS} interesses para manter as recomendações relevantes.`);
+            return;
+        }
+        setList([...list, item]);
     };
 
     const handleSave = async () => {
         const user = auth.currentUser;
         if (!user || loading) return;
+
+        // Interesses alimentam toda a descoberta: sem nenhum, a recomendação diária
+        // nunca seleciona evento e a seção "do seu interesse" fica vazia para sempre.
+        if (selectedInterests.length === 0) {
+            Alert.alert('Escolha seus interesses', 'Selecione ao menos um interesse para recebermos e mostrarmos eventos relevantes para você.');
+            return;
+        }
+
         setLoading(true);
 
         try {
             let uploadedPhotoUrl = user.photoURL || null;
-            
+
             // Se o usuário selecionou uma nova imagem local, fazemos o upload
             if (image && !image.startsWith('http')) {
                 uploadedPhotoUrl = await uploadProfileImage(storage, user.uid, image);
             }
 
             const userRef = doc(db, 'users', user.uid);
-            await updateDoc(userRef, {
+            const completion = {
                 bio,
                 interests: normalizeInterests(selectedInterests),
                 photoURL: uploadedPhotoUrl,
-                isProfileComplete: true
-            });
+                isProfileComplete: true,
+            };
+
+            try {
+                await updateDoc(userRef, completion);
+            } catch (updateError) {
+                if (getFirebaseErrorCode(updateError) !== 'not-found') throw updateError;
+                // Registro interrompido entre criar a conta e gravar o perfil (e cujo
+                // rollback também falhou): o doc não existe e updateDoc trava aqui para
+                // sempre. Recria a base — o nick já foi gravado no displayName antes da
+                // falha — e conclui. setDoc não serviria: as regras exigem o payload
+                // completo de criação mais a reserva do nick.
+                console.warn('[Onboarding] profile_document_missing_recreating');
+                await createInitialUserProfile({
+                    userId: user.uid,
+                    nick: user.displayName || '',
+                    email: user.email || '',
+                });
+                await updateDoc(userRef, completion);
+            }
 
             if (uploadedPhotoUrl) {
                 await updateProfile(user, { photoURL: uploadedPhotoUrl });
@@ -75,9 +115,11 @@ export default function CompleteProfileScreen() {
             console.error('[Onboarding] profile_completion_failed', { code });
             Alert.alert(
                 'Não foi possível concluir',
-                code === 'auth/network-request-failed' || code === 'storage/retry-limit-exceeded'
-                    ? 'Verifique sua conexão e tente novamente.'
-                    : 'Seu perfil ainda não foi concluído. Tente novamente.',
+                error instanceof NicknameUnavailableError
+                    ? 'Não conseguimos recuperar seu cadastro automaticamente. Fale com o suporte pelo Contato e Feedback para liberar seu acesso.'
+                    : code === 'auth/network-request-failed' || code === 'storage/retry-limit-exceeded'
+                        ? 'Verifique sua conexão e tente novamente.'
+                        : 'Seu perfil ainda não foi concluído. Tente novamente.',
             );
         } finally {
             setLoading(false);
@@ -116,11 +158,15 @@ export default function CompleteProfileScreen() {
                     numberOfLines={4}
                     value={bio}
                     onChangeText={setBio}
+                    maxLength={BIO_MAX_LENGTH}
                 />
             </View>
 
             <View style={styles.section}>
                 <Text style={styles.label}>Interesses</Text>
+                <Text style={styles.helperText}>
+                    Escolha de 1 a {MAX_INTERESTS}. É por aqui que encontramos eventos para recomendar a você.
+                </Text>
                 <View style={styles.chipsContainer}>
                     {INTERESTS_OPTIONS.map(item => (
                         <TouchableOpacity
@@ -163,6 +209,7 @@ const styles = StyleSheet.create({
     subtitle: { fontSize: 16, color: '#6b7280', textAlign: 'center' },
     section: { marginBottom: 24 },
     label: { fontSize: 16, fontWeight: '600', color: '#374151', marginBottom: 12 },
+    helperText: { fontSize: 13, color: '#6b7280', lineHeight: 18, marginTop: -6, marginBottom: 12 },
     imagePicker: { alignSelf: 'center', marginBottom: 8 },
     profileImage: { width: 120, height: 120, borderRadius: 60 },
     placeholderImage: {

@@ -12,6 +12,7 @@ import {
 import { useEffect, useState } from 'react';
 import { collection, doc, getDoc, limit, query, where, getDocs } from 'firebase/firestore';
 import { db, auth, functions } from '../../src/services/firebaseConfig';
+import { onAuthStateChanged } from 'firebase/auth';
 import { httpsCallable } from 'firebase/functions';
 import { FontAwesome } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -22,6 +23,7 @@ import { Place, User } from '@/src/types';
 import { CONFIG } from '@/src/constants/Config';
 import { toUserProfile } from '@/src/utils/userProfile';
 import { ReportReasonModal } from '@/src/components/ReportReasonModal';
+import { ManualModal } from '@/src/components/ManualModal';
 import { submitReport } from '@/src/services/reportService';
 
 function publicProfileLog(event: string, context: Record<string, boolean | number> = {}) {
@@ -36,8 +38,16 @@ export default function UserProfileScreen() {
     const [loading, setLoading] = useState(true);
     const [startingConversation, setStartingConversation] = useState(false);
     const [showReportReasonModal, setShowReportReasonModal] = useState(false);
+    const [showManualModal, setShowManualModal] = useState(false);
+    // `auth.currentUser` é null enquanto a sessão rehidrata (abertura fria por
+    // link direto). Lido só no render ele não é reativo: `isOwnProfile` ficava
+    // falso no próprio perfil, escondendo os próprios lugares frequentados, e o
+    // efeito de carga nunca reexecutava quando a sessão chegava.
+    const [currentUserId, setCurrentUserId] = useState<string | null>(auth.currentUser?.uid ?? null);
 
-    const isOwnProfile = auth.currentUser?.uid === profileId;
+    useEffect(() => onAuthStateChanged(auth, (user) => setCurrentUserId(user?.uid ?? null)), []);
+
+    const isOwnProfile = Boolean(currentUserId) && currentUserId === profileId;
     const joinedYear = profile?.createdAt ? new Date(profile.createdAt).getFullYear() : undefined;
 
     useEffect(() => {
@@ -175,6 +185,16 @@ export default function UserProfileScreen() {
         );
     }
 
+    // O Auth guarda o nick como displayName, então os dois campos quase sempre
+    // trazem o mesmo texto e o cabeçalho mostrava o mesmo nome duas vezes.
+    // O nick é a identidade pública: ele fica sempre; o nome só aparece quando
+    // realmente difere (contas antigas, criadas antes do nick).
+    const nickHandle = profile.nick ? `@${profile.nick}` : null;
+    const distinctDisplayName = profile.displayName
+        && profile.displayName.trim().toLowerCase() !== (profile.nick ?? '').trim().toLowerCase()
+        ? profile.displayName
+        : null;
+
     return (
         <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
             <Stack.Screen options={{ headerShown: false }} />
@@ -205,19 +225,19 @@ export default function UserProfileScreen() {
                     ) : (
                         <View style={styles.avatarPlaceholder}>
                             <Text style={styles.avatarText}>
-                                {profile.displayName?.charAt(0).toUpperCase() || 'U'}
+                                {(profile.nick || profile.displayName)?.charAt(0).toUpperCase() || 'U'}
                             </Text>
                         </View>
                     )}
                 </View>
 
-                {/* Nome e Nick */}
-                <View style={{flexDirection: 'row', alignItems: 'center', justifyContent: 'center'}}>
-                    <Text style={styles.displayName}>{profile.displayName}</Text>
-                </View>
-                {profile.nick && (
-                    <Text style={styles.nick}>@{profile.nick}</Text>
+                {/* Identidade pública */}
+                {distinctDisplayName && (
+                    <Text style={styles.displayName}>{distinctDisplayName}</Text>
                 )}
+                <Text style={distinctDisplayName ? styles.nick : styles.displayName}>
+                    {nickHandle ?? profile.displayName ?? 'Usuário'}
+                </Text>
                 {joinedYear && Number.isFinite(joinedYear) && (
                     <Text style={{color: '#E0E7FF', fontSize: 12, marginTop: 4}}>
                         No app desde {joinedYear}
@@ -228,11 +248,21 @@ export default function UserProfileScreen() {
             <ScrollView style={styles.content} showsVerticalScrollIndicator={false}>
                 {/* Estatísticas */}
                 <View style={styles.statsCard}>
-                    <View style={styles.statItem}>
+                    {/* Mesmo atalho do próprio perfil: o número sozinho não diz nada
+                        a quem está avaliando se vai a um evento dessa pessoa. */}
+                    <TouchableOpacity
+                        style={styles.statItem}
+                        onPress={() => setShowManualModal(true)}
+                        accessibilityRole="button"
+                        accessibilityLabel="Entenda como funciona a reputação"
+                    >
                         <FontAwesome name="star" size={24} color="#fbbf24" />
                         <Text style={styles.statValue}>{profile.reputation || 0}</Text>
-                        <Text style={styles.statLabel}>Reputação</Text>
-                    </View>
+                        <View style={styles.statLabelRow}>
+                            <Text style={styles.statLabel}>Reputação</Text>
+                            <FontAwesome name="question-circle" size={12} color="#9ca3af" />
+                        </View>
+                    </TouchableOpacity>
                     <View style={styles.divider} />
                     <View style={styles.statItem}>
                         <FontAwesome name="calendar-check-o" size={24} color="#6366f1" />
@@ -313,6 +343,7 @@ export default function UserProfileScreen() {
                 onClose={() => setShowReportReasonModal(false)}
                 onSelectReason={submitUserReport}
             />
+            <ManualModal visible={showManualModal} onClose={() => setShowManualModal(false)} />
         </SafeAreaView>
     );
 }
@@ -441,6 +472,11 @@ const styles = StyleSheet.create({
     statLabel: {
         fontSize: 14,
         color: '#6b7280',
+    },
+    statLabelRow: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 4,
     },
     section: {
         marginBottom: 24,

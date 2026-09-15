@@ -79,8 +79,11 @@ export default function RegisterScreen() {
             );
             authLog('registration_completed');
 
+            // Vai direto ao onboarding: todo cadastro novo nasce com
+            // isProfileComplete=false, então mandar para '/' fazia a Home piscar
+            // (montando os listeners dela à toa) antes do portão redirecionar.
             Alert.alert('Sucesso', STRINGS.AUTH_REGISTER_SUCCESS, [
-                { text: 'OK', onPress: () => router.replace('/') }
+                { text: 'OK', onPress: () => router.replace('/(auth)/onboarding') }
             ]);
         } catch (error) {
             const code = getFirebaseErrorCode(error);

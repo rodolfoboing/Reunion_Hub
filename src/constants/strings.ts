@@ -17,6 +17,8 @@ export const STRINGS = {
     AUTH_ERROR_INVALID_CREDS: 'Email ou senha inválidos.',
     AUTH_ERROR_NICK_EXISTS: 'Esse Nick já está em uso. Por favor, escolha outro.',
     AUTH_ERROR_TERMS: 'Você precisa aceitar os Termos de Uso para continuar.',
+    AUTH_ERROR_ACCOUNT_DISABLED: 'Esta conta foi suspensa pela moderação e não pode mais ser acessada. Se você acha que houve engano, fale com o suporte pelo Contato e Feedback.',
+    AUTH_ERROR_TOO_MANY_ATTEMPTS: 'Muitas tentativas seguidas. Aguarde alguns minutos antes de tentar entrar novamente.',
 
     // Eventos
     EVENT_CREATE_SUCCESS: 'Seu evento foi criado e já está disponível para a comunidade!',

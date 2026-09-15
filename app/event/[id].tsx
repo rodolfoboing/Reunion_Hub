@@ -19,6 +19,7 @@ import { markRelatedNotificationsAsRead } from '@/src/services/notificationReadS
 import { EventInviteModal } from '@/src/features/events/components/EventInviteModal';
 import { submitReport } from '@/src/services/reportService';
 import { ReputationFeedbackModal } from '@/src/components/ReputationFeedbackModal';
+import { describeConflicts, findScheduleConflicts } from '@/src/services/scheduleConflictService';
 
 type ReputationFeedback = {
     delta: number;
@@ -226,6 +227,37 @@ export default function MeetingDetailsScreen() {
             Alert.alert('Erro', 'Faça login para confirmar presença.');
             return;
         }
+
+        // Aviso de conflito antes de confirmar. É conveniência: se a consulta
+        // falhar, seguimos para o fluxo normal em vez de bloquear a presença.
+        setRsvpLoading(true);
+        let conflicts: Meeting[] = [];
+        try {
+            conflicts = await findScheduleConflicts(currentUser.uid, [meeting], eventId);
+        } catch {
+            console.warn('[Event] conflict_check_failed');
+        } finally {
+            setRsvpLoading(false);
+        }
+
+        if (conflicts.length > 0) {
+            Alert.alert(
+                'Conflito de agenda',
+                `Este evento é no mesmo horário de:\n\n${describeConflicts(conflicts)}\n\nDeseja confirmar presença mesmo assim?`,
+                [
+                    { text: 'Cancelar', style: 'cancel' },
+                    { text: 'Confirmar mesmo assim', onPress: confirmRSVP },
+                ],
+            );
+            return;
+        }
+
+        confirmRSVP();
+    };
+
+    const confirmRSVP = () => {
+        const currentUser = auth.currentUser;
+        if (!currentUser || !meeting || !eventId) return;
         Alert.alert(
             'Dica de Segurança e Responsabilidade',
             'Recomendamos que você sempre se comunique com os organizadores e verifique os detalhes do evento para garantir sua segurança e veracidade. Lembre-se que o Reunion Hub é apenas um facilitador tecnológico. No mais, divirta-se e faça ótimas conexões!',

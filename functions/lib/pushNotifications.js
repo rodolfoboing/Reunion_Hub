@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.sendPushMessages = void 0;
+exports.sendPushMessages = exports.planPushRouting = exports.stringData = exports.isExpoPushToken = void 0;
 const admin = require("firebase-admin");
 function isRecord(value) {
     return typeof value === 'object' && value !== null;
@@ -8,6 +8,13 @@ function isRecord(value) {
 function isExpoPushToken(token) {
     return typeof token === 'string' && (token.startsWith('ExponentPushToken') || token.startsWith('ExpoPushToken'));
 }
+exports.isExpoPushToken = isExpoPushToken;
+/**
+ * O payload `data` do FCM aceita apenas strings. Valores não primitivos são
+ * DESCARTADOS aqui — e o fallback Expo envia `message.data` cru (sem esta
+ * conversão), então um campo objeto chegaria diferente nos dois caminhos.
+ * Hoje todos os call sites mandam só strings; o teste fixa esse contrato.
+ */
 function stringData(data) {
     return Object.fromEntries(Object.entries(data).flatMap(([key, value]) => {
         if (typeof value === 'string')
@@ -17,6 +24,35 @@ function stringData(data) {
         return [];
     }));
 }
+exports.stringData = stringData;
+/**
+ * Decide por onde cada mensagem sai. Pura de propósito: é a lógica que causa
+ * notificação duplicada (mesma mensagem indo por FCM e Expo) ou silenciosa
+ * (nenhum caminho), então precisa ser testável sem tocar em rede nem Firestore.
+ *
+ * Um aparelho já roteado por FCM é excluído do Expo pelo `registrationPath` —
+ * é o que impede a duplicação. Mensagens sem `registrationPath` (o formato
+ * legado, criado quando o usuário não tem device registrado) nunca têm caminho
+ * nativo, então caem no Expo ou em missingToken.
+ */
+function planPushRouting(messages) {
+    const native = messages.filter((message) => message.platform === 'android'
+        && typeof message.nativeToken === 'string'
+        && message.nativeToken.length > 0);
+    const nativeRegistrationPaths = new Set(native.map(({ registrationPath }) => registrationPath).filter((value) => Boolean(value)));
+    const expoFallback = [];
+    let missingToken = 0;
+    messages
+        .filter((message) => !message.registrationPath || !nativeRegistrationPaths.has(message.registrationPath))
+        .forEach((message) => {
+        if (isExpoPushToken(message.expoToken))
+            expoFallback.push(message);
+        else
+            missingToken += 1;
+    });
+    return { native, expoFallback, missingToken };
+}
+exports.planPushRouting = planPushRouting;
 async function clearInvalidToken(db, message, field) {
     var _a, _b;
     if (!((_a = message.registrationPath) === null || _a === void 0 ? void 0 : _a.startsWith('pushDevices/')))
@@ -97,15 +133,11 @@ async function sendPushMessages(db, messages) {
         rejected: 0,
         missingToken: 0,
     };
-    const expoFallback = [];
-    const nativeMessages = messages.filter((message) => message.platform === 'android' && typeof message.nativeToken === 'string' && message.nativeToken.length > 0);
-    const nativeRegistrationPaths = new Set(nativeMessages.map(({ registrationPath }) => registrationPath).filter((value) => Boolean(value)));
-    messages.filter((message) => !message.registrationPath || !nativeRegistrationPaths.has(message.registrationPath)).forEach((message) => {
-        if (isExpoPushToken(message.expoToken))
-            expoFallback.push(message);
-        else
-            summary.missingToken += 1;
-    });
+    const plan = planPushRouting(messages);
+    const nativeMessages = plan.native;
+    // Cópia: mensagens cujo envio nativo falhar são acrescentadas aqui abaixo.
+    const expoFallback = [...plan.expoFallback];
+    summary.missingToken = plan.missingToken;
     for (let offset = 0; offset < nativeMessages.length; offset += 500) {
         const chunk = nativeMessages.slice(offset, offset + 500);
         const response = await admin.messaging().sendEach(chunk.map((message) => ({

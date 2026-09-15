@@ -2770,8 +2770,14 @@ export const deleteMyAccount = accountFunction.https.onCall(async (_data, contex
     );
     await processQueryInBatches(
         db.collection('conversations').where('participants', 'array-contains', uid),
+        // `participants` NÃO perde o uid. Todo o cliente identifica o outro lado
+        // com `participants.find(p => p !== eu)`; removendo o uid, esse find
+        // retornava undefined e o nome caía no fallback genérico "Usuário",
+        // enquanto a tela da conversa abortava antes de checar se o perfil ainda
+        // existe — deixando o campo de digitar habilitado para um destinatário
+        // que não existe mais. O nome anonimizado abaixo é o que preserva a
+        // privacidade; o array é contrato estrutural da conversa.
         (batch, document) => batch.update(document.ref, {
-            participants: admin.firestore.FieldValue.arrayRemove(uid),
             deletedBy: admin.firestore.FieldValue.arrayUnion(uid),
             [`participantNames.${uid}`]: 'Usuário excluído',
             [`unreadCounts.${uid}`]: admin.firestore.FieldValue.delete()

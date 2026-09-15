@@ -31,10 +31,18 @@ export type EventDiscovery = {
     shouldAnimateOnMap: boolean;
 };
 
-export const DISCOVERY_REASON_LABELS: Record<DiscoveryReason, string> = {
+/**
+ * Rótulos curtos: todo motivo é exibido como selo, dividindo a linha com o selo
+ * temporal. Existia também uma versão longa (`DISCOVERY_REASON_LABELS`), usada
+ * só pelo cartão de recomendação da Agenda enquanto ele era o único card sem
+ * selo temporal. Agora que ele mostra os dois eixos como as demais telas, não há
+ * mais espaço para frase — e uma única fonte evita que o mesmo motivo apareça
+ * com nomes diferentes dependendo da tela.
+ */
+export const DISCOVERY_REASON_BADGE_LABELS: Record<DiscoveryReason, string> = {
     in_progress: 'Em andamento',
     interest: 'Seu interesse',
-    history: 'Parecido com eventos anteriores',
+    history: 'Do seu histórico',
     popular: 'Popular',
     nearby: 'Perto de você',
 };
@@ -52,6 +60,32 @@ const hasActiveStatus = (meeting: DiscoveryMeeting): boolean =>
 
 function hasPopularAttendance(meeting: Pick<Meeting, 'attendees'>): boolean {
     return (meeting.attendees?.length || 0) >= CONFIG.POPULAR_ATTENDEES_COUNT;
+}
+
+/**
+ * Evento publicado há pouco. É sinal padrão em apps de evento porque dá tração a
+ * quem acabou de criar: sem confirmações ainda, ele nunca apareceria como
+ * "Popular" e ficaria invisível justamente na janela em que precisa de gente.
+ *
+ * Aceita os dois formatos de `createdAt` que existem em produção — `Timestamp`
+ * do Firestore e string ISO em registros antigos (ver §10 de dados legados).
+ * Sem `createdAt` retorna false: ausência de dado não vira selo.
+ */
+export function isNewMeeting(meeting: Pick<Meeting, 'createdAt'>, now = new Date()): boolean {
+    const createdAt = meeting.createdAt;
+    if (!createdAt) return false;
+
+    const createdMs = typeof createdAt === 'string'
+        ? Date.parse(createdAt)
+        : typeof (createdAt as { toMillis?: unknown }).toMillis === 'function'
+            ? (createdAt as { toMillis: () => number }).toMillis()
+            : Number.NaN;
+    if (!Number.isFinite(createdMs)) return false;
+
+    const ageMs = now.getTime() - createdMs;
+    // `ageMs >= 0` descarta relógio adiantado no aparelho, que marcaria como novo
+    // um evento com data de criação no futuro.
+    return ageMs >= 0 && ageMs <= CONFIG.NEW_EVENT_WINDOW_HOURS * 60 * 60 * 1000;
 }
 
 export function isMeetingNearby(
@@ -90,6 +124,52 @@ function isPopularForUser(
 ): boolean {
     if (!hasPopularAttendance(meeting)) return false;
     return meeting.type === 'online' || isMeetingNearby(meeting, userCoordinates);
+}
+
+/**
+ * Motivo a mostrar no selo do card, ou null quando ele não acrescenta nada.
+ *
+ * O app tem DOIS eixos de sinalização, e eles estavam misturados:
+ *   - QUANDO o evento acontece  → `getEventJourneyState` (HOJE, EM BREVE, ...)
+ *   - POR QUE ele aparece p/ você → este motivo (Seu interesse, Popular, ...)
+ *
+ * Dois filtros, cada um consertando um defeito real:
+ *
+ * 1. `in_progress` nunca sai daqui. "Está acontecendo" é estado temporal, não
+ *    motivo de descoberta. Enquanto morava nesta lista, Início e Explorar
+ *    precisavam repetir `isLive ? null : primaryReason` para escondê-lo — a
+ *    mesma gambiarra escrita em dois lugares.
+ *
+ * 2. `impliedReasons` são os motivos que a própria seção já comunica. Um card
+ *    marcado "Seu interesse" dentro da seção "Eventos do seu interesse" não
+ *    informava nada e ainda ocupava o selo que deveria dizer "HOJE".
+ */
+export function getDiscoveryBadgeReason(
+    discovery: EventDiscovery,
+    impliedReasons: readonly DiscoveryReason[] = [],
+): DiscoveryReason | null {
+    return DISCOVERY_REASON_PRIORITY.find((reason) => reason !== 'in_progress'
+        && !impliedReasons.includes(reason)
+        && discovery.reasons.includes(reason)) ?? null;
+}
+
+/**
+ * Este evento deve ser sugerido ao usuário, respeitando a preferência de perfil
+ * "eventos populares fora dos meus interesses"?
+ *
+ * Fonte única para Início, Agenda e Explorar. Antes cada tela aplicava a própria
+ * variação da mesma regra: o Início ignorava o motivo `history`, e o Explorar não
+ * consultava a preferência — o mapa piscava "popular" mesmo para quem desligou.
+ *
+ * Não precisa checar `isRecommended`: ele é verdadeiro sempre que há motivo
+ * personalizado ou popular, que é exatamente o que esta função exige.
+ */
+export function shouldSuggestEvent(
+    discovery: EventDiscovery,
+    showPopularOutsideInterests: boolean,
+): boolean {
+    const personalized = discovery.reasons.includes('interest') || discovery.reasons.includes('history');
+    return personalized || (showPopularOutsideInterests && discovery.reasons.includes('popular'));
 }
 
 /**

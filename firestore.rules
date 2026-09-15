@@ -89,10 +89,25 @@ service cloud.firestore {
                 && getAfter(/databases/$(database)/documents/nicknames/$(request.resource.data.searchName)).data.uid == request.auth.uid
               )
             )
+            // Teto generoso: o app limita bio a 300 e interesses a 10, então isto
+            // só barra abuso por script sem travar perfis antigos mais longos.
+            && (!request.resource.data.keys().hasAny(['bio'])
+              || (request.resource.data.bio is string && request.resource.data.bio.size() <= 1000))
+            && (!request.resource.data.keys().hasAny(['interests'])
+              || (request.resource.data.interests is list && request.resource.data.interests.size() <= 19))
           )
           || (
             request.resource.data.diff(resource.data).affectedKeys().hasOnly(['expoPushToken'])
             && !request.resource.data.keys().hasAny(['expoPushToken'])
+          )
+          // Reaceite dos termos: ramo isolado de propósito, para que um save comum
+          // de perfil não consiga reescrever a versão/data do aceite junto.
+          || (
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['termsVersion', 'termsAcceptedAt'])
+            && request.resource.data.termsVersion is string
+            && request.resource.data.termsVersion.size() > 0
+            && request.resource.data.termsVersion.size() <= 40
+            && request.resource.data.termsAcceptedAt == request.time
           )
         );
       allow delete: if false;

@@ -219,7 +219,7 @@ export async function setupNotifications(): Promise<PushRegistration> {
   }
   
   if (finalStatus !== 'granted') {
-    console.log('[Notifications] Permissão para notificações negada.');
+    if (__DEV__) console.info('[Notifications] permission_denied');
     return { granted: false, expoToken: null, nativeToken: null, platform: null };
   }
   
@@ -232,6 +232,14 @@ export async function setupNotifications(): Promise<PushRegistration> {
   } catch (error) {
     reportNotificationOperationError('push_token_registration', error);
   }
+
+  // Só a presença dos tokens (§14: nunca logar o valor). Sem isso não dava pra
+  // distinguir "sem permissão" de "permissão ok mas token não veio".
+  if (__DEV__) console.info('[Notifications] push_tokens_resolved', {
+    hasExpoToken: Boolean(expoToken),
+    hasNativeToken: Boolean(nativeToken),
+    platform: Platform.OS,
+  });
 
   return {
     granted: true,
@@ -435,10 +443,18 @@ async function syncReengagementReminderOperation(userId: string | null): Promise
   if (!userId) return;
   await AsyncStorage.removeItem(`${REENGAGEMENT_REMINDER_KEY_PREFIX}${userId}`);
   const enabled = (await AsyncStorage.getItem(`${REENGAGEMENT_ENABLED_KEY_PREFIX}${userId}`)) === 'true';
-  if (!enabled) return;
+  if (!enabled) {
+    // Explica o caso "não recebi o lembrete de 7 dias": a preferência ainda não
+    // foi sincronizada do notificationSettings, ou está desligada no perfil.
+    if (__DEV__) console.info('[Notifications] reengagement_skipped', { reason: 'disabled' });
+    return;
+  }
 
   const permission = await Notifications.getPermissionsAsync();
-  if (permission.status !== 'granted') return;
+  if (permission.status !== 'granted') {
+    if (__DEV__) console.info('[Notifications] reengagement_skipped', { reason: 'permission' });
+    return;
+  }
 
   const notificationId = await Notifications.scheduleNotificationAsync({
     content: {

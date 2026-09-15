@@ -24,6 +24,42 @@ const { width } = Dimensions.get('window');
 
 type StoredMapRegion = { latitude: number; longitude: number; latitudeDelta: number; longitudeDelta: number };
 const LAST_MAP_REGION_KEY = '@reunionhub_last_map_region';
+const MAP_FILTERS_KEY = '@reunionhub_map_filters';
+
+type MapFilters = { events: boolean; communityPlaces: boolean; osmPlaces: boolean; googlePoi: boolean };
+
+/**
+ * Padrão de instalação nova. Tudo ligado, EXCETO a Descoberta (OSM): ela consulta
+ * a Overpass, uma API comunitária gratuita com limite de taxa, e o cache é só de
+ * sessão — ligada para todos por padrão, multiplicaria o tráfego contra um
+ * serviço que pode nos bloquear. Fica como opt-in consciente do usuário.
+ * Os Pontos do Google são só estilo do mapa, sem custo, então vêm ligados.
+ */
+const DEFAULT_MAP_FILTERS: MapFilters = {
+    events: true,
+    communityPlaces: true,
+    osmPlaces: false,
+    googlePoi: true,
+};
+
+function parseStoredMapFilters(raw: string | null): MapFilters {
+    if (!raw) return DEFAULT_MAP_FILTERS;
+    try {
+        const stored: unknown = JSON.parse(raw);
+        if (typeof stored !== 'object' || stored === null) return DEFAULT_MAP_FILTERS;
+        const record = stored as Record<string, unknown>;
+        // Campo a campo: uma chave nova adicionada numa versão futura assume o
+        // padrão em vez de virar `undefined` e desligar o filtro sem querer.
+        return {
+            events: typeof record.events === 'boolean' ? record.events : DEFAULT_MAP_FILTERS.events,
+            communityPlaces: typeof record.communityPlaces === 'boolean' ? record.communityPlaces : DEFAULT_MAP_FILTERS.communityPlaces,
+            osmPlaces: typeof record.osmPlaces === 'boolean' ? record.osmPlaces : DEFAULT_MAP_FILTERS.osmPlaces,
+            googlePoi: typeof record.googlePoi === 'boolean' ? record.googlePoi : DEFAULT_MAP_FILTERS.googlePoi,
+        };
+    } catch {
+        return DEFAULT_MAP_FILTERS;
+    }
+}
 const DEFAULT_MAP_REGION: StoredMapRegion = { latitude: -23.5505, longitude: -46.6333, latitudeDelta: 0.05, longitudeDelta: 0.05 };
 
 function regionSearchKey(region: StoredMapRegion): string {
@@ -71,8 +107,9 @@ function parseStoredMapRegion(value: string): StoredMapRegion | null {
 }
 
 import { useEventClock } from '@/src/hooks/useEventClock';
-import { DISCOVERY_REASON_LABELS, getEventDiscovery } from '@/src/utils/eventDiscovery';
-import { hasEventEnded } from '@/src/utils/eventSchedule';
+import { DISCOVERY_REASON_BADGE_LABELS, getDiscoveryBadgeReason, getEventDiscovery, isNewMeeting, shouldSuggestEvent } from '@/src/utils/eventDiscovery';
+import { getDistanceFromLatLonInKm } from '@/src/utils/distance';
+import { getEventJourneyState, hasEventEnded } from '@/src/utils/eventSchedule';
 import { ErrorState } from '@/src/components/ErrorState';
 import { getTodayStr, normalizeDate } from '@/src/utils/dateUtils';
 import { toUserProfile } from '@/src/utils/userProfile';
@@ -152,20 +189,44 @@ const normalizeMarkerText = (value: string) => value
     .replace(/[\u0300-\u036f]/g, '')
     .toLocaleLowerCase('pt-BR');
 
+// Mapa direto interesse -> \u00edcone. A taxonomia \u00e9 FECHADA (INTERESTS_OPTIONS) e o
+// `theme` \u00e9 sempre normalizedInterests[0], ent\u00e3o casar por palavra-chave de texto
+// livre era a ferramenta errada: 11 dos 19 interesses ca\u00edam em 'general' e os
+// conjuntos social/study/nature nunca chegavam a ser usados.
+// Chaves sem acento e em min\u00fasculas (mesma normaliza\u00e7\u00e3o de normalizeMarkerText),
+// para n\u00e3o depender de como o acento est\u00e1 gravado no arquivo.
+// Interesse novo em INTERESTS_OPTIONS precisa de uma linha aqui \u2014 sen\u00e3o cai em 'general'.
+const INTEREST_MARKER_CATEGORY: Record<string, EventMarkerCategory> = {
+    'tecnologia & inovacao': 'technology',
+    'negocios & carreira': 'social',
+    'festas & shows': 'social',
+    'musica': 'culture',
+    'danca': 'culture',
+    'saude & bem-estar': 'sports',
+    'gastronomia': 'social',
+    'artes & cultura': 'culture',
+    'esportes': 'sports',
+    'educacao & workshops': 'study',
+    'networking': 'social',
+    'cinema & teatro': 'culture',
+    'religiao & espiritualidade': 'social',
+    'games & geek': 'games',
+    'jogos digitais': 'games',
+    'sustentabilidade': 'nature',
+    'animais de estimacao': 'nature',
+    'literatura': 'study',
+    'filosofia': 'study',
+};
+
 const getEventMarkerCategory = (meeting: Pick<Meeting, 'theme' | 'interests'>): EventMarkerCategory => {
-    const eventText = normalizeMarkerText([meeting.theme, ...(meeting.interests || [])].filter(Boolean).join(' '));
-
-    const categoryKeywords: Array<[EventMarkerCategory, string[]]> = [
-        ['sports', ['esporte', 'futebol', 'volei', 'basquete', 'corrida', 'ciclismo', 'bike', 'academia', 'exercicio']],
-        ['games', ['jogo', 'games', 'gamer', 'videogame', 'tabuleiro', 'xadrez', 'rpg']],
-        ['study', ['estudo', 'aprender', 'idioma', 'leitura', 'livro', 'faculdade', 'escola']],
-        ['culture', ['cultura', 'musica', 'cinema', 'filme', 'arte', 'teatro', 'danca', 'fotografia']],
-        ['technology', ['tecnologia', 'programacao', 'dev', 'software', 'ciencia']],
-        ['nature', ['natureza', 'parque', 'trilha', 'caminhada', 'ambiental']],
-        ['social', ['social', 'conversa', 'amizade', 'encontro', 'cafe', 'comunidade']],
-    ];
-
-    return categoryKeywords.find(([, keywords]) => keywords.some((keyword) => eventText.includes(keyword)))?.[0] || 'general';
+    // normalizeInterests converte os aliases legados (\u00a710) para a taxonomia atual,
+    // ent\u00e3o eventos antigos continuam recebendo o \u00edcone certo.
+    const canonicalInterests = normalizeInterests([meeting.theme, ...(meeting.interests || [])]);
+    for (const interest of canonicalInterests) {
+        const category = INTEREST_MARKER_CATEGORY[normalizeMarkerText(interest)];
+        if (category) return category;
+    }
+    return 'general';
 };
 
 const getEventMarkerImage = (meeting: Pick<Meeting, 'theme' | 'interests'>, isLive: boolean, isHighlighted: boolean, blinkOn: boolean) => {
@@ -230,14 +291,10 @@ export default function ExploreScreen() {
     const [viewMode, setViewMode] = useState<'map' | 'list'>('map');
     const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
     const [userInterests, setUserInterests] = useState<string[]>([]);
+    const [showPopularOutsideInterests, setShowPopularOutsideInterests] = useState(true);
 
-    // Filtros do Mapa
-    const [mapFilters, setMapFilters] = useState({
-        events: true,
-        communityPlaces: true,
-        osmPlaces: false,
-        googlePoi: false
-    });
+    // Filtros do Mapa — a escolha do usuário é gravada e vale até ele mudar.
+    const [mapFilters, setMapFilters] = useState<MapFilters>(DEFAULT_MAP_FILTERS);
     const [mapInitialRegion, setMapInitialRegion] = useState<StoredMapRegion>(DEFAULT_MAP_REGION);
     const [searchRegion, setSearchRegion] = useState<StoredMapRegion>(DEFAULT_MAP_REGION);
     const [storedRegionStatus, setStoredRegionStatus] = useState<'loading' | 'available' | 'missing'>('loading');
@@ -274,10 +331,30 @@ export default function ExploreScreen() {
         }
         void retryLocation();
     };
-    const toggleMapFilter = (key: keyof typeof mapFilters) => {
-        setMapFilters(prev => ({ ...prev, [key]: !prev[key] }));
+    // Grava dentro do próprio toggle, que é o único ponto de mutação: um effect
+    // sobre `mapFilters` também gravaria o padrão logo após a carga, apagando a
+    // escolha do usuário caso a leitura falhasse.
+    const persistMapFilters = (next: MapFilters) => {
+        AsyncStorage.setItem(MAP_FILTERS_KEY, JSON.stringify(next)).catch(() => {
+            console.warn('[Explore] map_filters_save_failed');
+        });
     };
-    const activeFilterCount = Object.values(mapFilters).filter(Boolean).length;
+    const toggleMapFilter = (key: keyof MapFilters) => {
+        setMapFilters((prev) => {
+            const next = { ...prev, [key]: !prev[key] };
+            persistMapFilters(next);
+            return next;
+        });
+    };
+    const restoreDefaultMapFilters = () => {
+        setMapFilters(DEFAULT_MAP_FILTERS);
+        persistMapFilters(DEFAULT_MAP_FILTERS);
+    };
+    // O selo do botão indica que o usuário MUDOU algo, não quantos filtros estão
+    // ligados: contar os ativos marcava uma instalação nova como "filtrada",
+    // porque a Descoberta (OSM) nasce desligada de propósito.
+    const changedFilterCount = (Object.keys(DEFAULT_MAP_FILTERS) as (keyof MapFilters)[])
+        .filter((key) => mapFilters[key] !== DEFAULT_MAP_FILTERS[key]).length;
 
     const [filtersOpen, setFiltersOpen] = useState(false);
     const [headerHeight, setHeaderHeight] = useState(0);
@@ -297,6 +374,21 @@ export default function ExploreScreen() {
     const [showPlaceModal, setShowPlaceModal] = useState(false);
     const [frequentersProfiles, setFrequentersProfiles] = useState<User[]>([]);
     const [loadingProfiles, setLoadingProfiles] = useState(false);
+
+    // Carga única da preferência gravada. A Descoberta (OSM) nasce desligada, então
+    // nada é buscado antes desta leitura: se o usuário a tiver ligado, a busca começa
+    // ao chegar aqui, sem nenhuma consulta desperdiçada no meio.
+    useEffect(() => {
+        let cancelled = false;
+        AsyncStorage.getItem(MAP_FILTERS_KEY)
+            .then((raw) => {
+                if (!cancelled) setMapFilters(parseStoredMapFilters(raw));
+            })
+            .catch(() => {
+                console.warn('[Explore] map_filters_load_failed');
+            });
+        return () => { cancelled = true; };
+    }, []);
 
     const mapRef = useRef<any>(null);
     const placeRequestId = useRef(0);
@@ -391,7 +483,10 @@ export default function ExploreScreen() {
         let active = true;
         getDoc(doc(db, 'users', currentUid)).then((snapshot) => {
             if (active && snapshot.exists()) {
+                // Mesma leitura que já era feita: aproveita o documento para trazer
+                // também a preferência, sem custo adicional de Firestore.
                 setUserInterests(normalizeInterests(snapshot.data().interests));
+                setShowPopularOutsideInterests(snapshot.data().showPopularOutsideInterests !== false);
             }
         }).catch((error) => {
             if (__DEV__) console.warn('[Explore] user_interests_load_failed', error);
@@ -516,14 +611,16 @@ export default function ExploreScreen() {
 
     const handleCreateEventAtSelectedPlace = () => {
         if (!selectedPlace) return;
-        setNewMeeting({
-            ...newMeeting,
+        // Funcional: o spread do estado capturado no render descartava qualquer
+        // alteração feita entre a renderização e este toque — data e hora inclusive.
+        setNewMeeting((current) => ({
+            ...current,
             locationName: selectedPlace.name,
             lat: selectedPlace.latitude,
             lng: selectedPlace.longitude,
             type: 'in-person',
-            placeId: selectedPlace.id
-        });
+            placeId: selectedPlace.id,
+        }));
         setShowPlaceModal(false);
         pendingCreateEventTask.current?.cancel();
         pendingCreateEventTask.current = InteractionManager.runAfterInteractions(() => {
@@ -598,12 +695,42 @@ export default function ExploreScreen() {
         }
     };
 
+    const viewerUid = auth.currentUser?.uid;
+    const isAttendingMeeting = (meeting: Meeting) => Boolean(viewerUid && meeting.attendees?.includes(viewerUid));
+
     const filteredMeetings = meetings.filter(m => {
         if (m.status === 'cancelled' || m.status === 'completed' || hasEventEnded(m, eventClock)) return false;
         if (m.type !== eventType) return false;
         if (selectedCategory && !hasMatchingInterest([m.theme, ...(m.interests || [])], [selectedCategory])) return false;
         return true;
     });
+
+    /** Distância até o evento, ou null quando não se aplica (online, sem GPS). */
+    const meetingDistanceKm = (meeting: Meeting): number | null => {
+        if (meeting.type === 'online' || !location) return null;
+        const latitude = Number(meeting.lat);
+        const longitude = Number(meeting.lng);
+        if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
+        return getDistanceFromLatLonInKm(location.coords.latitude, location.coords.longitude, latitude, longitude);
+    };
+
+    /**
+     * Estado do marcador em texto, no balão. A arte sozinha comunica por cor e
+     * piscada — inacessível para quem não distingue as cores ou reduz animações —
+     * e o balão é o único lugar do mapa onde texto cabe. Traz os dois eixos, a
+     * contagem de confirmados e, no lugar da remoção feita na lista, o aviso de
+     * que você já vai a este evento.
+     */
+    const describeMarkerMeeting = (meeting: Meeting) => {
+        const journey = getEventJourneyState(meeting, eventClock);
+        const attendeeCount = meeting.attendees?.length || 0;
+        const parts = [
+            isAttendingMeeting(meeting) ? 'Você vai' : null,
+            journey.compactLabel,
+            attendeeCount === 1 ? '1 confirmado' : `${attendeeCount} confirmados`,
+        ];
+        return parts.filter(Boolean).join(' • ');
+    };
 
     const visiblePlaces = useMemo(() => places.filter((place) => {
         if (!place.latitude || !place.longitude || isNaN(place.latitude) || isNaN(place.longitude)) return false;
@@ -620,8 +747,60 @@ export default function ExploreScreen() {
         userInterests,
         now: eventClock,
     });
-    const isPopularMeeting = (meeting: Meeting) =>
-        getMeetingDiscovery(meeting).reasons.includes('popular');
+    // Respeita a preferência do perfil, igual ao Início e à Agenda: antes o mapa
+    // destacava "popular" mesmo para quem desativou populares fora dos interesses.
+    const isPopularMeeting = (meeting: Meeting) => {
+        const discovery = getMeetingDiscovery(meeting);
+        return discovery.reasons.includes('popular')
+            && shouldSuggestEvent(discovery, showPopularOutsideInterests);
+    };
+
+    /**
+     * A LISTA é para descobrir o que você ainda não conhece: um evento já
+     * confirmado só ocupa espaço, porque ele já está na sua Agenda. No MAPA o
+     * marcador continua — você precisa localizar o seu próprio evento — e lá a
+     * participação é anunciada no balão.
+     *
+     * A ordem vinha crua do Firestore (`orderBy('date')`), então um evento a 8 km
+     * sem ninguém confirmado aparecia acima de um a 300 m com quinze pessoas, só
+     * por começar meia hora antes. Os critérios agora são em cascata:
+     *
+     *   1. FASE — reaproveita `getEventJourneyState`, a mesma fonte dos selos, então
+     *      a ordem da lista bate com o que cada card exibe. Evento é um momento:
+     *      ao vivo > começa em breve > hoje > próximos dias. Um evento popular
+     *      daqui a cinco dias não pode passar na frente de um que é hoje.
+     *   2. POPULAR — dentro da mesma fase, o que já tem gente confirmada.
+     *   3. DISTÂNCIA — depois, o mais perto. Sem GPS ou em evento online não há
+     *      distância, e esses ficam por último dentro do próprio grupo.
+     *   4. DATA E HORA — desempate estável, para a lista não dançar entre renders.
+     */
+    const LIST_PHASE_RANK: Record<string, number> = {
+        in_progress: 0,
+        starting_soon: 1,
+        today: 2,
+        upcoming: 3,
+    };
+    const rankedListMeetings = filteredMeetings
+        .filter((meeting) => !isAttendingMeeting(meeting))
+        .map((meeting) => ({
+            meeting,
+            phaseRank: LIST_PHASE_RANK[getEventJourneyState(meeting, eventClock).phase] ?? 9,
+            isPopular: isPopularMeeting(meeting),
+            distanceKm: meetingDistanceKm(meeting),
+            startKey: `${meeting.date ?? ''} ${meeting.time ?? ''}`,
+        }))
+        .sort((first, second) => {
+            if (first.phaseRank !== second.phaseRank) return first.phaseRank - second.phaseRank;
+            if (first.isPopular !== second.isPopular) return first.isPopular ? -1 : 1;
+            if (first.distanceKm !== second.distanceKm) {
+                if (first.distanceKm === null) return 1;
+                if (second.distanceKm === null) return -1;
+                return first.distanceKm - second.distanceKm;
+            }
+            return first.startKey.localeCompare(second.startKey);
+        });
+    const listMeetings = rankedListMeetings.map(({ meeting }) => meeting);
+    const hiddenAttendingCount = filteredMeetings.length - listMeetings.length;
     const isInterestHighlightMeeting = (meeting: Meeting) => {
         const discovery = getMeetingDiscovery(meeting);
         return discovery.shouldAnimateOnMap && discovery.reasons.includes('interest');
@@ -658,7 +837,19 @@ export default function ExploreScreen() {
     const renderMeetingCard = ({ item }: { item: Meeting }) => {
         const discovery = getMeetingDiscovery(item);
         const isLive = discovery.reasons.includes('in_progress');
-        const discoveryReason = isLive ? null : discovery.primaryReason;
+        // A lista é filtrada por online/presencial, não por motivo de descoberta:
+        // nenhum motivo está implícito na seção, então os dois eixos aparecem.
+        // Faltava justamente o temporal — o card dizia "Seu interesse" sem nunca
+        // dizer que o evento era hoje.
+        const badgeReason = getDiscoveryBadgeReason(discovery);
+        const journeyState = isLive ? null : getEventJourneyState(item, eventClock);
+        const attendeeCount = item.attendees?.length || 0;
+        // `label` traz "COMEÇA EM 45 MIN"; `compactLabel` reduz tudo a "EM BREVE".
+        // Aqui a linha é inteira, então a contagem precisa cabe e é mais acionável.
+        const journeyText = journeyState?.phase === 'starting_soon' ? journeyState.label : journeyState?.compactLabel;
+        // Mesma função que ordena a lista: se o card mostrasse uma distância
+        // calculada por outro caminho, a ordem poderia contradizer o que se lê.
+        const distanceKm = meetingDistanceKm(item);
         return (
         <TouchableOpacity style={styles.card} onPress={() => router.push(`/event/${item.id}` as any)}>
             <View style={styles.cardHeader}>
@@ -666,20 +857,44 @@ export default function ExploreScreen() {
                 <Text style={styles.dateText}>{item.date ? item.date.split('-').reverse().join('/') : ''} • {item.time}</Text>
             </View>
             <Text style={styles.cardTitle} numberOfLines={1}>{item.title}</Text>
+            {/* Confirmados e distância: dois dados que o app já tinha em mãos e
+                nunca mostrava. Contagem de presença é o principal sinal social
+                nos apps de evento, e alimentava só o cálculo interno de "Popular". */}
+            <View style={styles.cardMetaRow}>
+                <View style={styles.cardMetaItem}>
+                    <Ionicons name="people-outline" size={13} color="#6B7280" />
+                    <Text style={styles.cardMetaText}>
+                        {attendeeCount === 1 ? '1 confirmado' : `${attendeeCount} confirmados`}
+                    </Text>
+                </View>
+                {distanceKm !== null && (
+                    <View style={styles.cardMetaItem}>
+                        <Ionicons name="navigate-outline" size={13} color="#6B7280" />
+                        <Text style={styles.cardMetaText}>{`a ${distanceKm.toFixed(1)} km`}</Text>
+                    </View>
+                )}
+                {isNewMeeting(item, eventClock) && (
+                    <View style={styles.newBadge}><Text style={styles.newBadgeText}>NOVO</Text></View>
+                )}
+            </View>
             <View style={styles.cardFooter}>
                 <View style={styles.locationRow}>
                     <Ionicons name={eventType === 'online' ? "videocam-outline" : "location-outline"} size={16} color="#6B7280" />
                     <Text style={styles.locationText} numberOfLines={1}>{item.locationName}</Text>
                 </View>
-                {isLive && (
+                {isLive ? (
                     <View style={styles.liveBadge}>
                         <View style={styles.liveDot} />
                         <Text style={styles.liveText}>Ao vivo</Text>
                     </View>
-                )}
-                {discoveryReason && (
+                ) : journeyText ? (
+                    <View style={styles.journeyBadge}>
+                        <Text style={styles.journeyBadgeText} numberOfLines={1}>{journeyText}</Text>
+                    </View>
+                ) : null}
+                {badgeReason && (
                     <View style={styles.discoveryBadge}>
-                        <Text style={styles.discoveryBadgeText}>{DISCOVERY_REASON_LABELS[discoveryReason]}</Text>
+                        <Text style={styles.discoveryBadgeText} numberOfLines={1}>{DISCOVERY_REASON_BADGE_LABELS[badgeReason]}</Text>
                     </View>
                 )}
             </View>
@@ -747,9 +962,9 @@ export default function ExploreScreen() {
                             >
                                 <Ionicons name="options-outline" size={16} color={filtersOpen ? '#6366F1' : '#fff'} />
                                 <Text style={[styles.filterTriggerText, filtersOpen && styles.filterTriggerTextActive]}>Filtros</Text>
-                                {activeFilterCount > 0 && (
+                                {changedFilterCount > 0 && (
                                     <View style={styles.filterCountBadge}>
-                                        <Text style={styles.filterCountText}>{activeFilterCount}</Text>
+                                        <Text style={styles.filterCountText}>{changedFilterCount}</Text>
                                     </View>
                                 )}
                             </TouchableOpacity>
@@ -812,6 +1027,21 @@ export default function ExploreScreen() {
                                 />
                             </View>
                         ))}
+                        <Text style={styles.filterHint}>
+                            A Descoberta (OSM) busca locais em um serviço externo e vem desligada.
+                            Sua escolha fica salva para as próximas vezes.
+                        </Text>
+                        {changedFilterCount > 0 && (
+                            <TouchableOpacity
+                                onPress={restoreDefaultMapFilters}
+                                style={styles.filterResetButton}
+                                accessibilityRole="button"
+                                accessibilityLabel="Restaurar filtros padrão do mapa"
+                            >
+                                <Ionicons name="refresh" size={13} color="#6366F1" />
+                                <Text style={styles.filterResetText}>Restaurar padrão</Text>
+                            </TouchableOpacity>
+                        )}
                     </View>
                 </>
             )}
@@ -825,11 +1055,28 @@ export default function ExploreScreen() {
                     />
                 ) : (
                     <FlatList
-                        data={filteredMeetings}
+                        data={listMeetings}
                         keyExtractor={(item) => item.id}
                         renderItem={renderMeetingCard}
                         contentContainerStyle={styles.listContent}
                         showsVerticalScrollIndicator={false}
+                        // Sem este aviso, sumir com um evento confirmado parece defeito.
+                        ListHeaderComponent={hiddenAttendingCount > 0 ? (
+                            <TouchableOpacity
+                                style={styles.attendingNotice}
+                                onPress={() => router.push('/agenda' as never)}
+                                accessibilityRole="button"
+                                accessibilityLabel="Abrir a Agenda para ver os eventos que você confirmou"
+                            >
+                                <Ionicons name="checkmark-circle" size={15} color="#10B981" />
+                                <Text style={styles.attendingNoticeText}>
+                                    {hiddenAttendingCount === 1
+                                        ? '1 evento que você confirmou está na sua Agenda'
+                                        : `${hiddenAttendingCount} eventos que você confirmou estão na sua Agenda`}
+                                </Text>
+                                <Ionicons name="chevron-forward" size={14} color="#10B981" />
+                            </TouchableOpacity>
+                        ) : null}
                         ListEmptyComponent={
                             <View style={styles.emptyContainer}>
                                 <Ionicons name="calendar-outline" size={40} color="#C7CCF0" />
@@ -844,10 +1091,15 @@ export default function ExploreScreen() {
                             style={styles.map}
                             provider={Platform.OS === 'android' ? PROVIDER_GOOGLE : PROVIDER_DEFAULT}
                             key={`${mapInitialRegion.latitude}:${mapInitialRegion.longitude}`}
+                            /* Android (Google Maps) respeita o customMapStyle; iOS usa
+                               PROVIDER_DEFAULT (Apple Maps), que o ignora e obedece só
+                               showsPointsOfInterest. Os dois precisam do MESMO valor —
+                               antes `showsPointsOfInterest` tinha um `Platform.OS ===
+                               'android' ||` que o fixava em true e mascarava o filtro. */
                             customMapStyle={mapFilters.googlePoi ? [] : hideGooglePoiStyle}
                             initialRegion={mapInitialRegion}
                             showsUserLocation={true}
-                            showsPointsOfInterest={Platform.OS === 'android' || mapFilters.googlePoi}
+                            showsPointsOfInterest={mapFilters.googlePoi}
                             onRegionChangeComplete={(region) => {
                                 const nextRegion: StoredMapRegion = {
                                     latitude: region.latitude,
@@ -896,6 +1148,7 @@ export default function ExploreScreen() {
                                     coordinate={{ latitude: Number(place.latitude), longitude: Number(place.longitude) }}
                                     onPress={() => handleOpenPlaceModal(place)}
                                     title={place.name}
+                                    description={markerMeeting ? describeMarkerMeeting(markerMeeting) : undefined}
                                     image={markerImage}
                                     anchor={{ x: 0.5, y: 0.5 }}
                                     zIndex={isLive ? 100 : isPopular ? 80 : matchesInterestToday ? 70 : hasActiveEvent ? 40 : hasFrequenters ? 30 : 10}
@@ -920,6 +1173,7 @@ export default function ExploreScreen() {
                                     coordinate={{ latitude: Number(meeting.lat), longitude: Number(meeting.lng) }}
                                     onPress={() => router.push(`/event/${meeting.id}` as any)}
                                     title={meeting.title}
+                                    description={describeMarkerMeeting(meeting)}
                                     image={getEventMarkerImage(meeting, isLive, isHighlighted, markerBlinkOn)}
                                     anchor={{ x: 0.5, y: 0.5 }}
                                     zIndex={isLive ? 100 : isPopular ? 80 : matchesInterestToday ? 70 : 1}
@@ -1144,6 +1398,16 @@ const styles = StyleSheet.create({
         shadowOffset: { width: 0, height: 10 }, elevation: 12, zIndex: 50,
     },
     filtersPanelTitle: { fontSize: 11, fontWeight: '800', color: '#9CA3AF', textTransform: 'uppercase', letterSpacing: 0.6, marginBottom: 12 },
+    filterHint: { fontSize: 11, color: '#9CA3AF', lineHeight: 15, marginTop: 8 },
+    attendingNotice: { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: '#ECFDF5', borderRadius: 12, paddingVertical: 10, paddingHorizontal: 12, marginBottom: 12 },
+    attendingNoticeText: { flex: 1, fontSize: 12, fontWeight: '600', color: '#047857' },
+    cardMetaRow: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 12, marginTop: 6 },
+    cardMetaItem: { flexDirection: 'row', alignItems: 'center', gap: 4 },
+    cardMetaText: { fontSize: 12, color: '#6B7280', fontWeight: '600' },
+    newBadge: { backgroundColor: '#FEF3C7', paddingHorizontal: 7, paddingVertical: 2, borderRadius: 6 },
+    newBadgeText: { fontSize: 9, fontWeight: '800', color: '#B45309', letterSpacing: 0.5 },
+    filterResetButton: { flexDirection: 'row', alignItems: 'center', gap: 6, alignSelf: 'flex-start', marginTop: 10, paddingVertical: 6, paddingHorizontal: 10, borderRadius: 10, backgroundColor: '#EEF2FF' },
+    filterResetText: { fontSize: 12, fontWeight: '700', color: '#6366F1' },
     filterRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 8 },
     filterRowLeft: { flexDirection: 'row', alignItems: 'center', gap: 10, flex: 1, paddingRight: 8 },
     filterIconChip: { width: 28, height: 28, borderRadius: 9, justifyContent: 'center', alignItems: 'center' },
@@ -1186,8 +1450,11 @@ const styles = StyleSheet.create({
     liveBadge: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#FEF2F2', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10, gap: 5 },
     liveDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: '#EF4444' },
     liveText: { fontSize: 11, color: '#EF4444', fontWeight: 'bold' },
-    discoveryBadge: { backgroundColor: '#EEF2FF', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10 },
+    discoveryBadge: { flexShrink: 0, backgroundColor: '#EEF2FF', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10 },
     discoveryBadgeText: { fontSize: 10, color: '#4F46E5', fontWeight: '800' },
+    // Mesmo vocabulário e mesma cor do selo temporal do Início e da Agenda.
+    journeyBadge: { flexShrink: 0, backgroundColor: '#EEF2FF', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10 },
+    journeyBadgeText: { fontSize: 10, color: '#4338CA', fontWeight: '900' },
     actions: { position: 'absolute', bottom: 20, right: 20, alignItems: 'center' },
     createButton: { borderRadius: 30, shadowColor: "#6366F1", shadowOffset: { width: 0, height: 6 }, shadowOpacity: 0.35, shadowRadius: 12, elevation: 8 },
     gradientButton: { flexDirection: 'row', alignItems: 'center', paddingVertical: 13, paddingHorizontal: 20, borderRadius: 30 },

@@ -11,6 +11,7 @@ import { ReportReasonModal } from '@/src/components/ReportReasonModal';
 import { markRelatedNotificationsAsRead } from '@/src/services/notificationReadService';
 import { submitReport } from '@/src/services/reportService';
 import { setActiveNotificationTarget } from '@/src/utils/Notifications';
+import { getDateStr, formatConversationDateHeader } from '@/src/utils/dateUtils';
 import { useFocusEffect } from '@react-navigation/native';
 
 function getErrorMessage(error: unknown): string {
@@ -112,7 +113,14 @@ export default function ChatScreen() {
     useEffect(() => {
         if (!conversationData?.participants || !auth.currentUser) return;
         const otherUid = conversationData.participants.find((participant) => participant !== auth.currentUser?.uid);
-        if (!otherUid) return;
+        // Sem outro participante: conversa gravada pela versão antiga da Function
+        // de exclusão de conta, que removia o uid de `participants`. O `return`
+        // silencioso daqui deixava `otherUserExists` no valor inicial `true`, e o
+        // campo de mensagem seguia habilitado para um destinatário inexistente.
+        if (!otherUid) {
+            setOtherUserExists(false);
+            return;
+        }
 
         const unsubscribeOtherUser = onSnapshot(doc(db, 'users', otherUid), (userSnap) => {
             setOtherUserExists(userSnap.exists());
@@ -247,12 +255,25 @@ export default function ChatScreen() {
 
     const renderMessage = ({ item, index }: { item: Message, index: number }) => {
         const isMe = item.senderId === auth.currentUser?.uid;
-        const isLastMessage = index === messages.length - 1; // Array is reversed natively, wait no it's normally sorted but we appended. Wait, the array is reversed? No, the array is in normal chronological order because we reversed the firebase result `msgs.reverse()`. So the last item is messages.length - 1.
+        // messages está em ordem cronológica ascendente (msgs.reverse() no listener acima),
+        // então o último item do array é sempre a mensagem mais recente.
+        const isLastMessage = index === messages.length - 1;
 
+        const messageDate = item.createdAt?.seconds ? new Date(item.createdAt.seconds * 1000) : null;
         let timeString = '';
-        if (item.createdAt?.seconds) {
-            timeString = new Date(item.createdAt.seconds * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        if (messageDate) {
+            timeString = messageDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         }
+
+        // Separador de data quando o dia muda em relação à mensagem anterior
+        // (ou na primeira mensagem carregada) — evita uma lista inteira só com
+        // horas, sem indicar quando cada grupo de mensagens aconteceu.
+        const previousMessage = index > 0 ? messages[index - 1] : undefined;
+        const previousMessageDate = previousMessage?.createdAt?.seconds
+            ? new Date(previousMessage.createdAt.seconds * 1000)
+            : null;
+        const showDateHeader = Boolean(messageDate)
+            && (!previousMessageDate || getDateStr(messageDate!) !== getDateStr(previousMessageDate));
 
         // Determinar status de leitura para a última mensagem enviada por mim
         let isRead = false;
@@ -264,31 +285,40 @@ export default function ChatScreen() {
         }
 
         return (
-            <View style={[styles.messageRow, isMe ? styles.myMessageRow : styles.otherMessageRow]}>
-                {!isMe && (
-                    <View style={styles.avatarPlaceholder}>
-                        <FontAwesome name="user" size={12} color="#fff" />
+            <>
+                {showDateHeader && messageDate && (
+                    <View style={styles.dateHeaderRow}>
+                        <View style={styles.dateHeaderPill}>
+                            <Text style={styles.dateHeaderText}>{formatConversationDateHeader(messageDate)}</Text>
+                        </View>
                     </View>
                 )}
-                <View style={[styles.bubble, isMe ? styles.myBubble : styles.otherBubble]}>
-                    <Text style={[styles.messageText, isMe ? styles.myMessageText : styles.otherMessageText]}>
-                        {item.text}
-                    </Text>
-                    <View style={styles.messageFooter}>
-                        <Text style={[styles.timeText, isMe ? styles.myTimeText : styles.otherTimeText]}>
-                            {timeString}
+                <View style={[styles.messageRow, isMe ? styles.myMessageRow : styles.otherMessageRow]}>
+                    {!isMe && (
+                        <View style={styles.avatarPlaceholder}>
+                            <FontAwesome name="user" size={12} color="#fff" />
+                        </View>
+                    )}
+                    <View style={[styles.bubble, isMe ? styles.myBubble : styles.otherBubble]}>
+                        <Text style={[styles.messageText, isMe ? styles.myMessageText : styles.otherMessageText]}>
+                            {item.text}
                         </Text>
-                        {isMe && isLastMessage && (
-                            <Ionicons 
-                                name={isRead ? "checkmark-done" : "checkmark"} 
-                                size={14} 
-                                color={isRead ? "#60a5fa" : "rgba(255,255,255,0.7)"} 
-                                style={{ marginLeft: 4 }}
-                            />
-                        )}
+                        <View style={styles.messageFooter}>
+                            <Text style={[styles.timeText, isMe ? styles.myTimeText : styles.otherTimeText]}>
+                                {timeString}
+                            </Text>
+                            {isMe && isLastMessage && (
+                                <Ionicons
+                                    name={isRead ? "checkmark-done" : "checkmark"}
+                                    size={14}
+                                    color={isRead ? "#60a5fa" : "rgba(255,255,255,0.7)"}
+                                    style={{ marginLeft: 4 }}
+                                />
+                            )}
+                        </View>
                     </View>
                 </View>
-            </View>
+            </>
         );
     };
 
@@ -373,13 +403,19 @@ export default function ChatScreen() {
                     <View style={styles.optionsContent}>
                         <Text style={styles.optionsTitle}>Opções do Chat</Text>
 
+                        {/* Ver perfil, bloquear e denunciar exigem alguém do outro
+                            lado: com a conta excluída seus handlers já retornavam
+                            sem fazer nada, o que na tela vira botão morto. Só
+                            "Apagar da Minha Lista" continua fazendo sentido. */}
+                        {otherUserExists && (
                         <TouchableOpacity style={styles.optionItem} onPress={handleViewProfile}>
                             <View style={[styles.optionIcon, { backgroundColor: '#eef2ff' }]}>
                                 <Ionicons name="person-outline" size={20} color="#4f46e5" />
                             </View>
                             <Text style={styles.optionText}>Ver Perfil</Text>
                         </TouchableOpacity>
-                        
+                        )}
+
                         <TouchableOpacity style={styles.optionItem} onPress={handleDeleteChat}>
                             <View style={[styles.optionIcon, { backgroundColor: '#fee2e2' }]}>
                                 <Ionicons name="trash-outline" size={20} color="#ef4444" />
@@ -387,19 +423,23 @@ export default function ChatScreen() {
                             <Text style={styles.optionTextRed}>Apagar da Minha Lista</Text>
                         </TouchableOpacity>
 
+                        {otherUserExists && (
                         <TouchableOpacity style={styles.optionItem} onPress={handleBlockUser}>
                             <View style={[styles.optionIcon, { backgroundColor: '#ffedd5' }]}>
                                 <Ionicons name="ban-outline" size={20} color="#f97316" />
                             </View>
                             <Text style={styles.optionTextOrange}>Bloquear Usuário</Text>
                         </TouchableOpacity>
+                        )}
 
+                        {otherUserExists && (
                         <TouchableOpacity style={styles.optionItem} onPress={handleReportUser}>
                             <View style={[styles.optionIcon, { backgroundColor: '#f3f4f6' }]}>
                                 <Ionicons name="warning-outline" size={20} color="#4b5563" />
                             </View>
                             <Text style={styles.optionText}>Denunciar</Text>
                         </TouchableOpacity>
+                        )}
                     </View>
                 </TouchableOpacity>
             </Modal>
@@ -426,6 +466,21 @@ const styles = StyleSheet.create({
     listContent: {
         paddingVertical: 16,
         paddingHorizontal: 16,
+    },
+    dateHeaderRow: {
+        alignItems: 'center',
+        marginBottom: 12,
+    },
+    dateHeaderPill: {
+        backgroundColor: '#E5E7EB',
+        borderRadius: 12,
+        paddingHorizontal: 12,
+        paddingVertical: 4,
+    },
+    dateHeaderText: {
+        fontSize: 12,
+        fontWeight: '700',
+        color: '#6B7280',
     },
     messageRow: {
         flexDirection: 'row',

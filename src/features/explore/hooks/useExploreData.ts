@@ -159,7 +159,6 @@ export function useExploreData(
                     if (fallbackLocation && isActive) {
                         setLocation(fallbackLocation);
                         setLocationStatus('granted');
-                        console.info('[ExploreData] location_acquired', { source: 'last_known' });
                     }
 
                     const providerStatus = await Location.getProviderStatusAsync();
@@ -191,7 +190,6 @@ export function useExploreData(
                         setLocation(loc);
                         setLocationStatus('granted');
                         setLocationIssue(null);
-                        console.info('[ExploreData] location_acquired', { source: 'fresh' });
                     }
                     const userId = auth.currentUser?.uid;
                     if (userId) {

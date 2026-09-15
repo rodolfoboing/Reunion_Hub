@@ -17,6 +17,7 @@ import { getNotificationTarget } from '../src/utils/Notifications';
 import { markRelatedNotificationsAsRead } from '../src/services/notificationReadService';
 import { savePushRegistration, unregisterCurrentPushDevice } from '../src/services/pushRegistrationService';
 import { ErrorBoundary as CustomErrorBoundary } from '../src/components/ErrorBoundary';
+import { CURRENT_TERMS_VERSION } from '../src/constants/legal';
 
 export {
   // Catch any errors thrown by the Layout component.
@@ -65,8 +66,6 @@ export default function RootLayout() {
   }, []);
 
   useEffect(() => {
-    console.log(`[ReunionHub Debug] Estado atual: loaded=${loaded}, authInitialized=${authInitialized}, user=${user ? 'Logged In' : 'Logged Out'}`);
-
     // Só tomamos ação quando TUDO estiver carregado (fontes + auth)
     if (loaded && authInitialized) {
       SplashScreen.hideAsync().catch(e => console.warn(e));
@@ -88,9 +87,16 @@ export default function RootLayout() {
           }
           // Cadastros novos gravam false explicitamente. Perfis antigos que já existiam
           // antes desse campo são tratados como concluídos e não voltam ao onboarding.
-          const target = snapshot.exists() && snapshot.data().isProfileComplete !== false
-            ? '/(drawer)/(tabs)'
-            : '/(auth)/onboarding';
+          // O onboarding vem antes do reaceite porque também é o caminho de
+          // recuperação de perfil inexistente (registro interrompido).
+          const profile = snapshot.data();
+          const needsOnboarding = !snapshot.exists() || profile?.isProfileComplete === false;
+          const needsTermsAcceptance = !needsOnboarding && profile?.termsVersion !== CURRENT_TERMS_VERSION;
+          const target = needsOnboarding
+            ? '/(auth)/onboarding'
+            : needsTermsAcceptance
+              ? '/(auth)/accept-terms'
+              : '/(drawer)/(tabs)';
           if (lastProfileRoute.current !== target) {
             lastProfileRoute.current = target;
             router.replace(target as never);
@@ -133,13 +139,11 @@ export default function RootLayout() {
     if (!user) return;
 
     setupNotifications().then(async (result) => {
-      console.log('[ReunionHub Debug] Permissões de notificação:', result.granted ? 'Concedidas' : 'Negadas');
       if (result.granted) {
         await refreshReengagementReminder(user.uid);
       }
       if (result.granted && (result.expoToken || result.nativeToken)) {
         await savePushRegistration(user.uid, result);
-        if (__DEV__) console.info('[Notifications] push_device_saved', { platform: result.platform });
       }
     }).catch((error: unknown) => reportNotificationOperationError('setup_or_registration', error));
 
@@ -187,7 +191,7 @@ export default function RootLayout() {
         }
       }
       if (route) {
-        console.log('[ReunionHub Debug] Abrindo notificação para:', route);
+        if (__DEV__) console.info('[Notifications] deep_link_opened', { route });
         router.push(route as never);
       }
       await Notifications.clearLastNotificationResponseAsync();
@@ -231,7 +235,6 @@ export default function RootLayout() {
     );
   }
 
-  console.log('[ReunionHub Debug] Renderizando RootLayoutNav');
   return <RootLayoutNav />;
 }
 

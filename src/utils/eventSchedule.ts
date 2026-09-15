@@ -71,6 +71,18 @@ export function getEventInterval(event: EventSchedule): { start: Date; end: Date
     return end ? { start, end } : null;
 }
 
+/**
+ * Dois eventos conflitam quando seus intervalos se sobrepõem. Encostar não é
+ * conflito: um evento que termina 19:00 e outro que começa 19:00 convivem.
+ * Sem intervalo válido em algum dos lados, não afirmamos conflito.
+ */
+export function eventsOverlap(first: EventSchedule, second: EventSchedule): boolean {
+    const firstInterval = getEventInterval(first);
+    const secondInterval = getEventInterval(second);
+    if (!firstInterval || !secondInterval) return false;
+    return firstInterval.start < secondInterval.end && secondInterval.start < firstInterval.end;
+}
+
 export function getEventDurationIssue(event: EventSchedule): EventDurationIssue {
     const interval = getEventInterval(event);
     if (!interval || interval.end <= interval.start) return 'invalid';
@@ -195,7 +207,17 @@ export function getEventJourneyState(
 
     const interval = getEventInterval(event);
     if (!interval) {
-        return { phase: 'upcoming', label: 'AGENDADO', compactLabel: 'AGENDADO', title: 'Evento agendado', message: 'Confira a data e o horário antes de participar.', tone: 'info' };
+        // Sem intervalo válido o evento está com dado incompleto ou corrompido —
+        // não é um evento saudável marcado para daqui a alguns dias. Os dois
+        // estados diziam "AGENDADO", e um problema de dado se disfarçava de
+        // normal. `tone: 'warning'` para a tela de detalhe destacar (é o único
+        // consumidor de `tone`, em app/event/[id].tsx).
+        return {
+            phase: 'upcoming', label: 'DATA A CONFIRMAR', compactLabel: 'A CONFIRMAR',
+            title: 'Horário indisponível',
+            message: 'Este evento está sem data ou horário válidos. Consulte o organizador antes de confirmar presença.',
+            tone: 'warning',
+        };
     }
 
     if (now >= interval.end) {

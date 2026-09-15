@@ -9,6 +9,7 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { ReportReasonModal } from '@/src/components/ReportReasonModal';
 import { ErrorState } from '@/src/components/ErrorState';
 import { submitReport } from '@/src/services/reportService';
+import { formatRelativeMessageTimestamp } from '@/src/utils/dateUtils';
 
 function getErrorMessage(error: unknown): string {
     return error instanceof Error ? error.message : '';
@@ -134,10 +135,21 @@ export default function MessagesScreen() {
         }
     };
 
+    /**
+     * `undefined` aqui significa que a conversa não tem outro participante: é o
+     * rastro de uma exclusão de conta feita pela versão antiga da Function, que
+     * removia o uid de `participants`. A Function não faz mais isso, mas as
+     * conversas gravadas antes continuam assim no banco — por isso o cliente
+     * precisa reconhecer o caso em vez de cair no genérico "Usuário".
+     */
+    const getOtherParticipantUid = (conversation: any): string | undefined =>
+        conversation.participants?.find((p: string) => p !== auth.currentUser?.uid);
+
     const getOtherParticipantName = (conversation: any) => {
         if (!auth.currentUser) return 'Chat';
-        const otherUid = conversation.participants.find((p: string) => p !== auth.currentUser?.uid);
-        return conversation.participantNames?.[otherUid] || 'Usuário';
+        const otherUid = getOtherParticipantUid(conversation);
+        if (!otherUid) return 'Usuário excluído';
+        return conversation.participantNames?.[otherUid] || 'Usuário excluído';
     };
 
     const openOptions = (chat: any) => {
@@ -164,8 +176,12 @@ export default function MessagesScreen() {
 
     const handleBlockUser = () => {
         if (!selectedChat || !auth.currentUser) return;
-        const otherUid = selectedChat.participants.find((p: string) => p !== auth.currentUser?.uid);
-        const otherName = selectedChat.participantNames?.[otherUid] || 'Usuário';
+        const otherUid = getOtherParticipantUid(selectedChat);
+        if (!otherUid) {
+            Alert.alert('Conta excluída', 'Esta pessoa excluiu a conta. Não há mais ninguém para bloquear — você pode apagar a conversa.');
+            return;
+        }
+        const otherName = getOtherParticipantName(selectedChat);
 
         Alert.alert('Bloquear Usuário', `Tem certeza que deseja bloquear ${otherName}? Vocês não poderão mais trocar mensagens.`, [
             { text: 'Cancelar', style: 'cancel' },
@@ -244,7 +260,7 @@ export default function MessagesScreen() {
                         <View style={{ flexDirection: 'row', alignItems: 'center' }}>
                             {item.lastMessageTimestamp?.seconds && (
                                 <Text style={[styles.time, isUnread && styles.timeUnread]}>
-                                    {new Date(item.lastMessageTimestamp.seconds * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                    {formatRelativeMessageTimestamp(new Date(item.lastMessageTimestamp.seconds * 1000))}
                                 </Text>
                             )}
                             <TouchableOpacity style={styles.optionsBtn} onPress={() => openOptions(item)}>

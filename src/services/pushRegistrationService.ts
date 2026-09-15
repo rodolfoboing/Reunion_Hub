@@ -10,13 +10,30 @@ function createDeviceId(): string {
     return `device_${Date.now().toString(36)}_${randomParts.join('')}`;
 }
 
-async function getPushDeviceId(): Promise<string> {
-    const storedId = await AsyncStorage.getItem(PUSH_DEVICE_ID_KEY);
-    if (storedId?.startsWith('device_') && storedId.length <= 100) return storedId;
+let cachedDeviceIdPromise: Promise<string> | null = null;
 
-    const deviceId = createDeviceId();
-    await AsyncStorage.setItem(PUSH_DEVICE_ID_KEY, deviceId);
-    return deviceId;
+// Memoizado: sem isso, duas chamadas concorrentes na primeira execução (ex.:
+// setupNotifications() e o listener de token do expo-notifications disparando
+// quase juntos, comum no primeiro login num aparelho novo) podiam ler o
+// AsyncStorage antes de qualquer uma gravar, cada uma gerando um deviceId
+// diferente — dois documentos pushDevices para o mesmo aparelho, e toda
+// notificação do servidor saía duplicada dali em diante.
+function getPushDeviceId(): Promise<string> {
+    if (!cachedDeviceIdPromise) {
+        cachedDeviceIdPromise = (async () => {
+            const storedId = await AsyncStorage.getItem(PUSH_DEVICE_ID_KEY);
+            if (storedId?.startsWith('device_') && storedId.length <= 100) return storedId;
+
+            const deviceId = createDeviceId();
+            await AsyncStorage.setItem(PUSH_DEVICE_ID_KEY, deviceId);
+            return deviceId;
+        })().catch((error) => {
+            cachedDeviceIdPromise = null; // permite tentar de novo na próxima chamada em vez de travar a sessão inteira
+            console.warn('[PushRegistration] device_id_failed');
+            throw error;
+        });
+    }
+    return cachedDeviceIdPromise;
 }
 
 export async function savePushRegistration(userId: string, registration: PushRegistration): Promise<void> {
@@ -29,6 +46,13 @@ export async function savePushRegistration(userId: string, registration: PushReg
         nativePushToken: registration.nativeToken,
         platform: registration.platform,
         updatedAt: serverTimestamp(),
+    });
+    // Nunca logar o valor dos tokens (§14) — só a presença deles.
+    if (__DEV__) console.info('[PushRegistration] device_saved', {
+        deviceId,
+        platform: registration.platform,
+        hasExpoToken: Boolean(registration.expoToken),
+        hasNativeToken: Boolean(registration.nativeToken),
     });
 
     // Migração segura: o servidor novo envia apenas para registros por dispositivo.

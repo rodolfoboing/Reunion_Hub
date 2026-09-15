@@ -1,5 +1,5 @@
 import { View, Text, StyleSheet, ScrollView, Alert, TouchableOpacity, Image, TextInput, Linking, Switch, AppState, KeyboardAvoidingView, Platform, Modal } from 'react-native';
-import { Dispatch, SetStateAction, useEffect, useState } from 'react';
+import { Dispatch, SetStateAction, useEffect, useRef, useState } from 'react';
 import { auth, db, functions } from '../../src/services/firebaseConfig';
 import { httpsCallable } from 'firebase/functions';
 import { deleteField, doc, setDoc, onSnapshot, serverTimestamp } from 'firebase/firestore';
@@ -19,17 +19,16 @@ import { toUserProfile } from '../../src/utils/userProfile';
 import { unregisterCurrentPushDevice } from '@/src/services/pushRegistrationService';
 import { setEventRemindersEnabled, setReengagementReminderEnabled } from '@/src/utils/Notifications';
 import { clearRecommendationLocationCache } from '@/src/services/recommendationLocationService';
-import { isValidNickname, NicknameUnavailableError, updateOwnProfile, uploadProfileImage } from '@/src/services/profileService';
+import { isValidNickname, NicknameUnavailableError, normalizeNickname, updateOwnProfile, uploadProfileImage } from '@/src/services/profileService';
 import { DEFAULT_NOTIFICATION_SETTINGS } from '@/src/constants/userPreferences';
+import { getFirebaseErrorCode } from '@/src/utils/authError';
+
+const VERIFICATION_RESEND_COOLDOWN_SECONDS = 60;
+const BIO_MAX_LENGTH = 300;
+const MAX_INTERESTS = 10;
 
 function profileLog(event: string, context: Record<string, boolean | number> = {}) {
     if (__DEV__) console.info(`[Profile] ${event}`, context);
-}
-
-function getErrorCode(error: unknown): string | undefined {
-    if (typeof error !== 'object' || error === null || !('code' in error)) return undefined;
-    const code = (error as { code?: unknown }).code;
-    return typeof code === 'string' ? code : undefined;
 }
 
 export default function ProfileScreen() {
@@ -61,6 +60,14 @@ export default function ProfileScreen() {
     const [profileConfirmationPassword, setProfileConfirmationPassword] = useState('');
     const [showDeleteConfirmation, setShowDeleteConfirmation] = useState(false);
     const [deleteConfirmationPassword, setDeleteConfirmationPassword] = useState('');
+    const [verificationResendCooldown, setVerificationResendCooldown] = useState(0);
+
+    // O listener de notificationSettings roda com deps [] e não enxergaria um
+    // isEditing novo. O ref mantém o valor atual acessível dentro do snapshot.
+    const isEditingRef = useRef(isEditing);
+    useEffect(() => {
+        isEditingRef.current = isEditing;
+    }, [isEditing]);
 
     const resetPasswordEditor = () => {
         setShowPasswordEditor(false);
@@ -91,7 +98,7 @@ export default function ProfileScreen() {
     };
 
     const showReauthenticationError = (error: unknown) => {
-        const code = getErrorCode(error);
+        const code = getFirebaseErrorCode(error);
         if (code === 'auth/wrong-password' || code === 'auth/invalid-credential') {
             Alert.alert('Senha atual incorreta', 'Confira a senha atual e tente novamente.');
         } else if (code === 'auth/too-many-requests') {
@@ -138,6 +145,10 @@ export default function ProfileScreen() {
                 notifyRecommendations: data?.notifyRecommendations !== false,
             };
             setSavedNotificationSettings(settings);
+            // Não sobrescreve o que está sendo editado: este mesmo documento também
+            // recebe escrita em segundo plano (recommendationLocation, gravado pela
+            // aba Explorar), e o snapshot resultante descartava os switches do usuário.
+            if (isEditingRef.current) return;
             setNotifyMessages(settings.notifyMessages);
             setNotifyEventUpdates(settings.notifyEventUpdates);
             setNotifyEventReminders(settings.notifyEventReminders);
@@ -165,14 +176,19 @@ export default function ProfileScreen() {
         }
     };
 
+    // `emailVerified` vem do token em cache do Auth e só muda após um reload().
+    // Antes isso dependia de `emailVerificationSent`, que vive só nesta sessão:
+    // quem abria o link em outro aparelho, ou reabria o app depois, continuava
+    // vendo "não verificado" — e bloqueado para criar evento — até relogar.
+    // Agora tenta enquanto não estiver verificado, e para assim que estiver.
     useEffect(() => {
+        if (isEmailVerified) return;
+        refreshEmailVerification();
         const subscription = AppState.addEventListener('change', (state) => {
-            if (state === 'active' && emailVerificationSent) {
-                refreshEmailVerification();
-            }
+            if (state === 'active') refreshEmailVerification();
         });
         return () => subscription.remove();
-    }, [emailVerificationSent]);
+    }, [isEmailVerified]);
 
     const startEditing = () => {
         setEditBio(userProfile?.bio || '');
@@ -224,7 +240,7 @@ export default function ProfileScreen() {
             profileLog('password_changed');
             Alert.alert('Senha alterada', 'Sua nova senha já está ativa.');
         } catch (error) {
-            const code = getErrorCode(error);
+            const code = getFirebaseErrorCode(error);
             console.error('[Profile] password_change_failed', { code });
             setCurrentPassword('');
             if (code === 'auth/weak-password') {
@@ -240,53 +256,88 @@ export default function ProfileScreen() {
     const toggleEditSelection = (item: string, list: string[], setList: Dispatch<SetStateAction<string[]>>) => {
         if (list.includes(item)) {
             setList(list.filter((i: string) => i !== item));
-        } else {
-            setList([...list, item]);
+            return;
         }
+        // Marcar tudo faz o perfil casar com qualquer evento e esvazia o sentido
+        // da recomendação — mesmo teto de 10 usado na criação de evento.
+        if (list.length >= MAX_INTERESTS) {
+            Alert.alert('Limite de interesses', `Escolha até ${MAX_INTERESTS} interesses para manter as recomendações relevantes.`);
+            return;
+        }
+        setList([...list, item]);
     };
 
     const pickImage = async () => {
-        let result = await ImagePicker.launchImageLibraryAsync({
-            mediaTypes: ['images'],
-            allowsEditing: true,
-            aspect: [1, 1],
-            quality: 0.5,
-            base64: true,
-        });
+        try {
+            // Sem base64: só a uri é usada no upload, e pedir base64 alocava a
+            // imagem inteira em memória à toa.
+            const result = await ImagePicker.launchImageLibraryAsync({
+                mediaTypes: ['images'],
+                allowsEditing: true,
+                aspect: [1, 1],
+                quality: 0.5,
+            });
 
-        if (!result.canceled) {
-            setEditPhotoURL(result.assets[0].uri);
+            if (!result.canceled) {
+                setEditPhotoURL(result.assets[0].uri);
+            }
+        } catch (error) {
+            console.error('[Profile] image_pick_failed', { code: getFirebaseErrorCode(error) });
+            Alert.alert('Não foi possível abrir a galeria', 'Verifique a permissão de fotos do app e tente novamente.');
         }
     };
+
+    const nickHasChanged = () => normalizeNickname(editNick) !== (userProfile?.searchName ?? '');
 
     const requestProfileSave = () => {
         if (!isValidNickname(editNick)) {
             Alert.alert('Nick inválido', 'O nick deve ter de 3 a 20 caracteres: letras, números, ponto, hífen ou sublinhado.');
             return;
         }
-        setProfileConfirmationPassword('');
-        setShowProfileSaveConfirmation(true);
+        // Senha só na troca de nick: é o único campo de identidade pública (risco
+        // de impersonação). Bio, interesses, foto e preferências salvam direto —
+        // nem o Firebase nem as firestore.rules exigiam reautenticação para eles,
+        // era um portão só do cliente que cobrava senha para virar um switch.
+        if (nickHasChanged()) {
+            setProfileConfirmationPassword('');
+            setShowProfileSaveConfirmation(true);
+            return;
+        }
+        void persistProfile();
     };
 
+    /** Handler do modal de senha: reautentica e então persiste. */
     const saveProfile = async () => {
         if (loading) return;
-        const user = auth.currentUser;
-        if (!user) return;
+        if (!auth.currentUser) return;
         if (!profileConfirmationPassword) {
-            Alert.alert('Senha necessária', 'Digite sua senha atual antes de salvar o perfil.');
+            Alert.alert('Senha necessária', 'Digite sua senha atual para confirmar a troca de nick.');
             return;
         }
 
         setLoading(true);
-
+        let reauthenticated = false;
         try {
-            const reauthenticated = await reauthenticateCurrentUser(profileConfirmationPassword);
-            if (!reauthenticated) {
-                setProfileConfirmationPassword('');
-                return;
-            }
-            resetProfileSaveConfirmation();
+            reauthenticated = await reauthenticateCurrentUser(profileConfirmationPassword);
+        } catch (error) {
+            console.warn('[Profile] profile_reauthentication_failed', { code: getFirebaseErrorCode(error) });
+            showReauthenticationError(error);
+        } finally {
+            setLoading(false);
+        }
 
+        setProfileConfirmationPassword('');
+        if (!reauthenticated) return;
+        resetProfileSaveConfirmation();
+        await persistProfile();
+    };
+
+    const persistProfile = async () => {
+        const user = auth.currentUser;
+        if (!user) return;
+
+        setLoading(true);
+        try {
             profileLog('profile_save_started', { interestsCount: editInterests.length, hasPhoto: Boolean(editPhotoURL) });
 
             let finalPhotoURL = userProfile?.photoURL || user.photoURL || null;
@@ -328,7 +379,7 @@ export default function ProfileScreen() {
                     photoURL: finalPhotoURL
                 });
             } catch (authProfileError) {
-                console.warn('[Profile] auth_profile_sync_failed', { code: getErrorCode(authProfileError) });
+                console.warn('[Profile] auth_profile_sync_failed', { code: getFirebaseErrorCode(authProfileError) });
             }
 
             resetPasswordEditor();
@@ -337,33 +388,43 @@ export default function ProfileScreen() {
             profileLog('profile_saved', { interestsCount: normalizedInterests.length, hasPhoto: Boolean(finalPhotoURL) });
             Alert.alert('Sucesso', 'Perfil atualizado!');
         } catch (error) {
-            const code = getErrorCode(error);
+            // A reautenticação já aconteceu em saveProfile; aqui só sobram falhas
+            // de escrita (Firestore/Storage) e a colisão de nick.
             if (error instanceof NicknameUnavailableError) {
                 Alert.alert('Nick indisponível', 'Este nick já pertence a outra pessoa. Escolha outro.');
-            } else if (code?.startsWith('auth/')) {
-                console.warn('[Profile] profile_reauthentication_failed', { code });
-                setProfileConfirmationPassword('');
-                showReauthenticationError(error);
             } else {
-                console.error('[Profile] profile_save_failed', { code });
-                Alert.alert('Erro', 'Sua identidade foi confirmada, mas houve uma falha ao salvar o perfil. Tente novamente.');
+                console.error('[Profile] profile_save_failed', { code: getFirebaseErrorCode(error) });
+                Alert.alert('Erro', 'Não foi possível salvar o perfil. Tente novamente.');
             }
         } finally {
             setLoading(false);
         }
     };
 
+    // Contagem regressiva do reenvio: antes, emailVerificationSent desabilitava o
+    // botão para sempre — se o e-mail não chegasse, não havia como pedir de novo.
+    useEffect(() => {
+        if (verificationResendCooldown <= 0) return;
+        const timer = setTimeout(() => setVerificationResendCooldown((current) => current - 1), 1000);
+        return () => clearTimeout(timer);
+    }, [verificationResendCooldown]);
+
     const handleVerifyEmail = async () => {
         const user = auth.currentUser;
-        if (!user || emailVerificationSent || isEmailVerified) return;
+        if (!user || isEmailVerified || verificationResendCooldown > 0) return;
         try {
             await sendEmailVerification(user);
             setEmailVerificationSent(true);
+            setVerificationResendCooldown(VERIFICATION_RESEND_COOLDOWN_SECONDS);
             profileLog('email_verification_sent');
             Alert.alert('E-mail enviado', 'Abra o link recebido. Ao voltar ao app, a confirmação será atualizada automaticamente.');
         } catch (error) {
-            console.error('[Profile] email_verification_send_failed', { code: getErrorCode(error) });
-            Alert.alert('Erro', 'Não foi possível enviar o e-mail. Aguarde um momento e tente novamente.');
+            const code = getFirebaseErrorCode(error);
+            console.error('[Profile] email_verification_send_failed', { code });
+            // Sem cooldown quando falhou: o usuário precisa poder tentar de novo.
+            Alert.alert('Erro', code === 'auth/too-many-requests'
+                ? 'Muitas tentativas seguidas. Aguarde alguns minutos e tente novamente.'
+                : 'Não foi possível enviar o e-mail. Aguarde um momento e tente novamente.');
         }
     };
 
@@ -380,7 +441,7 @@ export default function ProfileScreen() {
             profileLog('logout_completed');
             router.replace('/login');
         } catch (error) {
-            console.error('[Profile] logout_failed', { code: getErrorCode(error) });
+            console.error('[Profile] logout_failed', { code: getFirebaseErrorCode(error) });
             Alert.alert('Erro', 'Falha ao sair.');
         }
     };
@@ -425,12 +486,12 @@ export default function ProfileScreen() {
             await httpsCallable<Record<string, never>, { ok: boolean }>(functions, 'deleteMyAccount')({});
             setShowDeleteConfirmation(false);
             await auth.signOut().catch((signOutError: unknown) => {
-                console.warn('[Profile] account_deleted_local_signout_failed', { code: getErrorCode(signOutError) });
+                console.warn('[Profile] account_deleted_local_signout_failed', { code: getFirebaseErrorCode(signOutError) });
             });
             profileLog('account_deletion_completed');
             router.replace('/login');
         } catch (error) {
-            const code = getErrorCode(error);
+            const code = getFirebaseErrorCode(error);
             setDeleteConfirmationPassword('');
             if (code?.startsWith('auth/')) {
                 console.warn('[Profile] account_deletion_reauthentication_failed', { code });
@@ -483,15 +544,21 @@ export default function ProfileScreen() {
                         <Text style={[styles.email, {marginTop: 0}]}>{auth.currentUser.email}</Text>
                         <TouchableOpacity
                             onPress={handleVerifyEmail}
-                            disabled={emailVerificationSent}
-                            style={{ marginLeft: 8, backgroundColor: emailVerificationSent ? '#F3F4F6' : '#FEF2F2', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 12 }}
+                            disabled={verificationResendCooldown > 0}
+                            accessibilityRole="button"
+                            accessibilityLabel="Enviar e-mail de verificação"
+                            style={{ marginLeft: 8, backgroundColor: verificationResendCooldown > 0 ? '#F3F4F6' : '#FEF2F2', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 12 }}
                         >
-                            <Text style={{fontSize: 10, color: emailVerificationSent ? '#6B7280' : '#EF4444', fontWeight: 'bold'}}>{emailVerificationSent ? 'E-mail enviado' : 'Verificar e-mail'}</Text>
+                            <Text style={{fontSize: 10, color: verificationResendCooldown > 0 ? '#6B7280' : '#EF4444', fontWeight: 'bold'}}>
+                                {verificationResendCooldown > 0
+                                    ? `Reenviar em ${verificationResendCooldown}s`
+                                    : emailVerificationSent ? 'Reenviar e-mail' : 'Verificar e-mail'}
+                            </Text>
                         </TouchableOpacity>
                     </View>
                 )}
 
-                {!isEmailVerified && emailVerificationSent && (
+                {!isEmailVerified && (
                     <TouchableOpacity onPress={refreshEmailVerification} disabled={checkingEmailVerification} style={styles.refreshVerificationButton}>
                         <FontAwesome name="refresh" size={12} color="#4F46E5" />
                         <Text style={styles.refreshVerificationText}>{checkingEmailVerification ? 'Verificando...' : 'Já verifiquei'}</Text>
@@ -538,6 +605,7 @@ export default function ProfileScreen() {
                         numberOfLines={3}
                         value={editBio}
                         onChangeText={setEditBio}
+                        maxLength={BIO_MAX_LENGTH}
                     />
                 ) : (
                     userProfile?.bio && <Text style={styles.bio}>{userProfile.bio}</Text>
@@ -546,11 +614,21 @@ export default function ProfileScreen() {
 
             {!isEditing && (
             <View style={styles.statsCard}>
-                <View style={styles.statItem}>
+                {/* A explicação da reputação já existe no Manual e nos Termos; aqui só
+                    damos o atalho, em vez de manter uma terceira cópia da regra. */}
+                <TouchableOpacity
+                    style={styles.statItem}
+                    onPress={() => setShowManualModal(true)}
+                    accessibilityRole="button"
+                    accessibilityLabel="Entenda como funciona a reputação"
+                >
                     <FontAwesome name="star" size={24} color="#fbbf24" />
                     <Text style={styles.statValue}>{userProfile?.reputation || 0}</Text>
-                    <Text style={styles.statLabel}>Reputação</Text>
-                </View>
+                    <View style={styles.statLabelRow}>
+                        <Text style={styles.statLabel}>Reputação</Text>
+                        <FontAwesome name="question-circle" size={12} color="#9ca3af" />
+                    </View>
+                </TouchableOpacity>
                 <View style={styles.divider} />
                 <View style={styles.statItem}>
                     <FontAwesome name="calendar-check-o" size={24} color="#6366f1" />
@@ -575,7 +653,7 @@ export default function ProfileScreen() {
                         </View>
                         <View style={styles.securityHeaderText}>
                             <Text style={styles.sectionTitleCompact}>Segurança</Text>
-                            <Text style={styles.privacyDescription}>Sua senha atual será solicitada ao salvar qualquer mudança. Você também pode alterá-la abaixo.</Text>
+                            <Text style={styles.privacyDescription}>Sua senha atual é solicitada ao trocar o nick, já que é por ele que as pessoas te identificam. Você também pode alterá-la abaixo.</Text>
                         </View>
                     </View>
 
@@ -825,7 +903,7 @@ export default function ProfileScreen() {
                             <FontAwesome name="shield" size={22} color="#4F46E5" />
                         </View>
                         <Text style={styles.confirmationTitle}>Confirme que é você</Text>
-                        <Text style={styles.confirmationDescription}>Digite sua senha atual para salvar as alterações do perfil.</Text>
+                        <Text style={styles.confirmationDescription}>Você está trocando seu nick, o nome pelo qual as pessoas te encontram. Digite sua senha atual para confirmar.</Text>
                         <TextInput
                             style={styles.passwordInput}
                             value={profileConfirmationPassword}
@@ -840,7 +918,7 @@ export default function ProfileScreen() {
                             autoFocus
                             onSubmitEditing={saveProfile}
                             returnKeyType="done"
-                            accessibilityLabel="Senha atual para salvar o perfil"
+                            accessibilityLabel="Senha atual para confirmar a troca de nick"
                         />
                         <StyledButton title="Confirmar e salvar" onPress={saveProfile} isLoading={loading} />
                         <TouchableOpacity
@@ -848,7 +926,7 @@ export default function ProfileScreen() {
                             onPress={resetProfileSaveConfirmation}
                             disabled={loading}
                             accessibilityRole="button"
-                            accessibilityLabel="Cancelar confirmação do perfil"
+                            accessibilityLabel="Cancelar a troca de nick"
                         >
                             <Text style={styles.passwordCancelText}>Voltar à edição</Text>
                         </TouchableOpacity>
@@ -935,6 +1013,7 @@ const styles = StyleSheet.create({
         shadowOpacity: 0.05, shadowRadius: 4, elevation: 2
     },
     statItem: { flex: 1, alignItems: 'center' },
+    statLabelRow: { flexDirection: 'row', alignItems: 'center', gap: 4 },
     divider: { width: 1, backgroundColor: '#e5e7eb' },
     statValue: { fontSize: 24, fontWeight: 'bold', color: '#1f2937', marginTop: 8 },
     statLabel: { fontSize: 14, color: '#6b7280' },
@@ -1003,9 +1082,6 @@ const styles = StyleSheet.create({
     },
     editBtnText: {
         fontSize: 12, fontWeight: 'bold', color: '#6366f1', marginLeft: 6
-    },
-    actionButtons: {
-        flexDirection: 'row', justifyContent: 'space-between'
     },
     // Menu Legal/Suporte
     menuContainer: { backgroundColor: '#f9fafb', borderRadius: 16, overflow: 'hidden', borderWidth: 1, borderColor: '#f3f4f6' },

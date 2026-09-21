@@ -14,8 +14,9 @@ import { CONFIG } from '../../../src/constants/Config';
 import { normalizeDate, getTodayStr, getDateAfterDays } from '../../../src/utils/dateUtils';
 import { formatEventTimeRange, getEventJourneyState, hasEventEnded, isEventInProgress, isEventToday } from '../../../src/utils/eventSchedule';
 import { useEventClock } from '../../../src/hooks/useEventClock';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { ManualModal } from '../../../src/components/ManualModal';
+import { ScreenTutorialModal } from '../../../src/components/ScreenTutorialModal';
+import { useFirstVisitTutorial } from '../../../src/hooks/useFirstVisitTutorial';
 import { normalizeInterests } from '../../../src/constants/Interests';
 import { DISCOVERY_REASON_BADGE_LABELS, DiscoveryReason, getDiscoveryBadgeReason, getEventDiscovery, isMeetingNearby, isNewMeeting, shouldSuggestEvent } from '../../../src/utils/eventDiscovery';
 
@@ -77,27 +78,15 @@ export default function HomeScreen() {
 
   const isMounted = useRef(true);
 
-  useEffect(() => {
-    const checkFirstTime = async () => {
-      try {
-        const hasSeen = await AsyncStorage.getItem('@reunionhub_has_seen_manual');
-        if (hasSeen !== 'true') {
-          setShowManualModal(true);
-        }
-      } catch (e) {
-        console.error('[Index] Erro ao ler flag do manual:', e);
-      }
-    };
-    checkFirstTime();
-  }, []);
+  // A primeira execução abria o manual completo, de 12 passos. Quem acaba de
+  // instalar não lê isso — e, com o tutorial curto em cada tela, o Início
+  // mostraria dois popups em sequência. Agora o manual fica a um toque, pelo
+  // botão secundário do tutorial, e também pela reputação em Perfil.
+  const { visible: showTutorial, dismiss: dismissTutorial } = useFirstVisitTutorial('inicio');
 
-  const handleCloseManual = async () => {
-    try {
-      await AsyncStorage.setItem('@reunionhub_has_seen_manual', 'true');
-    } catch (e) {
-      console.error('[Index] Erro ao salvar flag do manual:', e);
-    }
-    setShowManualModal(false);
+  const openManualFromTutorial = () => {
+    void dismissTutorial();
+    setShowManualModal(true);
   };
 
   useEffect(() => {
@@ -583,10 +572,16 @@ export default function HomeScreen() {
         </>
       )}
     </ScrollView>
+    <ScreenTutorialModal
+        screen="inicio"
+        visible={showTutorial}
+        onClose={() => void dismissTutorial()}
+        secondaryActionLabel="Ver o manual completo"
+        onSecondaryAction={openManualFromTutorial}
+    />
     <ManualModal
         visible={showManualModal}
-        onClose={handleCloseManual}
-        isFirstTime={true}
+        onClose={() => setShowManualModal(false)}
     />
     </>
   );

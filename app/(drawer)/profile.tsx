@@ -16,6 +16,9 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { INTERESTS_OPTIONS, normalizeInterests } from '../../src/constants/Interests';
 import { User } from '../../src/types';
 import { toUserProfile } from '../../src/utils/userProfile';
+import { BIO_MAX_LENGTH, NICK_MAX_LENGTH, PASSWORD_MAX_LENGTH } from '@/src/constants/textLimits';
+import { ScreenTutorialModal } from '@/src/components/ScreenTutorialModal';
+import { useFirstVisitTutorial } from '@/src/hooks/useFirstVisitTutorial';
 import { unregisterCurrentPushDevice } from '@/src/services/pushRegistrationService';
 import { setEventRemindersEnabled, setReengagementReminderEnabled } from '@/src/utils/Notifications';
 import { clearRecommendationLocationCache } from '@/src/services/recommendationLocationService';
@@ -24,7 +27,8 @@ import { DEFAULT_NOTIFICATION_SETTINGS } from '@/src/constants/userPreferences';
 import { getFirebaseErrorCode } from '@/src/utils/authError';
 
 const VERIFICATION_RESEND_COOLDOWN_SECONDS = 60;
-const BIO_MAX_LENGTH = 300;
+// BIO_MAX_LENGTH vinha declarado aqui E em onboarding.tsx, com o mesmo valor:
+// dois lugares para mudar e nenhuma garantia de que mudariam juntos.
 const MAX_INTERESTS = 10;
 
 function profileLog(event: string, context: Record<string, boolean | number> = {}) {
@@ -38,6 +42,7 @@ export default function ProfileScreen() {
     const [editNick, setEditNick] = useState('');
     const [editInterests, setEditInterests] = useState<string[]>([]);
     const [shareFrequentedPlaces, setShareFrequentedPlaces] = useState(true);
+    const [showFoundedPlaces, setShowFoundedPlaces] = useState(true);
     const [showPopularOutsideInterests, setShowPopularOutsideInterests] = useState(true);
     const [notifyMessages, setNotifyMessages] = useState(true);
     const [notifyEventUpdates, setNotifyEventUpdates] = useState(true);
@@ -48,6 +53,7 @@ export default function ProfileScreen() {
     const [loading, setLoading] = useState(false);
     const [showTermsModal, setShowTermsModal] = useState(false);
     const [showManualModal, setShowManualModal] = useState(false);
+    const { visible: showTutorial, dismiss: dismissTutorial } = useFirstVisitTutorial('perfil');
     const [isEmailVerified, setIsEmailVerified] = useState(auth.currentUser?.emailVerified ?? false);
     const [emailVerificationSent, setEmailVerificationSent] = useState(false);
     const [checkingEmailVerification, setCheckingEmailVerification] = useState(false);
@@ -195,6 +201,7 @@ export default function ProfileScreen() {
         setEditNick(userProfile?.nick || auth.currentUser?.displayName?.replace(/\s/g, '').toLowerCase() || '');
         setEditInterests(normalizeInterests(userProfile?.interests));
         setShareFrequentedPlaces(userProfile?.shareFrequentedPlaces !== false);
+        setShowFoundedPlaces(userProfile?.showFoundedPlaces !== false);
         setShowPopularOutsideInterests(userProfile?.showPopularOutsideInterests !== false);
         setNotifyMessages(savedNotificationSettings.notifyMessages);
         setNotifyEventUpdates(savedNotificationSettings.notifyEventUpdates);
@@ -356,6 +363,7 @@ export default function ProfileScreen() {
                 photoURL: finalPhotoURL,
                 showPopularOutsideInterests,
                 shareFrequentedPlaces,
+                showFoundedPlaces,
             });
             await setDoc(doc(db, 'notificationSettings', user.uid), {
                 notifyMessages,
@@ -592,6 +600,7 @@ export default function ProfileScreen() {
                             value={editNick}
                             onChangeText={setEditNick}
                             autoCapitalize="none"
+                            maxLength={NICK_MAX_LENGTH}
                         />
                         <Text style={styles.label}>Bio</Text>
                     </>
@@ -636,11 +645,22 @@ export default function ProfileScreen() {
                     <Text style={styles.statLabel}>Participações</Text>
                 </View>
                 <View style={styles.divider} />
-                <View style={styles.statItem}>
+                {/* A bandeira abre a lista dos lugares inaugurados. O número sozinho
+                    não dizia QUAIS lugares eram — e essa é a informação que dá
+                    sentido ao título. */}
+                <TouchableOpacity
+                    style={styles.statItem}
+                    onPress={() => auth.currentUser && router.push(`/founded-places/${auth.currentUser.uid}` as never)}
+                    accessibilityRole="button"
+                    accessibilityLabel="Ver os lugares que você fundou"
+                >
                     <FontAwesome name="flag" size={24} color="#10b981" />
                     <Text style={styles.statValue}>{userProfile?.foundedPlacesCount || 0}</Text>
-                    <Text style={styles.statLabel}>Fundador</Text>
-                </View>
+                    <View style={styles.statLabelRow}>
+                        <Text style={styles.statLabel}>Fundador</Text>
+                        <FontAwesome name="angle-right" size={13} color="#9ca3af" />
+                    </View>
+                </TouchableOpacity>
             </View>
 
             )}
@@ -679,6 +699,7 @@ export default function ProfileScreen() {
                                 autoCapitalize="none"
                                 autoCorrect={false}
                                 textContentType="password"
+                                maxLength={PASSWORD_MAX_LENGTH}
                                 editable={!changingPassword}
                             />
                             <Text style={styles.passwordLabel}>Nova senha</Text>
@@ -691,6 +712,7 @@ export default function ProfileScreen() {
                                 autoCapitalize="none"
                                 autoCorrect={false}
                                 textContentType="newPassword"
+                                maxLength={PASSWORD_MAX_LENGTH}
                                 editable={!changingPassword}
                             />
                             <Text style={styles.passwordLabel}>Confirmar nova senha</Text>
@@ -703,6 +725,7 @@ export default function ProfileScreen() {
                                 autoCapitalize="none"
                                 autoCorrect={false}
                                 textContentType="newPassword"
+                                maxLength={PASSWORD_MAX_LENGTH}
                                 editable={!changingPassword}
                             />
                             <StyledButton title="Confirmar nova senha" onPress={handleChangePassword} isLoading={changingPassword} />
@@ -762,6 +785,20 @@ export default function ProfileScreen() {
                     />
                 </View>
                 <Text style={styles.privacyHint}>Esta opção altera somente a lista exibida no seu perfil. Seus dias e períodos continuam visíveis ao abrir o próprio local.</Text>
+
+                <View style={styles.privacyRow}>
+                    <View style={styles.privacyTextContainer}>
+                        <Text style={styles.privacyTitle}>Mostrar lugares que fundei</Text>
+                        <Text style={styles.privacyDescription}>Permite que outras pessoas abram, pelo seu perfil público, a lista dos locais que você inaugurou.</Text>
+                    </View>
+                    <Switch
+                        value={showFoundedPlaces}
+                        onValueChange={setShowFoundedPlaces}
+                        trackColor={{ false: '#D1D5DB', true: '#A5B4FC' }}
+                        thumbColor={showFoundedPlaces ? '#4F46E5' : '#F9FAFB'}
+                    />
+                </View>
+                <Text style={styles.privacyHint}>O número de lugares fundados continua aparecendo no seu perfil; desligar esconde apenas a lista de quais são.</Text>
             </View>}
 
             {isEditing && <View style={styles.section}>
@@ -883,6 +920,11 @@ export default function ProfileScreen() {
             {/* Modal de Termos de Uso */}
             <TermsModal visible={showTermsModal} onClose={() => setShowTermsModal(false)} />
             <ManualModal visible={showManualModal} onClose={() => setShowManualModal(false)} />
+            <ScreenTutorialModal
+                screen="perfil"
+                visible={showTutorial}
+                onClose={() => void dismissTutorial()}
+            />
             </ScrollView>
             </KeyboardAvoidingView>
 
@@ -914,6 +956,7 @@ export default function ProfileScreen() {
                             autoCapitalize="none"
                             autoCorrect={false}
                             textContentType="password"
+                            maxLength={PASSWORD_MAX_LENGTH}
                             editable={!loading}
                             autoFocus
                             onSubmitEditing={saveProfile}
@@ -965,6 +1008,7 @@ export default function ProfileScreen() {
                             autoCapitalize="none"
                             autoCorrect={false}
                             textContentType="password"
+                            maxLength={PASSWORD_MAX_LENGTH}
                             editable={!loading}
                             autoFocus
                             onSubmitEditing={confirmAccountDeletion}

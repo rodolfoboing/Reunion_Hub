@@ -4,6 +4,7 @@ import { ActivityIndicator, Alert, FlatList, Image, KeyboardAvoidingView, Modal,
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { EventInviteCandidate } from '@/src/types';
 import { getEventInviteCandidates, inviteUserToEvent } from '@/src/services/eventInvitationService';
+import { NICK_MAX_LENGTH } from '@/src/constants/textLimits';
 
 type EventInviteModalProps = {
     visible: boolean;
@@ -99,7 +100,7 @@ export function EventInviteModal({ visible, eventId, onClose }: EventInviteModal
                         <TouchableOpacity onPress={onClose} accessibilityLabel="Fechar convites"><Ionicons name="close" size={26} color="#6B7280" /></TouchableOpacity>
                     </View>
                     <View style={styles.manualInvite}>
-                        <TextInput value={nick} onChangeText={setNick} placeholder="Digite o nick" autoCapitalize="none" autoCorrect={false} style={styles.nickInput} editable={!sending} />
+                        <TextInput value={nick} onChangeText={setNick} placeholder="Digite o nick" autoCapitalize="none" autoCorrect={false} maxLength={NICK_MAX_LENGTH} style={styles.nickInput} editable={!sending} />
                         <TouchableOpacity disabled={sending} style={[styles.manualButton, sending && styles.inviteButtonDisabled]} onPress={() => sendInvite()}>
                             {sending ? <ActivityIndicator size="small" color="#FFF" /> : <Ionicons name="send" size={18} color="#FFF" />}
                         </TouchableOpacity>

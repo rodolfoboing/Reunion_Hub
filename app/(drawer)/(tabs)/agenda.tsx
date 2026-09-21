@@ -20,6 +20,8 @@ import { auth, db, functions } from '../../../src/services/firebaseConfig';
 import { normalizeInterests } from '../../../src/constants/Interests';
 import { cancelEventReminder, scheduleEventReminders, syncEventReminders } from '../../../src/utils/Notifications';
 import { DISCOVERY_REASON_BADGE_LABELS, getDiscoveryBadgeReason, getEventDiscovery, isNewMeeting, shouldSuggestEvent, type EventDiscovery } from '../../../src/utils/eventDiscovery';
+import { ScreenTutorialModal } from '../../../src/components/ScreenTutorialModal';
+import { useFirstVisitTutorial } from '../../../src/hooks/useFirstVisitTutorial';
 import { ReputationFeedbackModal } from '../../../src/components/ReputationFeedbackModal';
 
 type FavoriteActionState = 'idle' | 'saving' | 'added' | 'removed';
@@ -383,6 +385,7 @@ export default function AgendaScreen() {
     const [favorites, setFavorites] = useState<string[]>([]);
     const [userInterests, setUserInterests] = useState<string[]>([]);
     const [showPopularOutsideInterests, setShowPopularOutsideInterests] = useState(true);
+    const { visible: showTutorial, dismiss: dismissTutorial } = useFirstVisitTutorial('agenda');
     const [userLocation, setUserLocation] = useState<Location.LocationObject | null>(null);
     const [markedDates, setMarkedDates] = useState<any>({});
     const [selectedDate, setSelectedDate] = useState('');
@@ -1465,6 +1468,11 @@ export default function AgendaScreen() {
                     </View>
                 </SafeAreaView>
             </Modal>
+            <ScreenTutorialModal
+                screen="agenda"
+                visible={showTutorial}
+                onClose={() => void dismissTutorial()}
+            />
             <ReputationFeedbackModal
                 visible={cancellationPenalty}
                 delta={-15}

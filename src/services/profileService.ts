@@ -77,6 +77,7 @@ export async function createInitialUserProfile(input: {
             foundedPlacesCount: 0,
             showPopularOutsideInterests: true,
             shareFrequentedPlaces: true,
+            showFoundedPlaces: true,
             isProfileComplete: false,
             createdAt: new Date().toISOString(),
             termsVersion: CURRENT_TERMS_VERSION,
@@ -118,6 +119,7 @@ export async function updateOwnProfile(input: {
     photoURL: string | null;
     showPopularOutsideInterests: boolean;
     shareFrequentedPlaces: boolean;
+    showFoundedPlaces: boolean;
 }): Promise<{ nickChanged: boolean }> {
     const searchName = normalizeNickname(input.nick);
     if (!isValidNickname(searchName)) throw new Error('invalid-nickname');
@@ -154,6 +156,7 @@ export async function updateOwnProfile(input: {
             photoURL: input.photoURL,
             showPopularOutsideInterests: input.showPopularOutsideInterests,
             shareFrequentedPlaces: input.shareFrequentedPlaces,
+            showFoundedPlaces: input.showFoundedPlaces,
         }, { merge: true });
         if (previousNicknameRef && previousNicknameSnapshot?.data()?.uid === input.userId) {
             transaction.delete(previousNicknameRef);

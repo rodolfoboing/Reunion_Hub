@@ -189,6 +189,10 @@ export default function UserProfileScreen() {
     // trazem o mesmo texto e o cabeçalho mostrava o mesmo nome duas vezes.
     // O nick é a identidade pública: ele fica sempre; o nome só aparece quando
     // realmente difere (contas antigas, criadas antes do nick).
+    // A preferência vale para os outros, nunca para o próprio dono.
+    const canSeeFoundedPlaces = (profile.foundedPlacesCount || 0) > 0
+        && (isOwnProfile || profile.showFoundedPlaces !== false);
+
     const nickHandle = profile.nick ? `@${profile.nick}` : null;
     const distinctDisplayName = profile.displayName
         && profile.displayName.trim().toLowerCase() !== (profile.nick ?? '').trim().toLowerCase()
@@ -270,11 +274,30 @@ export default function UserProfileScreen() {
                         <Text style={styles.statLabel}>Participações</Text>
                     </View>
                     <View style={styles.divider} />
-                    <View style={styles.statItem}>
-                        <FontAwesome name="flag" size={24} color="#10b981" />
-                        <Text style={styles.statValue}>{profile.foundedPlacesCount || 0}</Text>
-                        <Text style={styles.statLabel}>Fundador</Text>
-                    </View>
+                    {/* A lista é pública por padrão; só some quando o dono desliga
+                        `showFoundedPlaces`. O contador fica visível de qualquer
+                        forma — o que a preferência esconde é QUAIS são os lugares. */}
+                    {canSeeFoundedPlaces ? (
+                        <TouchableOpacity
+                            style={styles.statItem}
+                            onPress={() => profileId && router.push(`/founded-places/${profileId}` as never)}
+                            accessibilityRole="button"
+                            accessibilityLabel={`Ver os lugares fundados por ${profile.nick || profile.displayName || 'este usuário'}`}
+                        >
+                            <FontAwesome name="flag" size={24} color="#10b981" />
+                            <Text style={styles.statValue}>{profile.foundedPlacesCount || 0}</Text>
+                            <View style={styles.statLabelRow}>
+                                <Text style={styles.statLabel}>Fundador</Text>
+                                <FontAwesome name="angle-right" size={13} color="#9ca3af" />
+                            </View>
+                        </TouchableOpacity>
+                    ) : (
+                        <View style={styles.statItem}>
+                            <FontAwesome name="flag" size={24} color="#10b981" />
+                            <Text style={styles.statValue}>{profile.foundedPlacesCount || 0}</Text>
+                            <Text style={styles.statLabel}>Fundador</Text>
+                        </View>
+                    )}
                 </View>
 
                 {/* Bio */}

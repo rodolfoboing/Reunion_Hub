@@ -11,6 +11,7 @@ import { TermsModal } from '../../src/components/TermsModal';
 import { STRINGS } from '../../src/constants/strings';
 import { authLog, getFirebaseErrorCode } from '../../src/utils/authError';
 import { createInitialUserProfile, isValidNickname, NicknameUnavailableError, normalizeNickname } from '@/src/services/profileService';
+import { EMAIL_MAX_LENGTH, NICK_MAX_LENGTH, PASSWORD_MAX_LENGTH } from '@/src/constants/textLimits';
 
 export default function RegisterScreen() {
     const [nick, setNick] = useState('');
@@ -130,6 +131,7 @@ export default function RegisterScreen() {
                         value={nick}
                         onChangeText={setNick}
                         autoCapitalize="none"
+                        maxLength={NICK_MAX_LENGTH}
                     />
 
                     <StyledInput
@@ -139,6 +141,7 @@ export default function RegisterScreen() {
                         onChangeText={setEmail}
                         autoCapitalize="none"
                         keyboardType="email-address"
+                        maxLength={EMAIL_MAX_LENGTH}
                     />
 
                     <StyledInput
@@ -147,6 +150,7 @@ export default function RegisterScreen() {
                         value={password}
                         onChangeText={setPassword}
                         secureTextEntry
+                        maxLength={PASSWORD_MAX_LENGTH}
                     />
 
                     <StyledInput
@@ -155,6 +159,7 @@ export default function RegisterScreen() {
                         value={confirmPassword}
                         onChangeText={setConfirmPassword}
                         secureTextEntry
+                        maxLength={PASSWORD_MAX_LENGTH}
                     />
 
                     <TouchableOpacity style={styles.checkboxContainer} onPress={() => setAcceptedTerms(!acceptedTerms)} activeOpacity={0.7}>

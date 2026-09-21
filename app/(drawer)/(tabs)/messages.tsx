@@ -9,6 +9,9 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { ReportReasonModal } from '@/src/components/ReportReasonModal';
 import { ErrorState } from '@/src/components/ErrorState';
 import { submitReport } from '@/src/services/reportService';
+import { NICK_MAX_LENGTH } from '@/src/constants/textLimits';
+import { ScreenTutorialModal } from '@/src/components/ScreenTutorialModal';
+import { useFirstVisitTutorial } from '@/src/hooks/useFirstVisitTutorial';
 import { formatRelativeMessageTimestamp } from '@/src/utils/dateUtils';
 
 function getErrorMessage(error: unknown): string {
@@ -29,6 +32,7 @@ export default function MessagesScreen() {
     const [selectedChat, setSelectedChat] = useState<any>(null);
     const [showOptionsModal, setShowOptionsModal] = useState(false);
     const [showReportReasonModal, setShowReportReasonModal] = useState(false);
+    const { visible: showTutorial, dismiss: dismissTutorial } = useFirstVisitTutorial('mensagens');
 
     useEffect(() => {
         if (!auth.currentUser) return;
@@ -375,6 +379,7 @@ export default function MessagesScreen() {
                             onChangeText={setTargetNick}
                             autoCapitalize="none"
                             autoCorrect={false}
+                            maxLength={NICK_MAX_LENGTH}
                             placeholderTextColor="#9ca3af"
                         />
 
@@ -436,6 +441,11 @@ export default function MessagesScreen() {
                 targetType="user"
                 onClose={() => setShowReportReasonModal(false)}
                 onSelectReason={submitUserReport}
+            />
+            <ScreenTutorialModal
+                screen="mensagens"
+                visible={showTutorial}
+                onClose={() => void dismissTutorial()}
             />
         </View>
     );

@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, Image, FlatList, Dimensions, ActivityIndicator, Platform, ScrollView, Switch, Pressable, Modal, Alert, InteractionManager, Linking } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, Image, FlatList, Dimensions, ActivityIndicator, Platform, ScrollView, Switch, Pressable, Alert, InteractionManager, Linking } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { Ionicons, FontAwesome } from '@expo/vector-icons';
+import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import { router, useLocalSearchParams } from 'expo-router';
 import { useIsFocused } from '@react-navigation/native';
@@ -109,6 +109,8 @@ function parseStoredMapRegion(value: string): StoredMapRegion | null {
 import { useEventClock } from '@/src/hooks/useEventClock';
 import { DISCOVERY_REASON_BADGE_LABELS, getDiscoveryBadgeReason, getEventDiscovery, isNewMeeting, shouldSuggestEvent } from '@/src/utils/eventDiscovery';
 import { getDistanceFromLatLonInKm } from '@/src/utils/distance';
+import { ScreenTutorialModal } from '@/src/components/ScreenTutorialModal';
+import { useFirstVisitTutorial } from '@/src/hooks/useFirstVisitTutorial';
 import { getEventJourneyState, hasEventEnded } from '@/src/utils/eventSchedule';
 import { ErrorState } from '@/src/components/ErrorState';
 import { getTodayStr, normalizeDate } from '@/src/utils/dateUtils';
@@ -359,7 +361,9 @@ export default function ExploreScreen() {
     const [filtersOpen, setFiltersOpen] = useState(false);
     const [headerHeight, setHeaderHeight] = useState(0);
 
-    const [showMapOnboarding, setShowMapOnboarding] = useState(false);
+    // Mantém o nome local, mas a leitura/gravação agora vem do hook compartilhado,
+    // que também honra a chave legada `@reunionhub_has_seen_map_onboarding`.
+    const { visible: showMapOnboarding, dismiss: handleCloseMapOnboarding } = useFirstVisitTutorial('explorar');
     const [modalVisible, setModalVisible] = useState(false);
     const [createdEventIdForInvite, setCreatedEventIdForInvite] = useState<string | null>(null);
     const [repeatCount, setRepeatCount] = useState(0);
@@ -458,7 +462,9 @@ export default function ExploreScreen() {
             return;
         }
 
-        setShowMapOnboarding(false);
+        // Criar evento vindo do calendário dispensa o tutorial: o usuário já sabe
+        // o que veio fazer, e o popup competiria com o modal de criação.
+        void handleCloseMapOnboarding();
         pendingCreateEventTask.current?.cancel();
         pendingCreateEventTask.current = InteractionManager.runAfterInteractions(() => {
             if (!isExploreMounted.current) return;
@@ -511,28 +517,6 @@ export default function ExploreScreen() {
     useEffect(() => {
         setFiltersOpen(false);
     }, [viewMode, eventType]);
-
-    useEffect(() => {
-        const checkMapFirstTime = async () => {
-            if (createEvent === '1' || handledCalendarCreateRequest.current !== null) return;
-            try {
-                const hasSeen = await AsyncStorage.getItem('@reunionhub_has_seen_map_onboarding');
-                if (hasSeen !== 'true') {
-                    setShowMapOnboarding(true);
-                }
-            } catch (e) {
-                console.error('[Explore] Erro ao carregar mapa:', e);
-            }
-        };
-        checkMapFirstTime();
-    }, [createEvent]);
-
-    const handleCloseMapOnboarding = async () => {
-        try {
-            await AsyncStorage.setItem('@reunionhub_has_seen_map_onboarding', 'true');
-        } catch(e) {}
-        setShowMapOnboarding(false);
-    };
 
     const handleOpenPlaceModal = (place: Place) => {
         const requestId = ++placeRequestId.current;
@@ -1313,27 +1297,14 @@ export default function ExploreScreen() {
                 }}
             />
 
-            <Modal visible={showMapOnboarding} transparent={true} animationType="fade">
-                <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center' }}>
-                    <View style={{ width: '80%', backgroundColor: '#fff', borderRadius: 20, padding: 24, alignItems: 'center' }}>
-                        <View style={{ width: 50, height: 50, borderRadius: 25, backgroundColor: '#e0e7ff', justifyContent: 'center', alignItems: 'center', marginBottom: 16 }}>
-                            <FontAwesome name="map" size={24} color="#4f46e5" />
-                        </View>
-                        <Text style={{ fontSize: 18, fontWeight: 'bold', color: '#1f2937', marginBottom: 12, textAlign: 'center' }}>
-                            Explorar Eventos e Locais
-                        </Text>
-                        <Text style={{ fontSize: 14, color: '#4b5563', textAlign: 'center', lineHeight: 22, marginBottom: 20 }}>
-                            Use os filtros acima para ver eventos da comunidade ou ative as marcações de Locais Vagos (banco do Google Maps e Overpass) para conhecer novos lugares!
-                        </Text>
-                        <TouchableOpacity 
-                            onPress={handleCloseMapOnboarding} 
-                            style={{ backgroundColor: '#6366f1', paddingVertical: 12, paddingHorizontal: 32, borderRadius: 30, width: '100%', alignItems: 'center' }}
-                        >
-                            <Text style={{ color: '#fff', fontWeight: 'bold', fontSize: 16 }}>Entendi</Text>
-                        </TouchableOpacity>
-                    </View>
-                </View>
-            </Modal>
+            {/* O popup inline de onboarding do mapa virou o tutorial compartilhado:
+                mesma função, mesmo visual das outras telas, e a chave antiga
+                continua respeitada para não reaparecer a quem já dispensou. */}
+            <ScreenTutorialModal
+                screen="explorar"
+                visible={showMapOnboarding}
+                onClose={handleCloseMapOnboarding}
+            />
         </View>
     );
 }

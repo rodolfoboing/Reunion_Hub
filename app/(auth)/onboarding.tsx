@@ -4,6 +4,7 @@ import { router } from 'expo-router';
 import { auth, db } from '../../src/services/firebaseConfig';
 import { doc, updateDoc } from 'firebase/firestore';
 import { createInitialUserProfile, NicknameUnavailableError } from '@/src/services/profileService';
+import { BIO_MAX_LENGTH } from '@/src/constants/textLimits';
 import { updateProfile } from 'firebase/auth';
 import { storage } from '../../src/services/firebaseConfig';
 import * as ImagePicker from 'expo-image-picker';
@@ -15,7 +16,6 @@ import { INTERESTS_OPTIONS, normalizeInterests } from '../../src/constants/Inter
 import { uploadProfileImage } from '@/src/services/profileService';
 import { getFirebaseErrorCode } from '@/src/utils/authError';
 
-const BIO_MAX_LENGTH = 300;
 const MAX_INTERESTS = 10;
 
 export default function CompleteProfileScreen() {

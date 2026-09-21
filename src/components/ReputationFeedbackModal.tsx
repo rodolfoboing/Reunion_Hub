@@ -31,10 +31,16 @@ export function ReputationFeedbackModal({ visible, delta, title, body, onClose }
                     </View>
                     <ScrollView style={styles.bodyScroll} contentContainerStyle={styles.bodyContent} showsVerticalScrollIndicator={false}>
                         <Text style={styles.body}>{body}</Text>
+                        {/* Não prometa ação que a tela não oferece. O texto anterior
+                            mandava "usar a opção de denúncia disponível nesta tela",
+                            mas este modal abre sobre a Agenda e o detalhe do evento,
+                            e nenhuma das duas tem afordância para contestar reputação
+                            — nem deveria ter, já que a perda é calculada no servidor a
+                            partir do check-in. Ficou só o que é verificável. */}
                         <Text style={styles.context}>
                             {isGain
                                 ? 'Sua reputação ajuda a demonstrar participação responsável na comunidade.'
-                                : 'Se você acredita que houve um erro, confira os detalhes do evento e use a opção de denúncia disponível nesta tela.'}
+                                : 'Confirmar presença apenas nos eventos a que você realmente vai, e fazer check-in quando estiver lá, recupera sua reputação com o tempo.'}
                         </Text>
                     </ScrollView>
                     <TouchableOpacity

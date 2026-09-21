@@ -19,6 +19,8 @@ export interface User {
     interests?: string[];
     showPopularOutsideInterests?: boolean;
     shareFrequentedPlaces?: boolean;
+    /** Ausente = público. Só `false` esconde a lista de lugares fundados. */
+    showFoundedPlaces?: boolean;
     favorites?: string[];
     blockedUsers?: string[];
     role?: 'admin' | 'moderator';

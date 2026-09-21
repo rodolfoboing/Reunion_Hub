@@ -12,6 +12,7 @@ import { markRelatedNotificationsAsRead } from '@/src/services/notificationReadS
 import { submitReport } from '@/src/services/reportService';
 import { setActiveNotificationTarget } from '@/src/utils/Notifications';
 import { getDateStr, formatConversationDateHeader } from '@/src/utils/dateUtils';
+import { CHAT_MESSAGE_MAX_LENGTH } from '@/src/constants/textLimits';
 import { useFocusEffect } from '@react-navigation/native';
 
 function getErrorMessage(error: unknown): string {
@@ -377,6 +378,11 @@ export default function ChatScreen() {
                             value={inputText}
                             onChangeText={setInputText}
                             multiline
+                            // O servidor recusa acima de 2000 em sendChatMessage.
+                            // Sem o limite aqui, o usuário escrevia um texto longo
+                            // e só descobria no toque em enviar, perdendo o que
+                            // tinha escrito.
+                            maxLength={CHAT_MESSAGE_MAX_LENGTH}
                             editable={otherUserExists}
                         />
                         <TouchableOpacity 

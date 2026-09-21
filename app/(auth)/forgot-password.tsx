@@ -7,6 +7,7 @@ import { auth } from '@/src/services/firebaseConfig';
 import { StyledButton } from '@/src/components/StyledButton';
 import { StyledInput } from '@/src/components/StyledInput';
 import { authLog, getFirebaseErrorCode } from '@/src/utils/authError';
+import { EMAIL_MAX_LENGTH } from '@/src/constants/textLimits';
 
 export default function ForgotPasswordScreen() {
     const [email, setEmail] = useState('');
@@ -56,6 +57,7 @@ export default function ForgotPasswordScreen() {
                             autoCorrect={false}
                             keyboardType="email-address"
                             textContentType="emailAddress"
+                            maxLength={EMAIL_MAX_LENGTH}
                         />
                         <StyledButton title="Enviar instruções" onPress={handlePasswordReset} isLoading={loading} />
                         <Link href="/login" asChild>

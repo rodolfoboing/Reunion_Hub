@@ -39,6 +39,7 @@ export function toUserProfile(uid: string, data: Record<string, unknown>): User 
         interests: stringArrayValue(data.interests),
         showPopularOutsideInterests: booleanValue(data.showPopularOutsideInterests),
         shareFrequentedPlaces: booleanValue(data.shareFrequentedPlaces),
+        showFoundedPlaces: booleanValue(data.showFoundedPlaces),
         favorites: stringArrayValue(data.favorites),
         blockedUsers: stringArrayValue(data.blockedUsers),
         role,

@@ -54,8 +54,8 @@ service cloud.firestore {
     function editableUserFields() {
       return [
         'displayName', 'nick', 'searchName', 'bio', 'interests', 'photoURL',
-        'showPopularOutsideInterests', 'shareFrequentedPlaces', 'favorites',
-        'blockedUsers', 'isProfileComplete'
+        'showPopularOutsideInterests', 'shareFrequentedPlaces', 'showFoundedPlaces',
+        'favorites', 'blockedUsers', 'isProfileComplete'
       ];
     }
 
@@ -67,7 +67,7 @@ service cloud.firestore {
           'uid', 'displayName', 'nick', 'searchName', 'email', 'reputation',
           'eventsAttended', 'foundedPlacesCount', 'showPopularOutsideInterests',
           'isProfileComplete', 'createdAt', 'interests', 'photoURL', 'bio',
-          'shareFrequentedPlaces', 'favorites', 'blockedUsers',
+          'shareFrequentedPlaces', 'showFoundedPlaces', 'favorites', 'blockedUsers',
           'termsVersion', 'termsAcceptedAt'
         ])
         && request.resource.data.searchName is string

@@ -8,6 +8,7 @@ import { StyledInput } from '../../src/components/StyledInput';
 import { StyledButton } from '../../src/components/StyledButton';
 import { STRINGS } from '../../src/constants/strings';
 import { authLog, getFirebaseErrorCode } from '../../src/utils/authError';
+import { EMAIL_MAX_LENGTH, PASSWORD_MAX_LENGTH } from '@/src/constants/textLimits';
 
 export default function LoginScreen() {
     const [email, setEmail] = useState('');
@@ -76,6 +77,7 @@ export default function LoginScreen() {
                         onChangeText={setEmail}
                         autoCapitalize="none"
                         keyboardType="email-address"
+                        maxLength={EMAIL_MAX_LENGTH}
                     />
 
                     <StyledInput
@@ -84,6 +86,7 @@ export default function LoginScreen() {
                         value={password}
                         onChangeText={setPassword}
                         secureTextEntry
+                        maxLength={PASSWORD_MAX_LENGTH}
                     />
 
                     <Link href="/forgot-password" asChild>

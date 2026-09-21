@@ -1723,19 +1723,43 @@ async function cleanUpOldEventHistory() {
     }
     return oldEvents.size;
 }
+/**
+ * Retenção do sino. 30 dias, não 90: a lista in-app é um mural do que está
+ * acontecendo agora, não arquivo histórico — e o cliente já mostra só as 50 mais
+ * recentes, então o que passa disso é peso morto no banco.
+ *
+ * Uma notificação continua não lida depois de 30 dias é abandonada na prática;
+ * não separamos lida de não lida para não exigir índice composto novo.
+ */
+const NOTIFICATION_RETENTION_DAYS = 30;
+/**
+ * Teto por execução diária. O valor antigo era 50 num único lote: com o app
+ * gerando mais de 50 notificações por dia, a limpeza nunca alcançava o acúmulo e
+ * a coleção crescia para sempre. Drenar em rodadas resolve o atraso acumulado e,
+ * uma vez em dia, o custo volta a ser 1 consulta vazia por dia.
+ */
+const NOTIFICATION_CLEANUP_DAILY_LIMIT = 1000;
+const NOTIFICATION_CLEANUP_CHUNK = 250;
 async function cleanUpOldNotifications() {
-    const cutoff = admin.firestore.Timestamp.fromMillis(Date.now() - 90 * 24 * 60 * 60 * 1000);
-    const oldNotifications = await db.collection('notifications')
-        .where('createdAt', '<', cutoff)
-        .orderBy('createdAt', 'asc')
-        .limit(50)
-        .get();
-    if (oldNotifications.empty)
-        return 0;
-    const batch = db.batch();
-    oldNotifications.docs.forEach((notification) => batch.delete(notification.ref));
-    await batch.commit();
-    return oldNotifications.size;
+    const cutoff = admin.firestore.Timestamp.fromMillis(Date.now() - NOTIFICATION_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+    let deleted = 0;
+    while (deleted < NOTIFICATION_CLEANUP_DAILY_LIMIT) {
+        const oldNotifications = await db.collection('notifications')
+            .where('createdAt', '<', cutoff)
+            .orderBy('createdAt', 'asc')
+            .limit(Math.min(NOTIFICATION_CLEANUP_CHUNK, NOTIFICATION_CLEANUP_DAILY_LIMIT - deleted))
+            .get();
+        if (oldNotifications.empty)
+            break;
+        const batch = db.batch();
+        oldNotifications.docs.forEach((notification) => batch.delete(notification.ref));
+        await batch.commit();
+        deleted += oldNotifications.size;
+        // Lote incompleto = acabou o que havia para apagar antes do teto.
+        if (oldNotifications.size < NOTIFICATION_CLEANUP_CHUNK)
+            break;
+    }
+    return deleted;
 }
 const DAILY_RECOMMENDATION_EVENT_LIMIT = 30;
 const DAILY_RECOMMENDATION_DEVICE_LIMIT = 200;
@@ -2108,9 +2132,14 @@ exports.closeExpiredEventsDaily = dailyFunction.pubsub
     catch (_c) {
         console.error('[EventAutoClose] legacy_settlement_delivery_failed', { recipientCount: legacySettlementSummaries.length });
     }
+    // O portão protege só a limpeza de histórico, que é cara: ela varre
+    // eventos e cruza 3 coleções. A de notificações é uma consulta indexada
+    // simples e não depende da carga de eventos — ficava refém do portão e,
+    // justamente nos dias de maior volume (quando mais notificação é criada),
+    // era a que mais precisava rodar e não rodava.
     const canRunMaintenance = activeCandidates.size < 50;
     const cleaned = canRunMaintenance ? await cleanUpOldEventHistory() : 0;
-    const notificationsCleaned = canRunMaintenance ? await cleanUpOldNotifications() : 0;
+    const notificationsCleaned = await cleanUpOldNotifications();
     console.info('[EventAutoClose] daily_run_completed', {
         scanned: activeCandidates.size,
         expired: expiredEvents.length,

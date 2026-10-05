@@ -12,6 +12,7 @@ import { submitReport } from '@/src/services/reportService';
 import { NICK_MAX_LENGTH } from '@/src/constants/textLimits';
 import { ScreenTutorialModal } from '@/src/components/ScreenTutorialModal';
 import { useFirstVisitTutorial } from '@/src/hooks/useFirstVisitTutorial';
+import { useUserProfile } from '@/src/hooks/useUserProfile';
 import { formatRelativeMessageTimestamp } from '@/src/utils/dateUtils';
 
 function getErrorMessage(error: unknown): string {
@@ -23,7 +24,7 @@ export default function MessagesScreen() {
     const [loading, setLoading] = useState(true);
     const [loadError, setLoadError] = useState(false);
     const [listenerRetryKey, setListenerRetryKey] = useState(0);
-    const [userProfile, setUserProfile] = useState<any>(null);
+    const userProfile = useUserProfile();
 
     const [showNewChatModal, setShowNewChatModal] = useState(false);
     const [targetNick, setTargetNick] = useState('');
@@ -37,9 +38,8 @@ export default function MessagesScreen() {
     useEffect(() => {
         if (!auth.currentUser) return;
 
-        const unsubUser = onSnapshot(doc(db, 'users', auth.currentUser.uid), (docSnap) => {
-            if (docSnap.exists()) setUserProfile(docSnap.data());
-        });
+        // `blockedUsers` vem do perfil compartilhado. Esta tela abria um
+        // `onSnapshot` próprio em `users/{uid}` e guardava o dado cru como `any`.
 
         const q = query(
             collection(db, 'conversations'),
@@ -60,7 +60,6 @@ export default function MessagesScreen() {
         });
 
         return () => {
-            unsubUser();
             unsubscribe();
         };
     }, [listenerRetryKey]);

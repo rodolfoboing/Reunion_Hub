@@ -5,6 +5,7 @@ import {
     PushChannel,
     PushDeliverySummary,
     PushMessage,
+    processExpoReceipts,
     sendPushMessages as deliverPushMessages,
 } from './pushNotifications';
 import {
@@ -22,6 +23,7 @@ import {
     RecommendationUser,
     canSendDailyRecommendation,
     isNotificationPreferenceEnabled,
+    isFrequentedPlaceEvent,
     recommendationCooldownNotificationIds,
     selectDailyRecommendation,
 } from './recommendations';
@@ -49,6 +51,11 @@ const dailyFunction = functions.runWith({
     timeoutSeconds: 120,
     maxInstances: 1,
 });
+const recommendationFunction = functions.runWith({
+    memory: '256MB',
+    timeoutSeconds: 540,
+    maxInstances: 1,
+});
 // Exclusão é rara, mas percorre todas as coleções ligadas à conta. Um limite
 // maior evita exclusão parcial sem aumentar custo quando a Function está ociosa.
 const accountFunction = functions.runWith({
@@ -74,7 +81,7 @@ async function pushMessagesForUser(
 ): Promise<PushMessage[]> {
     const preferenceField = options.preferenceField;
     const [devicesSnapshot, settingsSnapshot] = await Promise.all([
-        db.collection('pushDevices').where('userId', '==', userId).limit(10).get(),
+        db.collection('pushDevices').where('userId', '==', userId).get(),
         preferenceField ? db.collection('notificationSettings').doc(userId).get() : Promise.resolve(null),
     ]);
     if (settingsSnapshot && preferenceField && settingsSnapshot.data()?.[preferenceField] === false) return [];
@@ -125,7 +132,7 @@ async function requireStaff(context: functions.https.CallableContext): Promise<s
     const uid = requireAuthenticated(context);
     const profile = await db.collection('users').doc(uid).get();
     const role = profile.data()?.role;
-    if (role !== 'admin' && role !== 'moderator') {
+    if (profile.data()?.banned === true || (role !== 'admin' && role !== 'moderator')) {
         throw new functions.https.HttpsError('permission-denied', 'Apenas a moderacao pode executar esta acao.');
     }
     return uid;
@@ -143,7 +150,42 @@ type EventNotificationDelivery = {
     detailBody?: string;
     preferenceField?: 'notifyEventUpdates' | 'notifyRecommendations';
     channel?: PushChannel;
+    expiresAtMs?: number;
+    revision?: string;
 };
+
+type ChatPushDelivery = {
+    id: string;
+    userId: string;
+    type: 'chat';
+    title: string;
+    body: string;
+    conversationId: string;
+};
+
+async function settlePushOutbox(
+    deliveries: { id: string }[], messages: PushMessage[], summary: PushDeliverySummary,
+): Promise<void> {
+    const failedPaths = new Set(summary.retryableRegistrationPaths);
+    const failedByNotification = new Map<string, Set<string>>();
+    messages.forEach((message) => {
+        const outboxId = message.data.outboxId ?? message.data.notificationId;
+        if (!message.registrationPath || !failedPaths.has(message.registrationPath) || typeof outboxId !== 'string') return;
+        const paths = failedByNotification.get(outboxId) ?? new Set<string>();
+        paths.add(message.registrationPath);
+        failedByNotification.set(outboxId, paths);
+    });
+    for (let offset = 0; offset < deliveries.length; offset += 400) {
+        const batch = db.batch();
+        deliveries.slice(offset, offset + 400).forEach((delivery) => {
+            const reference = db.collection('pushOutbox').doc(delivery.id);
+            const paths = [...(failedByNotification.get(delivery.id) ?? [])];
+            if (paths.length > 0) batch.set(reference, { registrationPaths: paths }, { merge: true });
+            else batch.delete(reference);
+        });
+        await batch.commit();
+    }
+}
 
 async function deliverEventNotifications(deliveries: EventNotificationDelivery[]): Promise<void> {
     if (deliveries.length === 0) return;
@@ -158,10 +200,13 @@ async function deliverEventNotifications(deliveries: EventNotificationDelivery[]
         });
     }
 
-    const validDeliveries = deliveries.filter(({ userId }) => recipientProfiles.get(userId)?.banned !== true);
-    for (let index = 0; index < validDeliveries.length; index += 400) {
+    const validDeliveries = deliveries.filter(({ userId }) => {
+        const profile = recipientProfiles.get(userId);
+        return Boolean(profile && profile.banned !== true);
+    });
+    for (let index = 0; index < validDeliveries.length; index += 200) {
         const batch = db.batch();
-        validDeliveries.slice(index, index + 400).forEach((delivery) => {
+        validDeliveries.slice(index, index + 200).forEach((delivery) => {
             batch.set(db.collection('notifications').doc(delivery.id), {
                 userId: delivery.userId,
                 type: delivery.type,
@@ -171,9 +216,14 @@ async function deliverEventNotifications(deliveries: EventNotificationDelivery[]
                 ...(typeof delivery.reputationDelta === 'number' ? { reputationDelta: delivery.reputationDelta } : {}),
                 ...(delivery.detailTitle ? { detailTitle: delivery.detailTitle } : {}),
                 ...(delivery.detailBody ? { detailBody: delivery.detailBody } : {}),
+                ...(delivery.revision ? { revision: delivery.revision } : {}),
                 createdAt: admin.firestore.FieldValue.serverTimestamp(),
                 read: false,
             }, { merge: true });
+            batch.set(db.collection('pushOutbox').doc(delivery.id), {
+                delivery: JSON.parse(JSON.stringify(delivery)),
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
         });
         await batch.commit();
     }
@@ -195,11 +245,12 @@ async function deliverEventNotifications(deliveries: EventNotificationDelivery[]
             ...(delivery.type === 'checkin_request' || delivery.type === 'checkin_review_ready' ? {
                 tag: `checkin_review_${delivery.meetingId}`,
                 collapseKey: `checkin_review_${delivery.meetingId}`,
-            } : {}),
+            } : { tag: delivery.id, collapseKey: delivery.id }),
         }
     )))).flat();
     try {
-        await deliverPushMessages(db, pushMessages);
+        const summary = await deliverPushMessages(db, pushMessages);
+        await settlePushOutbox(validDeliveries, pushMessages, summary);
     } catch {
         // A notificação interna já foi persistida. Push não pode desfazer a ação principal.
         console.error('[MeetingNotification] push_delivery_failed', { recipientCount: validDeliveries.length });
@@ -215,7 +266,6 @@ async function notifyReportersOfModerationAction(
     const reports = await db.collection('reports')
         .where('type', '==', targetType)
         .where('targetId', '==', targetId)
-        .limit(50)
         .get();
     const reporterIds = [...new Set(reports.docs.map((report) => report.data().reportedBy).filter((userId): userId is string => typeof userId === 'string'))];
     if (reporterIds.length === 0) return;
@@ -248,7 +298,12 @@ async function notifyReportersOfModerationAction(
     }
 }
 
-export const onReportCreated = smallFunction.firestore
+export const onReportCreated = functions.runWith({
+    memory: '128MB',
+    timeoutSeconds: 30,
+    maxInstances: 5,
+    failurePolicy: true,
+}).firestore
     .document('reports/{reportId}')
     .onCreate(async (snapshot) => {
         const report = snapshot.data();
@@ -257,7 +312,6 @@ export const onReportCreated = smallFunction.firestore
 
         const staffProfiles = await db.collection('users')
             .where('role', 'in', ['admin', 'moderator'])
-            .limit(10)
             .get();
         const staffIds = staffProfiles.docs
             .filter((profile) => profile.data().banned !== true)
@@ -268,9 +322,10 @@ export const onReportCreated = smallFunction.firestore
         }
 
         const targetLabel = report.type === 'user' ? 'usuário' : 'evento';
-        const batch = db.batch();
-        staffIds.forEach((userId) => {
-            batch.set(db.collection('notifications').doc(`report_received_${snapshot.id}_${userId}`), {
+        for (let offset = 0; offset < staffIds.length; offset += 400) {
+            const batch = db.batch();
+            staffIds.slice(offset, offset + 400).forEach((userId) => {
+                batch.set(db.collection('notifications').doc(`report_received_${snapshot.id}_${userId}`), {
                 userId,
                 type: 'report_received',
                 title: 'Nova denúncia para análise',
@@ -278,10 +333,13 @@ export const onReportCreated = smallFunction.firestore
                 path: '/(drawer)/(tabs)/moderation',
                 createdAt: admin.firestore.FieldValue.serverTimestamp(),
                 read: false,
-            }, { merge: true });
-        });
-        batch.set(snapshot.ref, { moderatorNotifiedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-        await batch.commit();
+                }, { merge: true });
+            });
+            if (offset + 400 >= staffIds.length) {
+                batch.set(snapshot.ref, { moderatorNotifiedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+            }
+            await batch.commit();
+        }
 
         try {
             await sendPushNotification(
@@ -488,6 +546,63 @@ async function notifyCancelledEvents(events: CancelledEventNotification[]): Prom
     console.info('[MeetingNotification] cancellations_delivered', { eventCount: events.length, recipientCount: deliveries.length });
 }
 
+// A gravação do evento e o envio podem ocorrer em processos diferentes. Este
+// gatilho recupera avisos que faltaram após uma falha entre essas duas etapas.
+export const recoverEventNotifications = functions.runWith({
+    memory: '128MB',
+    timeoutSeconds: 120,
+    failurePolicy: true,
+}).firestore.document('meetings/{eventId}').onUpdate(async (change, context) => {
+    const before = change.before.data();
+    const after = change.after.data();
+    const eventId = context.params.eventId as string;
+    const attendees = [...new Set(stringIds(after.attendees))].filter((userId) => userId !== after.createdBy);
+    const eventTitle = typeof after.title === 'string' ? after.title : 'Evento';
+    let deliveries: EventNotificationDelivery[] = [];
+    if (before.status !== 'cancelled' && after.status === 'cancelled') {
+        deliveries = attendees.map((userId) => ({
+            id: `event_cancelled_${eventId}_${userId}`, userId, type: 'event_cancelled',
+            title: 'Evento cancelado', body: `O evento "${eventTitle}" foi cancelado pelo organizador.`, meetingId: eventId,
+        }));
+    } else if (before.status !== 'completed' && after.status === 'completed') {
+        deliveries = [...new Set([...stringIds(after.attendees), ...stringIds(after.checkedIn),
+            ...(typeof after.createdBy === 'string' ? [after.createdBy] : [])])].map((userId) => ({
+            id: `event_completed_${eventId}_${userId}`, userId, type: 'event_completed',
+            title: 'Evento encerrado', body: `O evento "${eventTitle}" foi encerrado. Confira seu histórico.`, meetingId: eventId,
+        }));
+    } else if (before.status !== 'awaiting_review' && after.status === 'awaiting_review') {
+        const creatorId = typeof after.createdBy === 'string' ? after.createdBy : '';
+        if (creatorId) deliveries = [{
+            id: `checkin_review_ready_${eventId}_${creatorId}`, userId: creatorId, type: 'checkin_review_ready',
+            title: 'Revise os check-ins do evento', body: `Há presenças de "${eventTitle}" aguardando sua validação.`, meetingId: eventId,
+        }];
+    } else if (isEventStillActive(after.status)) {
+        const changes = [
+            before.date !== after.date || before.time !== after.time || before.endDate !== after.endDate || before.endTime !== after.endTime ? 'data/horário' : null,
+            before.locationName !== after.locationName ? 'local' : null,
+            before.meetingLink !== after.meetingLink ? 'link' : null,
+        ].filter(Boolean).join(', ');
+        if (changes) deliveries = attendees.map((userId) => ({
+            id: `event_updated_${eventId}_${userId}`, userId, type: 'event_updated',
+            title: 'Evento atualizado', body: `"${eventTitle}" teve mudança de ${changes}. Confira os novos detalhes.`,
+            meetingId: eventId, preferenceField: 'notifyEventUpdates', channel: 'events',
+            revision: typeof after.notificationRevision === 'string' ? after.notificationRevision : undefined,
+        }));
+    }
+    if (deliveries.length === 0) return;
+    // A chamada que alterou o evento normalmente grava o aviso logo em seguida.
+    // Dar um intervalo curto evita um segundo push quando os dois caminhos correm juntos.
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    const existing: FirebaseFirestore.DocumentSnapshot[] = [];
+    for (let offset = 0; offset < deliveries.length; offset += 100) {
+        existing.push(...await db.getAll(...deliveries.slice(offset, offset + 100)
+            .map((delivery) => db.collection('notifications').doc(delivery.id))));
+    }
+    const missing = deliveries.filter((delivery, index) => !existing[index].exists
+        || (delivery.revision && existing[index].data()?.revision !== delivery.revision));
+    if (missing.length > 0) await deliverEventNotifications(missing);
+});
+
 function eventInviteCount(event: FirebaseFirestore.DocumentData, userId: string): number {
     const counts = event.inviteCounts;
     if (!isRecord(counts)) return 0;
@@ -558,7 +673,7 @@ export const reportEventLinkIssue = smallFunction.https.onCall(async (data, cont
             userId: creatorId,
             type: 'event_link_issue',
             title: 'Possível problema no link',
-            body: `Um participante informou que o link de "${eventTitle}" pode não estar funcionando. Alguns links só abrem perto do horário; verifique quando possível.`,
+            body: `Uma pessoa informou que o link de "${eventTitle}" pode não estar funcionando. Alguns links só abrem perto do horário; verifique quando possível.`,
             meetingId: eventId,
             reporterId,
             reportedLink: meetingLink,
@@ -607,6 +722,16 @@ export const rsvpToEvent = smallFunction.https.onCall(async (data, context) => {
         if (event.createdBy === uid || stringIds(event.attendees).includes(uid)) {
             return { added: false, creatorId: '', eventTitle: '' };
         }
+        if (!userSnap.exists || userSnap.data()?.banned === true) {
+            throw new functions.https.HttpsError('permission-denied', 'Sua conta não pode confirmar presença.');
+        }
+        const creatorId = typeof event.createdBy === 'string' ? event.createdBy : '';
+        if (!creatorId) throw new functions.https.HttpsError('failed-precondition', 'Evento sem organizador válido.');
+        const creatorSnap = await transaction.get(db.collection('users').doc(creatorId));
+        if (!creatorSnap.exists || creatorSnap.data()?.banned === true
+            || isBlockedBy(userSnap.data(), creatorId) || isBlockedBy(creatorSnap.data(), uid)) {
+            throw new functions.https.HttpsError('permission-denied', 'Não é possível participar deste evento.');
+        }
         if ((userSnap.data()?.reputation || 0) <= -50) {
             throw new functions.https.HttpsError('permission-denied', 'Sua reputação não permite novas confirmações.');
         }
@@ -614,7 +739,7 @@ export const rsvpToEvent = smallFunction.https.onCall(async (data, context) => {
         transaction.update(eventRef, { attendees: admin.firestore.FieldValue.arrayUnion(uid) });
         return {
             added: true,
-            creatorId: typeof event.createdBy === 'string' ? event.createdBy : '',
+            creatorId,
             eventTitle: typeof event.title === 'string' ? event.title : 'seu evento',
         };
     });
@@ -690,6 +815,35 @@ function requireDateField(data: unknown, field: string): string {
         throw new functions.https.HttpsError('invalid-argument', `${field} é inválida.`);
     }
     return date;
+}
+
+function requireClockField(data: unknown, field: string): string {
+    const time = requireStringField(data, field);
+    if (!isValidClockTime(time)) {
+        throw new functions.https.HttpsError('invalid-argument', `${field} é inválido.`);
+    }
+    return time;
+}
+
+/**
+ * Interesses do evento: 1 a 10 strings não vazias, mesmo teto das
+ * `firestore.rules` na criação (§9 — a regra vive nos dois lados de propósito,
+ * porque o Admin SDK não passa pelas regras).
+ */
+function requireEventInterests(data: unknown): string[] {
+    const raw = isRecord(data) ? data.interests : undefined;
+    if (!Array.isArray(raw)) {
+        throw new functions.https.HttpsError('invalid-argument', 'Selecione ao menos um interesse.');
+    }
+    const interests = [...new Set(
+        raw.filter((value): value is string => typeof value === 'string')
+            .map((value) => value.trim())
+            .filter(Boolean)
+    )];
+    if (interests.length === 0 || interests.length > 10) {
+        throw new functions.https.HttpsError('invalid-argument', 'Selecione de 1 a 10 interesses.');
+    }
+    return interests;
 }
 
 export const toggleEventFavorite = smallFunction.https.onCall(async (data, context) => {
@@ -786,6 +940,13 @@ export const recreateFavoriteEvent = smallFunction.https.onCall(async (data, con
         if ((userSnap.data()?.reputation ?? 0) <= -50) throw new functions.https.HttpsError('permission-denied', 'Sua reputação não permite criar novos eventos.');
         const favorite = favoriteSnap.data()!;
         if (favorite.createdBy !== uid) throw new functions.https.HttpsError('permission-denied', 'Apenas o criador original pode repetir este evento.');
+        if (userSnap.data()?.banned === true) throw new functions.https.HttpsError('permission-denied', 'Sua conta não pode criar eventos.');
+        if (favorite.type === 'online' && (typeof favorite.meetingLink !== 'string' || !/^https:\/\/.+/.test(favorite.meetingLink) || favorite.meetingLink.length > 500)) {
+            throw new functions.https.HttpsError('failed-precondition', 'Este favorito não possui um link online válido para ser repetido.');
+        }
+        if (!Array.isArray(favorite.interests) || favorite.interests.length < 1 || favorite.interests.length > 10) {
+            throw new functions.https.HttpsError('failed-precondition', 'Este favorito não possui interesses válidos para ser repetido.');
+        }
         if (date <= dateInSaoPaulo()) throw new functions.https.HttpsError('invalid-argument', 'Escolha uma data futura para repetir o evento.');
         if (typeof favorite.time !== 'string' || typeof favorite.endTime !== 'string') throw new functions.https.HttpsError('failed-precondition', 'Este favorito não possui horários suficientes para ser repetido.');
         const favoriteStart = getEventStartDate(favorite);
@@ -971,6 +1132,9 @@ export const getEventInviteCandidates = smallFunction.https.onCall(async (data, 
     if (!eventSnap.exists) throw new functions.https.HttpsError('not-found', 'Evento não encontrado.');
 
     const event = eventSnap.data()!;
+    if (!callerSnap.exists || callerSnap.data()?.banned === true) {
+        throw new functions.https.HttpsError('permission-denied', 'Sua conta não pode convidar pessoas.');
+    }
     if (!stringIds(event.attendees).includes(uid)) {
         throw new functions.https.HttpsError('permission-denied', 'Confirme presença no evento para convidar pessoas.');
     }
@@ -1005,26 +1169,31 @@ export const getEventInviteCandidates = smallFunction.https.onCall(async (data, 
         });
     }
 
-    const candidateIds = [...candidates.entries()]
+    const rankedCandidateIds = [...candidates.entries()]
         .sort((first, second) => second[1].priority - first[1].priority)
-        .slice(0, 12)
         .map(([candidateId]) => candidateId);
-    if (candidateIds.length === 0) return { candidates: [] };
+    if (rankedCandidateIds.length === 0) return { candidates: [] };
 
-    const candidateProfiles = await db.getAll(...candidateIds.map((candidateId) => db.collection('users').doc(candidateId)));
     const callerProfile = callerSnap.data();
-    const result = candidateProfiles.flatMap((candidateProfile): InviteCandidate[] => {
-        if (!candidateProfile.exists || isBlockedBy(callerProfile, candidateProfile.id) || isBlockedBy(candidateProfile.data(), uid)) return [];
-        const profile = candidateProfile.data();
-        return [{
-            uid: candidateProfile.id,
-            displayName: displayNameFor(profile),
-            nick: typeof profile?.nick === 'string' ? profile.nick : undefined,
-            photoURL: typeof profile?.photoURL === 'string' ? profile.photoURL : undefined,
-            sharedEventsCount: candidates.get(candidateProfile.id)?.sharedEventsCount || 0,
-            previousParticipant: candidates.get(candidateProfile.id)?.previousParticipant === true,
-        }];
-    });
+    const result: InviteCandidate[] = [];
+    for (let offset = 0; offset < rankedCandidateIds.length && result.length < 12; offset += 100) {
+        const candidateProfiles = await db.getAll(...rankedCandidateIds.slice(offset, offset + 100)
+            .map((candidateId) => db.collection('users').doc(candidateId)));
+        for (const candidateProfile of candidateProfiles) {
+            if (!candidateProfile.exists || candidateProfile.data()?.banned === true
+                || isBlockedBy(callerProfile, candidateProfile.id) || isBlockedBy(candidateProfile.data(), uid)) continue;
+            const profile = candidateProfile.data();
+            result.push({
+                uid: candidateProfile.id,
+                displayName: displayNameFor(profile),
+                nick: typeof profile?.nick === 'string' ? profile.nick : undefined,
+                photoURL: typeof profile?.photoURL === 'string' ? profile.photoURL : undefined,
+                sharedEventsCount: candidates.get(candidateProfile.id)?.sharedEventsCount || 0,
+                previousParticipant: candidates.get(candidateProfile.id)?.previousParticipant === true,
+            });
+            if (result.length === 12) break;
+        }
+    }
 
     console.info('[EventInvite] candidates_loaded', { count: result.length });
     return { candidates: result };
@@ -1059,7 +1228,12 @@ export const inviteUserToEvent = smallFunction.https.onCall(async (data, context
             transaction.get(invitationRef),
         ]);
         if (!eventSnap.exists) throw new functions.https.HttpsError('not-found', 'Evento não encontrado.');
-        if (!inviteeSnap.exists) throw new functions.https.HttpsError('not-found', 'Usuário não encontrado.');
+        if (!inviterSnap.exists || inviterSnap.data()?.banned === true) {
+            throw new functions.https.HttpsError('permission-denied', 'Sua conta não pode enviar convites.');
+        }
+        if (!inviteeSnap.exists || inviteeSnap.data()?.banned === true) {
+            throw new functions.https.HttpsError('not-found', 'Usuário não encontrado.');
+        }
         if (existingInvitation.exists) return { alreadyInvited: true, eventTitle: '' };
 
         const event = eventSnap.data()!;
@@ -1143,7 +1317,12 @@ export const getOrCreateConversation = smallFunction.https.onCall(async (data, c
             transaction.get(callerRef),
             transaction.get(targetRef),
         ]);
-        if (!targetSnap.exists) throw new functions.https.HttpsError('not-found', 'Usuário não encontrado.');
+        if (!callerSnap.exists || callerSnap.data()?.banned === true) {
+            throw new functions.https.HttpsError('permission-denied', 'Sua conta não pode iniciar conversas.');
+        }
+        if (!targetSnap.exists || targetSnap.data()?.banned === true) {
+            throw new functions.https.HttpsError('not-found', 'Usuário não encontrado.');
+        }
         if (isBlockedBy(callerSnap.data(), targetUserId)) {
             throw new functions.https.HttpsError('permission-denied', 'Você bloqueou esta pessoa. Desbloqueie-a no seu perfil para conversar.');
         }
@@ -1156,6 +1335,10 @@ export const getOrCreateConversation = smallFunction.https.onCall(async (data, c
         const caller = callerSnap.data();
         const callerName = caller?.nick || caller?.displayName || 'Usuário';
         if (existing.exists) {
+            const participants = stringIds(existing.data()?.participants);
+            if (participants.length !== 2 || !participants.includes(uid) || !participants.includes(targetUserId)) {
+                throw new functions.https.HttpsError('failed-precondition', 'Esta conversa pertence a outras pessoas.');
+            }
             transaction.update(conversationRef, {
                 deletedBy: admin.firestore.FieldValue.arrayRemove(uid),
                 [`participantNames.${uid}`]: callerName,
@@ -1223,8 +1406,12 @@ export const sendChatMessage = smallFunction.https.onCall(async (data, context) 
             transaction.get(db.collection('users').doc(otherUserId)),
             transaction.get(notificationRef),
         ]);
-        if (!senderSnap.exists) throw new functions.https.HttpsError('failed-precondition', 'Seu perfil não está disponível.');
-        if (!recipientSnap.exists) throw new functions.https.HttpsError('failed-precondition', 'Este usuário não está mais disponível.');
+        if (!senderSnap.exists || senderSnap.data()?.banned === true) {
+            throw new functions.https.HttpsError('failed-precondition', 'Seu perfil não está disponível para enviar mensagens.');
+        }
+        if (!recipientSnap.exists || recipientSnap.data()?.banned === true) {
+            throw new functions.https.HttpsError('failed-precondition', 'Este usuário não está mais disponível.');
+        }
         if (isBlockedBy(senderSnap.data(), otherUserId)) {
             throw new functions.https.HttpsError('permission-denied', 'Você bloqueou esta pessoa. Desbloqueie-a no seu perfil para enviar mensagens.');
         }
@@ -1258,6 +1445,20 @@ export const sendChatMessage = smallFunction.https.onCall(async (data, context) 
             read: false,
             ...(shouldPush ? { lastPushAt: admin.firestore.FieldValue.serverTimestamp() } : {}),
         }, { merge: true });
+        if (shouldPush) {
+            const chatDelivery: ChatPushDelivery = {
+                id: `chat_push_${conversationId}_${otherUserId}_${messageRef.id}`,
+                userId: otherUserId,
+                type: 'chat',
+                title: `Nova mensagem de ${senderName}`,
+                body: text,
+                conversationId,
+            };
+            transaction.set(db.collection('pushOutbox').doc(chatDelivery.id), {
+                delivery: chatDelivery,
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+        }
         return {
             senderName,
             recipientUserId: otherUserId,
@@ -1269,19 +1470,29 @@ export const sendChatMessage = smallFunction.https.onCall(async (data, context) 
     let push: PushDeliverySummary | null = null;
     if (delivery.shouldPush && delivery.recipientUserId) {
         try {
-            push = await sendPushNotification(
-                [delivery.recipientUserId],
-                `Nova mensagem de ${delivery.senderName}`,
-                text,
-                { path: `/conversation/${conversationId}`, conversationId, notificationType: 'chat' },
-                {
-                    channel: 'messages',
-                    priority: 'high',
-                    preferenceField: 'notifyMessages',
-                    tag: `chat_${conversationId}`,
-                    collapseKey: `chat_${conversationId}`,
-                }
-            );
+            const chatDelivery: ChatPushDelivery = {
+                id: `chat_push_${conversationId}_${delivery.recipientUserId}_${messageRef.id}`,
+                userId: delivery.recipientUserId,
+                type: 'chat',
+                title: `Nova mensagem de ${delivery.senderName}`,
+                body: text,
+                conversationId,
+            };
+            const messages = await pushMessagesForUser(chatDelivery.userId, chatDelivery.title, chatDelivery.body, {
+                path: `/conversation/${conversationId}`,
+                conversationId,
+                notificationType: 'chat',
+                notificationId: `chat_${conversationId}_${chatDelivery.userId}`,
+                outboxId: chatDelivery.id,
+            }, {
+                channel: 'messages',
+                priority: 'high',
+                preferenceField: 'notifyMessages',
+                tag: `chat_${conversationId}`,
+                collapseKey: `chat_${conversationId}`,
+            });
+            push = await deliverPushMessages(db, messages);
+            await settlePushOutbox([chatDelivery], messages, push);
         } catch {
             console.error('[ChatMessage] push_delivery_failed', { conversationId });
         }
@@ -1410,7 +1621,9 @@ export const setFrequentedPlacesPrivacy = smallFunction.https.onCall(async (data
     }
 
     const enabled = (data as Record<string, unknown>).enabled as boolean;
-    await db.collection('users').doc(uid).set({ shareFrequentedPlaces: enabled }, { merge: true });
+    const userRef = db.collection('users').doc(uid);
+    if (!(await userRef.get()).exists) throw new functions.https.HttpsError('not-found', 'Perfil não encontrado.');
+    await userRef.update({ shareFrequentedPlaces: enabled });
     console.info('[ProfilePrivacy] compatibility_preference_updated');
     return { ok: true };
 });
@@ -1424,6 +1637,9 @@ export const checkInToEvent = smallFunction.https.onCall(async (data, context) =
     const result = await db.runTransaction(async (transaction) => {
         const [eventSnap, userSnap] = await Promise.all([transaction.get(eventRef), transaction.get(userRef)]);
         if (!eventSnap.exists) throw new functions.https.HttpsError('not-found', 'Evento não encontrado.');
+        if (!userSnap.exists || userSnap.data()?.banned === true) {
+            throw new functions.https.HttpsError('permission-denied', 'Sua conta não pode registrar check-in.');
+        }
         const event = eventSnap.data()!;
         if ((event.status && event.status !== 'active') || !stringIds(event.attendees).includes(uid) || !isCheckInWindowOpen(event, new Date())) {
             throw new functions.https.HttpsError('failed-precondition', 'O check-in só pode ser solicitado entre o início e o término do evento ativo.');
@@ -2097,6 +2313,7 @@ async function cleanUpOldNotifications(): Promise<number> {
 const DAILY_RECOMMENDATION_EVENT_LIMIT = 30;
 const DAILY_RECOMMENDATION_DEVICE_LIMIT = 200;
 const DAILY_RECOMMENDATION_USER_LIMIT = 100;
+const DAILY_RECOMMENDATION_WINDOW_DAYS = 7;
 const RECOMMENDATION_LOCATION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
 function recommendationLocationFrom(settings: FirebaseFirestore.DocumentData | undefined): RecommendationLocation | null {
@@ -2127,6 +2344,7 @@ function recommendationEventFrom(
         eventId: eventDocument.id,
         title: typeof event.title === 'string' && event.title.trim() ? event.title.trim() : 'Evento',
         type: event.type === 'online' ? 'online' : 'in-person',
+        placeId: typeof event.placeId === 'string' ? event.placeId : undefined,
         interests,
         latitude: typeof event.lat === 'number' && Number.isFinite(event.lat) ? event.lat : null,
         longitude: typeof event.lng === 'number' && Number.isFinite(event.lng) ? event.lng : null,
@@ -2134,48 +2352,181 @@ function recommendationEventFrom(
         endsAtMs: end.getTime(),
         createdBy,
         attendees: stringIds(event.attendees),
+        createdAtMs: event.createdAt instanceof admin.firestore.Timestamp ? event.createdAt.toMillis() : null,
     };
 }
 
-// Duas execuções diárias (Brasil, fuso único) em vez de uma: pegam eventos
-// criados ao longo do dia sem aumentar notificação por pessoa — o cooldown de
-// 3 dias abaixo (recommendations.ts) já bloqueia uma 2ª notificação no mesmo
-// dia se a 1ª execução já tiver notificado. O trabalho continua proporcional
-// aos aparelhos com push ativo, não ao histórico de usuários/eventos.
-export const dailyEventRecommendations = dailyFunction.pubsub
-    .schedule('0 7,13 * * *')
+// Três execuções dão chance aos eventos publicados depois das 13h. A janela
+// de sete dias deixa a pessoa se planejar; o cooldown de 72 horas usa o
+// instante real de criação do aviso, não só a data no calendário.
+export const checkExpoPushReceipts = dailyFunction.pubsub
+    .schedule('*/15 * * * *')
+    .timeZone('America/Sao_Paulo')
+    .onRun(async () => {
+        const checked = await processExpoReceipts(db);
+        console.info('[PushNotification] receipts_checked', { checked });
+        return null;
+    });
+
+export const retryPendingEventPushes = dailyFunction.pubsub
+    .schedule('*/10 * * * *')
+    .timeZone('America/Sao_Paulo')
+    .onRun(async () => {
+        const pending = await db.collection('pushOutbox').orderBy('createdAt').limit(100).get();
+        let retried = 0;
+        for (const document of pending.docs) {
+            const delivery = document.data().delivery as EventNotificationDelivery | ChatPushDelivery | undefined;
+            if (!delivery?.userId || ('conversationId' in delivery ? !delivery.conversationId : !delivery.meetingId)) {
+                await document.ref.delete();
+                continue;
+            }
+            if ('expiresAtMs' in delivery && delivery.expiresAtMs && Date.now() >= delivery.expiresAtMs) {
+                await document.ref.delete();
+                continue;
+            }
+            const createdAt = document.data().createdAt;
+            if (createdAt instanceof admin.firestore.Timestamp && Date.now() - createdAt.toMillis() > 24 * 60 * 60 * 1000) {
+                await document.ref.delete();
+                continue;
+            }
+            try {
+                const isChat = 'conversationId' in delivery;
+                const allMessages = await pushMessagesForUser(delivery.userId, delivery.title, delivery.body, isChat ? {
+                    path: `/conversation/${delivery.conversationId}`,
+                    conversationId: delivery.conversationId,
+                    notificationType: delivery.type,
+                    notificationId: `chat_${delivery.conversationId}_${delivery.userId}`,
+                    outboxId: delivery.id,
+                } : {
+                    path: `/event/${delivery.meetingId}`,
+                    meetingId: delivery.meetingId,
+                    notificationType: delivery.type,
+                    notificationId: delivery.id,
+                }, {
+                    channel: isChat ? 'messages' : delivery.channel ?? 'events',
+                    priority: isChat || (delivery.type !== 'event_completed' && delivery.type !== 'daily_event_recommendation') ? 'high' : 'normal',
+                    preferenceField: isChat ? 'notifyMessages' : delivery.preferenceField ?? 'notifyEventUpdates',
+                    ...(isChat ? { tag: `chat_${delivery.conversationId}`, collapseKey: `chat_${delivery.conversationId}` }
+                        : delivery.type === 'checkin_request' || delivery.type === 'checkin_review_ready' ? {
+                            tag: `checkin_review_${delivery.meetingId}`,
+                            collapseKey: `checkin_review_${delivery.meetingId}`,
+                        } : { tag: delivery.id, collapseKey: delivery.id }),
+                });
+                const pendingPaths = document.data().registrationPaths;
+                const messages = allMessages
+                    .filter((message) => !Array.isArray(pendingPaths) || pendingPaths.includes(message.registrationPath))
+                    .map((message) => ({ ...message, expiresAtMs: 'expiresAtMs' in delivery ? delivery.expiresAtMs : undefined }));
+                const summary = await deliverPushMessages(db, messages);
+                await settlePushOutbox([delivery], messages, summary);
+                retried += 1;
+            } catch {
+                console.error('[PushNotification] outbox_retry_failed', { notificationId: delivery.id });
+            }
+        }
+        console.info('[PushNotification] outbox_retry_completed', { retried, pending: pending.size });
+        return null;
+    });
+
+export const dailyEventRecommendations = recommendationFunction.pubsub
+    .schedule('0 7,13,19 * * *')
     .timeZone('America/Sao_Paulo')
     .onRun(async () => {
         const today = dateInSaoPaulo();
-        const [eventSnapshot, deviceSnapshot] = await Promise.all([
-            db.collection('meetings')
+        const firstDate = dateInSaoPaulo(-1);
+        const finalDate = dateInSaoPaulo(DAILY_RECOMMENDATION_WINDOW_DAYS);
+        const events: RecommendationEvent[] = [];
+        let lastEvent: FirebaseFirestore.QueryDocumentSnapshot | undefined;
+        while (true) {
+            let eventQuery = db.collection('meetings')
                 .where('status', '==', 'active')
-                .where('date', '==', today)
-                .limit(DAILY_RECOMMENDATION_EVENT_LIMIT)
-                .get(),
-            db.collection('pushDevices')
-                .limit(DAILY_RECOMMENDATION_DEVICE_LIMIT)
-                .get(),
-        ]);
+                .where('date', '>=', firstDate)
+                .where('date', '<=', finalDate)
+                .orderBy('date', 'asc')
+                .limit(DAILY_RECOMMENDATION_EVENT_LIMIT);
+            if (lastEvent) eventQuery = eventQuery.startAfter(lastEvent);
+            const page = await eventQuery.get();
+            events.push(...page.docs.map(recommendationEventFrom)
+                .filter((event): event is RecommendationEvent => event !== null));
+            if (page.empty || page.size < DAILY_RECOMMENDATION_EVENT_LIMIT) break;
+            lastEvent = page.docs[page.docs.length - 1];
+        }
+
+        const devicesByUser = new Map<string, FirebaseFirestore.QueryDocumentSnapshot[]>();
+        let lastDevice: FirebaseFirestore.QueryDocumentSnapshot | undefined;
+        while (true) {
+            let deviceQuery = db.collection('pushDevices')
+                .orderBy(admin.firestore.FieldPath.documentId())
+                .limit(DAILY_RECOMMENDATION_DEVICE_LIMIT);
+            if (lastDevice) deviceQuery = deviceQuery.startAfter(lastDevice);
+            const page = await deviceQuery.get();
+            page.docs.forEach((device) => {
+                const uid = device.data().userId;
+                if (typeof uid !== 'string' || !uid) return;
+                devicesByUser.set(uid, [...(devicesByUser.get(uid) ?? []), device]);
+            });
+            if (page.empty || page.size < DAILY_RECOMMENDATION_DEVICE_LIMIT) break;
+            lastDevice = page.docs[page.docs.length - 1];
+        }
         const nowMs = Date.now();
-        const events = eventSnapshot.docs
-            .map(recommendationEventFrom)
-            .filter((event): event is RecommendationEvent => event !== null && event.endsAtMs > nowMs);
-        const recipientIds = [...new Set(deviceSnapshot.docs
-            .map((device) => device.data().userId)
-            .filter((userId): userId is string => typeof userId === 'string' && userId.length > 0))]
-            .slice(0, DAILY_RECOMMENDATION_USER_LIMIT);
-        if (events.length === 0 || recipientIds.length === 0) {
-            console.info('[DailyRecommendation] no_candidates', { eventCount: events.length, recipientCount: recipientIds.length });
+        const availableEvents = events.filter((event) => event.endsAtMs > nowMs);
+        if (availableEvents.length === 0) {
+            console.info('[DailyRecommendation] no_candidates', { eventCount: availableEvents.length });
             return null;
         }
 
-        const [profiles, settingsDocuments] = await Promise.all([
-            db.getAll(...recipientIds.map((userId) => db.collection('users').doc(userId))),
-            db.getAll(...recipientIds.map((userId) => db.collection('notificationSettings').doc(userId))),
-        ]);
-        const settingsByUserId = new Map(settingsDocuments.map((settings) => [settings.id, settings.data()]));
-        const deliveries = profiles.flatMap((profile): EventNotificationDelivery[] => {
+        const creatorIds = [...new Set(availableEvents.map((event) => event.createdBy))];
+        const creatorProfiles = new Map<string, FirebaseFirestore.DocumentData>();
+        for (let offset = 0; offset < creatorIds.length; offset += DAILY_RECOMMENDATION_USER_LIMIT) {
+            const chunk = creatorIds.slice(offset, offset + DAILY_RECOMMENDATION_USER_LIMIT);
+            const documents = await db.getAll(...chunk.map((uid) => db.collection('users').doc(uid)));
+            documents.forEach((document) => {
+                if (document.exists) creatorProfiles.set(document.id, document.data()!);
+            });
+        }
+        const eligibleEvents = availableEvents.filter((event) => creatorProfiles.get(event.createdBy)?.banned !== true)
+            .map((event) => ({
+            ...event,
+            blockedRecipientIds: stringIds(creatorProfiles.get(event.createdBy)?.blockedUsers),
+        }));
+
+        // Um documento por local de evento, sem consultar o histórico de GPS nem
+        // percorrer a subcoleção privada de cada usuário em cada execução.
+        const placeIds = [...new Set(eligibleEvents
+            .filter((event) => event.type === 'in-person' && event.placeId)
+            .map((event) => event.placeId!))];
+        const frequentedPlacesByUser = new Map<string, Record<string, HabitScheduleInput>>();
+        for (let offset = 0; offset < placeIds.length; offset += 100) {
+            const places = await db.getAll(...placeIds.slice(offset, offset + 100)
+                .map((placeId) => db.collection('places').doc(placeId)));
+            places.forEach((place) => {
+                if (!place.exists) return;
+                const schedules = place.data()?.habitSchedules;
+                stringIds(place.data()?.frequenters).forEach((userId) => {
+                    const userPlaces = frequentedPlacesByUser.get(userId) ?? {};
+                    userPlaces[place.id] = isRecord(schedules) && isRecord(schedules[userId])
+                        ? schedules[userId] as HabitScheduleInput : {};
+                    frequentedPlacesByUser.set(userId, userPlaces);
+                });
+            });
+        }
+
+        let matched = 0;
+        let created = 0;
+        let recipientCount = 0;
+        let lastProfile: FirebaseFirestore.QueryDocumentSnapshot | undefined;
+        while (true) {
+            let profileQuery = db.collection('users').orderBy(admin.firestore.FieldPath.documentId())
+                .limit(DAILY_RECOMMENDATION_USER_LIMIT);
+            if (lastProfile) profileQuery = profileQuery.startAfter(lastProfile);
+            const profilePage = await profileQuery.get();
+            if (profilePage.empty) break;
+            const profiles = profilePage.docs;
+            recipientCount += profiles.length;
+            lastProfile = profiles[profiles.length - 1];
+            const settingsDocuments = await db.getAll(...profiles.map((profile) =>
+                db.collection('notificationSettings').doc(profile.id)));
+            const settingsByUserId = new Map(settingsDocuments.map((settings) => [settings.id, settings.data()]));
+            const deliveries = profiles.flatMap((profile): EventNotificationDelivery[] => {
             const profileData = profile.data();
             if (!profile.exists || !profileData || profileData.banned === true) return [];
             const settings = settingsByUserId.get(profile.id);
@@ -2186,27 +2537,34 @@ export const dailyEventRecommendations = dailyFunction.pubsub
                     ? profileData.interests.filter((interest: unknown): interest is string => typeof interest === 'string')
                     : [],
                 location: recommendationLocationFrom(settings),
+                frequentedPlaces: frequentedPlacesByUser.get(profile.id),
+                blockedUserIds: stringIds(profileData.blockedUsers),
             };
-            const selectedEvent = selectDailyRecommendation(events, user, nowMs);
+            const selectedEvent = selectDailyRecommendation(eligibleEvents, user, nowMs);
             if (!selectedEvent) return [];
             const inProgress = selectedEvent.startsAtMs <= nowMs;
+            const when = selectedEvent.startsAtMs - nowMs <= 24 * 60 * 60 * 1000 ? 'hoje ou amanhã' : 'nos próximos dias';
             return [{
                 id: `daily_recommendation_${today}_${profile.id}`,
                 userId: profile.id,
                 type: 'daily_event_recommendation',
-                title: inProgress ? 'Um evento do seu interesse está acontecendo' : 'Evento do seu interesse hoje',
+                title: inProgress ? 'Um evento do seu interesse está acontecendo' : `Evento do seu interesse ${when}`,
                 body: selectedEvent.type === 'online'
                     ? `"${selectedEvent.title}" é online e combina com seus interesses.`
-                    : `"${selectedEvent.title}" acontece hoje perto de você.`,
+                    : isFrequentedPlaceEvent(selectedEvent, user)
+                        ? `"${selectedEvent.title}" acontece ${when} em um lugar que você frequenta.`
+                        : `"${selectedEvent.title}" acontece ${when} perto de você.`,
                 meetingId: selectedEvent.eventId,
+                expiresAtMs: selectedEvent.endsAtMs,
                 preferenceField: 'notifyRecommendations',
                 channel: 'recommendations',
             }];
-        });
-        if (deliveries.length === 0) {
-            console.info('[DailyRecommendation] no_matches', { eventCount: events.length, recipientCount: recipientIds.length });
-            return null;
-        }
+            });
+            matched += deliveries.length;
+            if (deliveries.length === 0) {
+                if (profiles.length < DAILY_RECOMMENDATION_USER_LIMIT) break;
+                continue;
+            }
 
         // O job roda sempre no mesmo horário. Consultar hoje e os dois dias
         // anteriores cria um cooldown de 72 horas sem outro documento de estado,
@@ -2215,10 +2573,19 @@ export const dailyEventRecommendations = dailyFunction.pubsub
             recommendationCooldownNotificationIds(today, delivery.userId)
                 .map((notificationId) => db.collection('notifications').doc(notificationId))
         );
-        const existingNotifications = await db.getAll(...cooldownReferences);
-        const existingIds = new Set(existingNotifications.filter((notification) => notification.exists).map((notification) => notification.id));
+        const existingNotifications: FirebaseFirestore.DocumentSnapshot[] = [];
+        for (let index = 0; index < cooldownReferences.length; index += 100) {
+            existingNotifications.push(...await db.getAll(...cooldownReferences.slice(index, index + 100)));
+        }
+        const existingTimes = new Map<string, number[]>();
+        existingNotifications.forEach((notification) => {
+            const userId = notification.data()?.userId;
+            const createdAt = notification.data()?.createdAt;
+            if (typeof userId !== 'string' || !(createdAt instanceof admin.firestore.Timestamp)) return;
+            existingTimes.set(userId, [...(existingTimes.get(userId) ?? []), createdAt.toMillis()]);
+        });
         const newDeliveries = deliveries.filter((delivery) =>
-            canSendDailyRecommendation(today, delivery.userId, existingIds)
+            canSendDailyRecommendation(nowMs, existingTimes.get(delivery.userId) ?? [])
         );
         if (newDeliveries.length > 0) {
             const notificationBatch = db.batch();
@@ -2231,10 +2598,14 @@ export const dailyEventRecommendations = dailyFunction.pubsub
                 createdAt: admin.firestore.FieldValue.serverTimestamp(),
                 read: false,
             }));
+            newDeliveries.forEach((delivery) => notificationBatch.set(db.collection('pushOutbox').doc(delivery.id), {
+                delivery: JSON.parse(JSON.stringify(delivery)),
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            }));
             await notificationBatch.commit();
 
             const deliveryByUserId = new Map(newDeliveries.map((delivery) => [delivery.userId, delivery]));
-            const pushMessages = deviceSnapshot.docs.flatMap((device): PushMessage[] => {
+            const pushMessages = [...devicesByUser.values()].flat().flatMap((device): PushMessage[] => {
                 const deviceData = device.data();
                 const userId = typeof deviceData.userId === 'string' ? deviceData.userId : '';
                 const delivery = deliveryByUserId.get(userId);
@@ -2251,24 +2622,30 @@ export const dailyEventRecommendations = dailyFunction.pubsub
                         path: `/event/${delivery.meetingId}`,
                         meetingId: delivery.meetingId,
                         notificationType: delivery.type,
+                        notificationId: delivery.id,
                     },
                     channel: 'recommendations',
                     priority: 'normal',
+                    expiresAtMs: eligibleEvents.find((event) => event.eventId === delivery.meetingId)?.endsAtMs,
                     tag: 'daily_event_recommendation',
                     collapseKey: 'daily_event_recommendation',
                 }];
             });
             try {
-                await deliverPushMessages(db, pushMessages);
+                const summary = await deliverPushMessages(db, pushMessages);
+                await settlePushOutbox(newDeliveries, pushMessages, summary);
             } catch {
                 console.error('[DailyRecommendation] push_delivery_failed', { recipientCount: newDeliveries.length });
             }
+            created += newDeliveries.length;
+        }
+            if (profiles.length < DAILY_RECOMMENDATION_USER_LIMIT) break;
         }
         console.info('[DailyRecommendation] completed', {
-            eventCount: events.length,
-            recipientCount: recipientIds.length,
-            matched: deliveries.length,
-            delivered: newDeliveries.length,
+            eventCount: availableEvents.length,
+            recipientCount,
+            matched,
+            created,
         });
         return null;
     });
@@ -2536,6 +2913,178 @@ export const cancelEvent = smallFunction.https.onCall(async (data, context) => {
     return { ok: true, penalized: result.penalized, alreadyClosed: result.alreadyClosed };
 });
 
+/**
+ * Prazo em que o evento deixa de aceitar edição, medido a partir do horário de
+ * início ATUALMENTE gravado. Existe para que ninguém confirme presença com base
+ * numa informação e chegue ao local encontrando outra.
+ */
+const EVENT_EDIT_LOCK_MS = 24 * 60 * 60 * 1000;
+const EVENT_MIN_LEAD_MS = 5 * 60 * 1000;
+const EVENT_MIN_DURATION_MS = 15 * 60 * 1000;
+const EVENT_MAX_DURATION_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Edição de evento pelo criador, até 24 h antes do início.
+ *
+ * Existe porque a única alternativa era cancelar e recriar — o que perdia todos
+ * os confirmados E tirava 15 pontos de reputação de quem só errou um horário.
+ *
+ * NÃO são editáveis de propósito: o tipo (presencial ↔ online trocaria a
+ * natureza do evento e deixaria `lat`/`lng` ou `meetingLink` órfãos), as
+ * coordenadas no mapa, e a série de repetições. O nome do local é editável; mover
+ * o pino exige o seletor de mapa e fica para depois.
+ *
+ * Passa por callable, e não por escrita direta, porque `meetings` tem
+ * `allow update: if false` nas regras: o Admin SDK é quem pode escrever, e é aqui
+ * que as validações de duração, prazo e autoria são garantidas.
+ */
+export const editEvent = smallFunction.https.onCall(async (data, context) => {
+    const uid = requireAuthenticated(context);
+    const eventId = requireEventId(data);
+
+    const title = requireStringField(data, 'title').trim();
+    const description = requireStringField(data, 'description').trim();
+    const locationName = requireStringField(data, 'locationName').trim();
+    const date = requireDateField(data, 'date');
+    const time = requireClockField(data, 'time');
+    const endDate = requireDateField(data, 'endDate');
+    const endTime = requireClockField(data, 'endTime');
+    const interests = requireEventInterests(data);
+    const meetingLinkInput = isRecord(data) && typeof data.meetingLink === 'string' ? data.meetingLink.trim() : '';
+
+    if (title.length < 3 || title.length > 100) {
+        throw new functions.https.HttpsError('invalid-argument', 'O nome do evento deve ter de 3 a 100 caracteres.');
+    }
+    if (description.length < 1 || description.length > 2000) {
+        throw new functions.https.HttpsError('invalid-argument', 'A descrição deve ter de 1 a 2000 caracteres.');
+    }
+    if (locationName.length < 1 || locationName.length > 150) {
+        throw new functions.https.HttpsError('invalid-argument', 'O local deve ter de 1 a 150 caracteres.');
+    }
+
+    const nextStart = new Date(`${date}T${time}:00-03:00`);
+    const nextEnd = new Date(`${endDate}T${endTime}:00-03:00`);
+    if (Number.isNaN(nextStart.getTime()) || Number.isNaN(nextEnd.getTime())) {
+        throw new functions.https.HttpsError('invalid-argument', 'Revise a data e os horários.');
+    }
+    const durationMs = nextEnd.getTime() - nextStart.getTime();
+    if (durationMs < EVENT_MIN_DURATION_MS) {
+        throw new functions.https.HttpsError('invalid-argument', 'O evento precisa durar pelo menos 15 minutos.');
+    }
+    if (durationMs > EVENT_MAX_DURATION_MS) {
+        throw new functions.https.HttpsError('invalid-argument', 'Um evento pode durar no máximo 24 horas.');
+    }
+    if (nextStart.getTime() <= Date.now() + EVENT_MIN_LEAD_MS) {
+        throw new functions.https.HttpsError('invalid-argument', 'Escolha um horário com pelo menos 5 minutos de antecedência.');
+    }
+
+    const eventRef = db.collection('meetings').doc(eventId);
+    const notificationRevision = db.collection('notifications').doc().id;
+    const result = await db.runTransaction(async (transaction) => {
+        const eventSnap = await transaction.get(eventRef);
+        if (!eventSnap.exists) throw new functions.https.HttpsError('not-found', 'Evento não encontrado.');
+        const event = eventSnap.data()!;
+        if (event.createdBy !== uid) {
+            throw new functions.https.HttpsError('permission-denied', 'Apenas o criador pode editar este evento.');
+        }
+        if (event.status && event.status !== 'active') {
+            throw new functions.https.HttpsError('failed-precondition', 'Este evento já foi encerrado ou cancelado.');
+        }
+
+        const currentStart = getEventStartDate(event);
+        if (!currentStart) {
+            throw new functions.https.HttpsError('failed-precondition', 'Este evento não tem horário válido para edição.');
+        }
+        const msUntilStart = currentStart.getTime() - Date.now();
+        if (msUntilStart < EVENT_EDIT_LOCK_MS) {
+            throw new functions.https.HttpsError(
+                'failed-precondition',
+                'A edição fecha 24 horas antes do início, para ninguém ser pego de surpresa. Se precisar mudar algo agora, fale com os participantes ou cancele o evento.'
+            );
+        }
+
+        const isOnline = event.type === 'online';
+        let meetingLink = typeof event.meetingLink === 'string' ? event.meetingLink : '';
+        if (isOnline) {
+            // Mesmo esquema minúsculo e sem espaço em branco que o cliente grava:
+            // as regras comparam com `^https://` literal e o `matches()` do
+            // Firestore casa a string inteira, então um `\n` colado reprovaria.
+            meetingLink = meetingLinkInput.replace(/[\s​‌‍⁠﻿]+/g, '').replace(/^https:\/\//i, 'https://');
+            if (!/^https:\/\/.+/.test(meetingLink) || meetingLink.length > 500) {
+                throw new functions.https.HttpsError('invalid-argument', 'Informe um link HTTPS válido para a reunião online.');
+            }
+        }
+
+        const scheduleChanged = event.date !== date
+            || event.time !== time
+            || event.endDate !== endDate
+            || event.endTime !== endTime;
+        const placeChanged = (typeof event.locationName === 'string' ? event.locationName : '') !== locationName;
+        const linkChanged = isOnline && (typeof event.meetingLink === 'string' ? event.meetingLink : '') !== meetingLink;
+
+        transaction.update(eventRef, {
+            title,
+            description,
+            locationName,
+            interests,
+            theme: interests[0],
+            date,
+            time,
+            endDate,
+            endTime,
+            startsAt: admin.firestore.Timestamp.fromDate(nextStart),
+            endsAt: admin.firestore.Timestamp.fromDate(nextEnd),
+            ...(isOnline ? { meetingLink } : {}),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            notificationRevision,
+        });
+
+        return {
+            title,
+            scheduleChanged,
+            placeChanged,
+            linkChanged,
+            notificationRevision,
+            // O próprio criador não precisa de aviso do que ele acabou de fazer.
+            attendees: stringIds(event.attendees).filter((attendeeId) => attendeeId !== uid),
+        };
+    });
+
+    const mattersToAttendees = result.scheduleChanged || result.placeChanged || result.linkChanged;
+    if (mattersToAttendees && result.attendees.length > 0) {
+        const changes = [
+            result.scheduleChanged ? 'data/horário' : null,
+            result.placeChanged ? 'local' : null,
+            result.linkChanged ? 'link' : null,
+        ].filter(Boolean).join(', ');
+        try {
+            await deliverEventNotifications(result.attendees.map((attendeeId) => ({
+                // Id determinístico: uma segunda edição substitui o aviso anterior
+                // em vez de empilhar notificação para o mesmo evento.
+                id: `event_updated_${eventId}_${attendeeId}`,
+                userId: attendeeId,
+                type: 'event_updated',
+                title: 'Evento atualizado',
+                body: `"${result.title}" teve mudança de ${changes}. Confira os novos detalhes.`,
+                meetingId: eventId,
+                revision: result.notificationRevision,
+                preferenceField: 'notifyEventUpdates',
+                channel: 'events',
+            })));
+        } catch {
+            console.error('[EventEdit] notification_failed', { eventId });
+        }
+    }
+
+    console.info('[EventEdit] completed', {
+        scheduleChanged: result.scheduleChanged,
+        placeChanged: result.placeChanged,
+        linkChanged: result.linkChanged,
+        notified: mattersToAttendees ? result.attendees.length : 0,
+    });
+    return { ok: true, scheduleChanged: result.scheduleChanged };
+});
+
 async function processQueryInBatches(
     query: FirebaseFirestore.Query,
     apply: (batch: FirebaseFirestore.WriteBatch, snapshot: FirebaseFirestore.QueryDocumentSnapshot) => void
@@ -2617,17 +3166,28 @@ export const banUser = accountFunction.https.onCall(async (data, context) => {
 
     // A conta continua marcada como banida para impedir nova sessão; as demais
     // relações do usuário saem do app por consultas limitadas e sob demanda.
-    const createdEvents = await db.collection('meetings').where('createdBy', '==', targetUserId).limit(200).get();
-    const eventsToCancel = createdEvents.docs.filter((eventDocument) => isEventStillActive(eventDocument.data().status));
-    if (eventsToCancel.length > 0) {
-        const batch = db.batch();
-        eventsToCancel.forEach((eventDocument) => batch.update(eventDocument.ref, { status: 'cancelled', moderationRemoved: true }));
-        await batch.commit();
-        try {
-            await notifyCancelledEvents(eventsToCancel.map((eventDocument) => ({ eventId: eventDocument.id, event: eventDocument.data() })));
-        } catch {
-            console.error('[Moderation] banned_event_notifications_failed', { eventCount: eventsToCancel.length });
+    let cancelledEvents = 0;
+    let createdEventsCursor: FirebaseFirestore.QueryDocumentSnapshot | undefined;
+    while (true) {
+        let createdEventsQuery = db.collection('meetings').where('createdBy', '==', targetUserId)
+            .orderBy(admin.firestore.FieldPath.documentId()).limit(200);
+        if (createdEventsCursor) createdEventsQuery = createdEventsQuery.startAfter(createdEventsCursor);
+        const createdEvents = await createdEventsQuery.get();
+        if (createdEvents.empty) break;
+        const eventsToCancel = createdEvents.docs.filter((eventDocument) => isEventStillActive(eventDocument.data().status));
+        if (eventsToCancel.length > 0) {
+            const batch = db.batch();
+            eventsToCancel.forEach((eventDocument) => batch.update(eventDocument.ref, { status: 'cancelled', moderationRemoved: true }));
+            await batch.commit();
+            cancelledEvents += eventsToCancel.length;
+            try {
+                await notifyCancelledEvents(eventsToCancel.map((eventDocument) => ({ eventId: eventDocument.id, event: eventDocument.data() })));
+            } catch {
+                console.error('[Moderation] banned_event_notifications_failed', { eventCount: eventsToCancel.length });
+            }
         }
+        if (createdEvents.size < 200) break;
+        createdEventsCursor = createdEvents.docs[createdEvents.docs.length - 1];
     }
     await processQueryInBatches(
         db.collection('meetings').where('attendees', 'array-contains', targetUserId),
@@ -2637,15 +3197,26 @@ export const banUser = accountFunction.https.onCall(async (data, context) => {
             pendingCheckIns: pendingCheckIns(document.data().pendingCheckIns).filter((request) => request.userId !== targetUserId),
         })
     );
-    await processQueryInBatches(
-        db.collection('conversations').where('participants', 'array-contains', targetUserId),
-        (batch, document) => batch.update(document.ref, {
-            participants: admin.firestore.FieldValue.arrayRemove(targetUserId),
+    // Preserva o contrato estrutural de dois participantes e o histórico da
+    // outra pessoa; getOrCreateConversation/sendChatMessage barram conta banida.
+    let conversationCursor: FirebaseFirestore.QueryDocumentSnapshot | undefined;
+    while (true) {
+        let conversationQuery = db.collection('conversations')
+            .where('participants', 'array-contains', targetUserId)
+            .orderBy(admin.firestore.FieldPath.documentId()).limit(200);
+        if (conversationCursor) conversationQuery = conversationQuery.startAfter(conversationCursor);
+        const conversations = await conversationQuery.get();
+        if (conversations.empty) break;
+        const batch = db.batch();
+        conversations.docs.forEach((document) => batch.update(document.ref, {
             deletedBy: admin.firestore.FieldValue.arrayUnion(targetUserId),
             [`participantNames.${targetUserId}`]: 'Usuário banido',
             [`unreadCounts.${targetUserId}`]: admin.firestore.FieldValue.delete(),
-        })
-    );
+        }));
+        await batch.commit();
+        if (conversations.size < 200) break;
+        conversationCursor = conversations.docs[conversations.docs.length - 1];
+    }
     await processQueryInBatches(
         db.collectionGroup('messages').where('senderId', '==', targetUserId),
         (batch, document) => batch.delete(document.ref)
@@ -2699,8 +3270,8 @@ export const banUser = accountFunction.https.onCall(async (data, context) => {
         'A moderação analisou a denúncia e tomou uma medida sobre a conta informada.',
         '/notifications'
     ).catch(() => console.error('[Moderation] reporter_resolution_failed', { targetType: 'user' }));
-    console.info('[Moderation] user_banned', { cancelledEvents: eventsToCancel.length });
-    return { ok: true, cancelledEvents: eventsToCancel.length };
+    console.info('[Moderation] user_banned', { cancelledEvents });
+    return { ok: true, cancelledEvents };
 });
 
 export const deleteMyAccount = accountFunction.https.onCall(async (_data, context) => {
@@ -2733,6 +3304,21 @@ export const deleteMyAccount = accountFunction.https.onCall(async (_data, contex
             } catch {
                 console.error('[AccountDeletion] attendee_notification_failed', { eventCount: eventsToNotify.length });
             }
+        }
+
+        // Os documentos ligados ao evento deixam de ser alcançáveis pela rotina
+        // de retenção depois que o evento é apagado. Limpá-los primeiro também
+        // permite retomar a exclusão com segurança caso um lote falhe.
+        for (let offset = 0; offset < createdEventsSnapshot.size; offset += 10) {
+            const eventIds = createdEventsSnapshot.docs.slice(offset, offset + 10).map((event) => event.id);
+            await processQueryInBatches(
+                db.collection('eventInvitations').where('eventId', 'in', eventIds),
+                (batch, document) => batch.delete(document.ref),
+            );
+            await processQueryInBatches(
+                db.collection('eventCheckInReviews').where('eventId', 'in', eventIds),
+                (batch, document) => batch.delete(document.ref),
+            );
         }
 
         if (createdEventsSnapshot.size < 200) break;
@@ -2799,21 +3385,26 @@ export const deleteMyAccount = accountFunction.https.onCall(async (_data, contex
             pendingCheckIns: pendingCheckIns(document.data().pendingCheckIns).filter((request) => request.userId !== uid)
         })
     );
-    await processQueryInBatches(
-        db.collection('conversations').where('participants', 'array-contains', uid),
-        // `participants` NÃO perde o uid. Todo o cliente identifica o outro lado
-        // com `participants.find(p => p !== eu)`; removendo o uid, esse find
-        // retornava undefined e o nome caía no fallback genérico "Usuário",
-        // enquanto a tela da conversa abortava antes de checar se o perfil ainda
-        // existe — deixando o campo de digitar habilitado para um destinatário
-        // que não existe mais. O nome anonimizado abaixo é o que preserva a
-        // privacidade; o array é contrato estrutural da conversa.
-        (batch, document) => batch.update(document.ref, {
+    // `participants` é parte do contrato do chat; sua preservação exige cursor,
+    // pois atualizar os documentos não os retira do resultado da consulta.
+    let conversationCursor: FirebaseFirestore.QueryDocumentSnapshot | undefined;
+    while (true) {
+        let conversationQuery = db.collection('conversations')
+            .where('participants', 'array-contains', uid)
+            .orderBy(admin.firestore.FieldPath.documentId()).limit(200);
+        if (conversationCursor) conversationQuery = conversationQuery.startAfter(conversationCursor);
+        const conversations = await conversationQuery.get();
+        if (conversations.empty) break;
+        const batch = db.batch();
+        conversations.docs.forEach((document) => batch.update(document.ref, {
             deletedBy: admin.firestore.FieldValue.arrayUnion(uid),
             [`participantNames.${uid}`]: 'Usuário excluído',
-            [`unreadCounts.${uid}`]: admin.firestore.FieldValue.delete()
-        })
-    );
+            [`unreadCounts.${uid}`]: admin.firestore.FieldValue.delete(),
+        }));
+        await batch.commit();
+        if (conversations.size < 200) break;
+        conversationCursor = conversations.docs[conversations.docs.length - 1];
+    }
 
     if (searchName) {
         const nicknameRef = db.collection('nicknames').doc(searchName);

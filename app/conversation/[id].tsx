@@ -13,11 +13,17 @@ import { submitReport } from '@/src/services/reportService';
 import { setActiveNotificationTarget } from '@/src/utils/Notifications';
 import { getDateStr, formatConversationDateHeader } from '@/src/utils/dateUtils';
 import { CHAT_MESSAGE_MAX_LENGTH } from '@/src/constants/textLimits';
+import { STRINGS } from '@/src/constants/strings';
 import { useFocusEffect } from '@react-navigation/native';
 
 function getErrorMessage(error: unknown): string {
     return error instanceof Error ? error.message : '';
 }
+
+type PendingMessage = { id: string; text: string; failed: boolean };
+
+/** Mensagem na lista: vinda do banco, ou local aguardando confirmação. */
+type DisplayMessage = Message & { pendingState?: 'sending' | 'failed' };
 
 type ConversationData = {
     participants: string[];
@@ -47,9 +53,21 @@ export default function ChatScreen() {
     const [messages, setMessages] = useState<Message[]>([]);
     const [inputText, setInputText] = useState('');
     const [loading, setLoading] = useState(true);
-    const [sendingMessage, setSendingMessage] = useState(false);
+    /**
+     * Mensagens já escritas pela pessoa e ainda não confirmadas pelo servidor.
+     *
+     * A gravação acontece na callable `sendChatMessage` (o Admin SDK precisa
+     * checar bloqueio, contador de não-lidas e limite de push, coisas que as
+     * regras não fazem). Como a escrita é do servidor, o Firestore do aparelho
+     * NÃO tem compensação de latência: a mensagem só aparecia depois da ida e
+     * volta HTTPS + transação + entrega do push. Daí a demora percebida.
+     *
+     * Estas bolhas locais cobrem essa janela. Elas somem sozinhas quando o
+     * listener entrega a mensagem real com o mesmo id — o id é gerado aqui antes
+     * do envio, e a callable é idempotente sobre ele, então reenviar não duplica.
+     */
+    const [pendingMessages, setPendingMessages] = useState<PendingMessage[]>([]);
     const flatListRef = useRef<FlatList>(null);
-    const pendingMessageRef = useRef<{ text: string; messageId: string } | null>(null);
     
     // Novas dependências para opções e lidas/não-lidas
     const [conversationData, setConversationData] = useState<ConversationData | null>(null);
@@ -81,6 +99,12 @@ export default function ChatScreen() {
                 ...(doc.data() as Omit<Message, 'id'>)
             }));
             setMessages(msgs.reverse());
+            // A bolha local sai daqui, não do sucesso do envio: remover antes de a
+            // mensagem real chegar abriria um vão em que ela não aparece em lugar
+            // nenhum. Este é também o único ponto que limpa o estado pendente.
+            setPendingMessages((current) => current.filter(
+                (pending) => !msgs.some((message) => message.id === pending.id)
+            ));
             setLoading(false);
             // Scroll to bottom on new message
             setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 100);
@@ -139,45 +163,50 @@ export default function ChatScreen() {
         return () => unsubscribeOtherUser();
     }, [conversationData?.participants]);
 
-    const sendMessage = async () => {
-        if (!inputText.trim() || !auth.currentUser || !id || sendingMessage) return;
+    const sendMessage = async (retryOf?: PendingMessage) => {
+        if (!auth.currentUser || !id) return;
+        const text = retryOf ? retryOf.text : inputText.trim();
+        if (!text) return;
 
-        const text = inputText.trim();
-        const pendingMessage = pendingMessageRef.current?.text === text
-            ? pendingMessageRef.current
-            : {
-                text,
-                messageId: doc(collection(db, 'conversations', id, 'messages')).id,
-            };
-        pendingMessageRef.current = pendingMessage;
-        setSendingMessage(true);
+        const messageId = retryOf ? retryOf.id : doc(collection(db, 'conversations', id, 'messages')).id;
+        // Campo limpo ANTES da rede: é o que faz o envio parecer instantâneo e
+        // libera a pessoa para escrever a próxima sem esperar.
+        if (!retryOf) setInputText('');
+        setPendingMessages((current) => [
+            ...current.filter((pending) => pending.id !== messageId),
+            { id: messageId, text, failed: false },
+        ]);
 
         try {
             await httpsCallable<{ conversationId: string; text: string; messageId: string }, { ok: boolean; alreadySent: boolean; messageId: string }>(functions, 'sendChatMessage')({
                 conversationId: id,
                 text,
-                messageId: pendingMessage.messageId,
+                messageId,
             });
-            pendingMessageRef.current = null;
-            setInputText('');
         } catch (error) {
             const message = getErrorMessage(error);
-            const isExpectedBlock = message.includes('bloqueou você') || message.includes('Você bloqueou');
-            if (isExpectedBlock) {
+            const isBlocked = message.includes('bloqueou você') || message.includes('Você bloqueou');
+            if (isBlocked) {
                 if (__DEV__) console.info('[Conversation] message_rejected_by_block');
-            } else {
-                console.error('[Conversation] message_send_failed');
+                // Bloqueio é definitivo: reenviar nunca vai funcionar, então a
+                // bolha sai da lista e o texto volta para o campo.
+                setPendingMessages((current) => current.filter((pending) => pending.id !== messageId));
+                setInputText((current) => current || text);
+                Alert.alert(
+                    'Mensagem não enviada',
+                    message.includes('bloqueou você')
+                        ? 'Esta pessoa bloqueou você e não pode receber suas mensagens.'
+                        : STRINGS.CHAT_MESSAGE_BLOCKED
+                );
+                return;
             }
-            Alert.alert(
-                'Mensagem não enviada',
-                message.includes('bloqueou você')
-                    ? 'Esta pessoa bloqueou você e não pode receber suas mensagens.'
-                    : message.includes('Você bloqueou')
-                        ? 'Você bloqueou esta pessoa. Desbloqueie-a no seu perfil para enviar mensagens.'
-                        : 'Não foi possível enviar sua mensagem. Tente novamente.'
-            );
-        } finally {
-            setSendingMessage(false);
+            // Falha transitória: sem Alert. A bolha marcada já comunica, e o toque
+            // nela reenvia com o MESMO id — a callable é idempotente, então se a
+            // primeira tentativa tinha chegado ao servidor, nada é duplicado.
+            console.error('[Conversation] message_send_failed');
+            setPendingMessages((current) => current.map(
+                (pending) => (pending.id === messageId ? { ...pending, failed: true } : pending)
+            ));
         }
     };
 
@@ -254,11 +283,25 @@ export default function ChatScreen() {
         }
     };
 
-    const renderMessage = ({ item, index }: { item: Message, index: number }) => {
+    // Pendentes entram no fim, que é a posição cronológica delas. Uma pendente
+    // cujo id já existe em `messages` não é filtrada aqui: o listener já a removeu
+    // do estado pendente, então não há risco de a mesma mensagem aparecer duas vezes.
+    const displayedMessages: DisplayMessage[] = [
+        ...messages,
+        ...pendingMessages.map((pending): DisplayMessage => ({
+            id: pending.id,
+            text: pending.text,
+            senderId: auth.currentUser?.uid ?? '',
+            pendingState: pending.failed ? 'failed' : 'sending',
+        })),
+    ];
+
+    const renderMessage = ({ item, index }: { item: DisplayMessage, index: number }) => {
         const isMe = item.senderId === auth.currentUser?.uid;
-        // messages está em ordem cronológica ascendente (msgs.reverse() no listener acima),
-        // então o último item do array é sempre a mensagem mais recente.
-        const isLastMessage = index === messages.length - 1;
+        // displayedMessages está em ordem cronológica ascendente, com as pendentes
+        // no fim — então o último item é sempre o mais recente.
+        const isLastMessage = index === displayedMessages.length - 1;
+        const isPending = Boolean(item.pendingState);
 
         const messageDate = item.createdAt?.seconds ? new Date(item.createdAt.seconds * 1000) : null;
         let timeString = '';
@@ -269,7 +312,7 @@ export default function ChatScreen() {
         // Separador de data quando o dia muda em relação à mensagem anterior
         // (ou na primeira mensagem carregada) — evita uma lista inteira só com
         // horas, sem indicar quando cada grupo de mensagens aconteceu.
-        const previousMessage = index > 0 ? messages[index - 1] : undefined;
+        const previousMessage = index > 0 ? displayedMessages[index - 1] : undefined;
         const previousMessageDate = previousMessage?.createdAt?.seconds
             ? new Date(previousMessage.createdAt.seconds * 1000)
             : null;
@@ -278,7 +321,7 @@ export default function ChatScreen() {
 
         // Determinar status de leitura para a última mensagem enviada por mim
         let isRead = false;
-        if (isMe && isLastMessage && conversationData) {
+        if (isMe && isLastMessage && !isPending && conversationData) {
             const otherUid = conversationData.participants.find((participant) => participant !== auth.currentUser?.uid);
             if (otherUid && conversationData.unreadCounts?.[otherUid] === 0) {
                 isRead = true; // Se o outro tem 0 não-lidas, ele já leu!
@@ -300,24 +343,43 @@ export default function ChatScreen() {
                             <FontAwesome name="user" size={12} color="#fff" />
                         </View>
                     )}
-                    <View style={[styles.bubble, isMe ? styles.myBubble : styles.otherBubble]}>
+                    <TouchableOpacity
+                        activeOpacity={item.pendingState === 'failed' ? 0.7 : 1}
+                        disabled={item.pendingState !== 'failed'}
+                        onPress={() => {
+                            const failed = pendingMessages.find((pending) => pending.id === item.id);
+                            if (failed) void sendMessage(failed);
+                        }}
+                        accessibilityRole={item.pendingState === 'failed' ? 'button' : undefined}
+                        accessibilityLabel={item.pendingState === 'failed' ? 'Tentar enviar esta mensagem de novo' : undefined}
+                        style={[
+                            styles.bubble,
+                            isMe ? styles.myBubble : styles.otherBubble,
+                            item.pendingState === 'sending' && styles.sendingBubble,
+                            item.pendingState === 'failed' && styles.failedBubble,
+                        ]}
+                    >
                         <Text style={[styles.messageText, isMe ? styles.myMessageText : styles.otherMessageText]}>
                             {item.text}
                         </Text>
                         <View style={styles.messageFooter}>
                             <Text style={[styles.timeText, isMe ? styles.myTimeText : styles.otherTimeText]}>
-                                {timeString}
+                                {item.pendingState === 'failed' ? 'Toque para reenviar' : item.pendingState === 'sending' ? 'Enviando...' : timeString}
                             </Text>
-                            {isMe && isLastMessage && (
+                            {item.pendingState === 'failed' ? (
+                                <Ionicons name="alert-circle" size={14} color="#FEE2E2" style={{ marginLeft: 4 }} />
+                            ) : item.pendingState === 'sending' ? (
+                                <Ionicons name="time-outline" size={14} color="rgba(255,255,255,0.7)" style={{ marginLeft: 4 }} />
+                            ) : isMe && isLastMessage ? (
                                 <Ionicons
                                     name={isRead ? "checkmark-done" : "checkmark"}
                                     size={14}
                                     color={isRead ? "#60a5fa" : "rgba(255,255,255,0.7)"}
                                     style={{ marginLeft: 4 }}
                                 />
-                            )}
+                            ) : null}
                         </View>
-                    </View>
+                    </TouchableOpacity>
                 </View>
             </>
         );
@@ -349,7 +411,7 @@ export default function ChatScreen() {
                 ) : (
                     <FlatList
                         ref={flatListRef}
-                        data={messages}
+                        data={displayedMessages}
                         renderItem={renderMessage}
                         keyExtractor={item => item.id}
                         contentContainerStyle={styles.listContent}
@@ -385,14 +447,16 @@ export default function ChatScreen() {
                             maxLength={CHAT_MESSAGE_MAX_LENGTH}
                             editable={otherUserExists}
                         />
-                        <TouchableOpacity 
-                            onPress={sendMessage} 
-                            style={[styles.sendButton, (!inputText.trim() || !otherUserExists || sendingMessage) && styles.sendButtonDisabled]}
-                            disabled={!inputText.trim() || !otherUserExists || sendingMessage}
+                        {/* Sem spinner e sem trava: com a bolha otimista, quem envia
+                            não espera a rede para escrever a próxima mensagem. */}
+                        <TouchableOpacity
+                            onPress={() => void sendMessage()}
+                            style={[styles.sendButton, (!inputText.trim() || !otherUserExists) && styles.sendButtonDisabled]}
+                            disabled={!inputText.trim() || !otherUserExists}
+                            accessibilityRole="button"
+                            accessibilityLabel="Enviar mensagem"
                         >
-                            {sendingMessage
-                                ? <ActivityIndicator size="small" color="#fff" />
-                                : <Ionicons name="send" size={20} color="#fff" />}
+                            <Ionicons name="send" size={20} color="#fff" />
                         </TouchableOpacity>
                     </View>
                 </View>
@@ -523,6 +587,10 @@ const styles = StyleSheet.create({
         backgroundColor: '#fff',
         borderBottomLeftRadius: 2,
     },
+    // Enviando: mesma cor, levemente translúcida — a diferença é discreta de
+    // propósito, porque na maioria dos envios ela vai durar menos de um segundo.
+    sendingBubble: { opacity: 0.72 },
+    failedBubble: { backgroundColor: '#B91C1C', opacity: 1 },
     messageText: {
         fontSize: 16,
     },

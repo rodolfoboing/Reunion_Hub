@@ -5,10 +5,7 @@ import { Tabs } from 'expo-router';
 import Colors from '@/src/constants/Colors';
 import { useColorScheme } from '@/src/components/useColorScheme';
 import { useClientOnlyValue } from '@/src/components/useClientOnlyValue';
-import { useEffect, useState } from 'react';
-import { auth, db } from '../../../src/services/firebaseConfig';
-import { onAuthStateChanged } from 'firebase/auth';
-import { doc, onSnapshot } from 'firebase/firestore';
+import { useIsStaffProfile } from '@/src/hooks/useUserProfile';
 
 // You can explore the built-in icon families and icons on the web at https://icons.expo.fyi/
 function TabBarIcon(props: {
@@ -20,39 +17,10 @@ function TabBarIcon(props: {
 
 export default function TabLayout() {
   const colorScheme = useColorScheme();
-  const [isAdmin, setIsAdmin] = useState(false);
-
-  useEffect(() => {
-    let isActive = true;
-
-    let unsubscribeProfile: (() => void) | undefined;
-    const unsubscribe = onAuthStateChanged(auth, (user) => {
-      if (unsubscribeProfile) {
-        unsubscribeProfile();
-        unsubscribeProfile = undefined;
-      }
-      if (!user) {
-        if (isActive) setIsAdmin(false);
-        return;
-      }
-
-      unsubscribeProfile = onSnapshot(doc(db, 'users', user.uid), (userDoc) => {
-        const role = userDoc.exists() ? userDoc.get('role') : null;
-        if (isActive) {
-          setIsAdmin(role === 'admin' || role === 'moderator');
-        }
-      }, (error) => {
-        console.error('[Tabs] Failed to load moderation role:', error);
-        if (isActive) setIsAdmin(false);
-      });
-    });
-
-    return () => {
-      isActive = false;
-      unsubscribe();
-      if (unsubscribeProfile) unsubscribeProfile();
-    };
-  }, []);
+  // O papel vem do perfil compartilhado. Antes este layout abria o próprio
+  // `onSnapshot` em `users/{uid}` só para ler `role` — e `moderation.tsx` abria
+  // outro, para o mesmo campo.
+  const isAdmin = useIsStaffProfile();
 
   return (
     <Tabs

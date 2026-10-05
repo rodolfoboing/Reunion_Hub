@@ -1,7 +1,6 @@
 import { useState } from 'react';
 import { Alert, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { router } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { doc, serverTimestamp, updateDoc } from 'firebase/firestore';
 import { auth, db } from '@/src/services/firebaseConfig';
@@ -57,10 +56,10 @@ export default function AcceptTermsScreen() {
                                 console.warn('[Auth] terms_decline_device_cleanup_failed');
                             });
                         }
+                        // Com a sessão encerrada, o portão do RootLayout leva ao login.
                         await auth.signOut().catch((signOutError: unknown) => {
                             console.error('[Auth] terms_decline_sign_out_failed', { code: getFirebaseErrorCode(signOutError) });
                         });
-                        router.replace('/login');
                     },
                 },
             ],

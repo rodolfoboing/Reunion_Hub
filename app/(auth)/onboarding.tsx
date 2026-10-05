@@ -1,6 +1,5 @@
 import { Dispatch, SetStateAction, useState } from 'react';
 import { View, Text, StyleSheet, ScrollView, Alert, Image, TouchableOpacity, TextInput, KeyboardAvoidingView, Platform } from 'react-native';
-import { router } from 'expo-router';
 import { auth, db } from '../../src/services/firebaseConfig';
 import { doc, updateDoc } from 'firebase/firestore';
 import { createInitialUserProfile, NicknameUnavailableError } from '@/src/services/profileService';
@@ -12,11 +11,10 @@ import { StyledButton } from '../../src/components/StyledButton';
 import { FontAwesome } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-import { INTERESTS_OPTIONS, normalizeInterests } from '../../src/constants/Interests';
+import { INTERESTS_OPTIONS, MAX_PROFILE_INTERESTS, normalizeInterests } from '../../src/constants/Interests';
 import { uploadProfileImage } from '@/src/services/profileService';
 import { getFirebaseErrorCode } from '@/src/utils/authError';
 
-const MAX_INTERESTS = 10;
 
 export default function CompleteProfileScreen() {
     const [bio, setBio] = useState('');
@@ -49,8 +47,8 @@ export default function CompleteProfileScreen() {
             setList(list.filter(i => i !== item));
             return;
         }
-        if (list.length >= MAX_INTERESTS) {
-            Alert.alert('Limite de interesses', `Escolha até ${MAX_INTERESTS} interesses para manter as recomendações relevantes.`);
+        if (list.length >= MAX_PROFILE_INTERESTS) {
+            Alert.alert('Limite de interesses', `Escolha até ${MAX_PROFILE_INTERESTS} interesses para manter as recomendações relevantes.`);
             return;
         }
         setList([...list, item]);
@@ -107,9 +105,10 @@ export default function CompleteProfileScreen() {
                 await updateProfile(user, { photoURL: uploadedPhotoUrl });
             }
 
-            Alert.alert('Sucesso', 'Perfil atualizado!', [
-                { text: 'Ir para Início', onPress: () => router.replace('/') }
-            ]);
+            // Sem navegar daqui: o portão do RootLayout já leva adiante assim que o
+            // perfil concluído chega — para o Início, ou para o aceite dos termos
+            // se a versão aceita estiver desatualizada. Navegar também competia com ele.
+            Alert.alert('Sucesso', 'Perfil atualizado!');
         } catch (error) {
             const code = getFirebaseErrorCode(error);
             console.error('[Onboarding] profile_completion_failed', { code });
@@ -165,7 +164,7 @@ export default function CompleteProfileScreen() {
             <View style={styles.section}>
                 <Text style={styles.label}>Interesses</Text>
                 <Text style={styles.helperText}>
-                    Escolha de 1 a {MAX_INTERESTS}. É por aqui que encontramos eventos para recomendar a você.
+                    Escolha de 1 a {MAX_PROFILE_INTERESTS}. É por aqui que encontramos eventos para recomendar a você.
                 </Text>
                 <View style={styles.chipsContainer}>
                     {INTERESTS_OPTIONS.map(item => (

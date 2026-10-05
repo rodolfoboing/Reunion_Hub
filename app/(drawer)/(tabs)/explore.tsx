@@ -199,26 +199,57 @@ const normalizeMarkerText = (value: string) => value
 // para n\u00e3o depender de como o acento est\u00e1 gravado no arquivo.
 // Interesse novo em INTERESTS_OPTIONS precisa de uma linha aqui \u2014 sen\u00e3o cai em 'general'.
 const INTEREST_MARKER_CATEGORY: Record<string, EventMarkerCategory> = {
-    'tecnologia & inovacao': 'technology',
-    'negocios & carreira': 'social',
+    // Encontrar gente e sair
+    'encontros & amizades': 'social',
+    'networking': 'social',
     'festas & shows': 'social',
+    'bares & vida noturna': 'social',
+    'gastronomia': 'social',
+    'familia & criancas': 'social',
+    // Cultura e expressão
     'musica': 'culture',
     'danca': 'culture',
-    'saude & bem-estar': 'sports',
-    'gastronomia': 'social',
     'artes & cultura': 'culture',
-    'esportes': 'sports',
-    'educacao & workshops': 'study',
-    'networking': 'social',
     'cinema & teatro': 'culture',
+    'literatura': 'study',
+    'fotografia': 'culture',
+    'artesanato & diy': 'culture',
+    'moda & beleza': 'culture',
+    // Corpo e ar livre
+    'esportes': 'sports',
+    'saude & bem-estar': 'sports',
+    'trilhas & ar livre': 'nature',
+    'viagens & aventura': 'nature',
+    // Conhecimento e sentido
+    'educacao & workshops': 'study',
+    'idiomas & intercambio': 'study',
+    'filosofia': 'study',
     'religiao & espiritualidade': 'social',
+    // Trabalho e dinheiro
+    'negocios & carreira': 'social',
+    'financas & investimentos': 'social',
+    'tecnologia & inovacao': 'technology',
+    // Jogos
     'games & geek': 'games',
     'jogos digitais': 'games',
+    'jogos de mesa & rpg': 'games',
+    // Causas e nichos
     'sustentabilidade': 'nature',
+    'voluntariado & causas': 'social',
     'animais de estimacao': 'nature',
-    'literatura': 'study',
-    'filosofia': 'study',
+    // Único sem arte temática: cai no pino neutro de propósito.
+    'carros & motos': 'general',
 };
+
+// Esquecer uma linha acima devolve o marcador genérico sem erro nenhum — foi um
+// defeito real antes, com 11 dos 19 interesses caindo em 'general'. A checagem
+// abaixo transforma esse silêncio em aviso na primeira renderização em dev.
+if (__DEV__) {
+    const unmapped = INTERESTS_OPTIONS.filter((interest) => !INTEREST_MARKER_CATEGORY[normalizeMarkerText(interest)]);
+    if (unmapped.length > 0) {
+        console.warn('[Explore] interest_marker_unmapped', { interests: unmapped.join(', ') });
+    }
+}
 
 const getEventMarkerCategory = (meeting: Pick<Meeting, 'theme' | 'interests'>): EventMarkerCategory => {
     // normalizeInterests converte os aliases legados (\u00a710) para a taxonomia atual,

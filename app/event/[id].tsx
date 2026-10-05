@@ -1,5 +1,5 @@
 import { useLocalSearchParams, router, Stack } from 'expo-router';
-import { View, Text, StyleSheet, ScrollView, Alert, ActivityIndicator, TouchableOpacity, Linking, Modal } from 'react-native';
+import { View, Text, StyleSheet, ScrollView, Alert, ActivityIndicator, TouchableOpacity, Linking, Modal, Share } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { doc, getDoc, onSnapshot } from 'firebase/firestore';
@@ -11,7 +11,7 @@ import { StyledButton } from '@/src/components/StyledButton';
 import { ErrorState } from '@/src/components/ErrorState';
 import { FontAwesome } from '@expo/vector-icons';
 import { normalizeDate } from '../../src/utils/dateUtils';
-import { canManuallyCompleteEvent, canRequestFavoriteAttendedEvent, formatEventTimeRange, getCheckInReviewDeadline, getEventJourneyState, hasEventEnded, isEventInProgress, isEventRegistrationOpen, isEventToday } from '../../src/utils/eventSchedule';
+import { canEditEvent, canManuallyCompleteEvent, canRequestFavoriteAttendedEvent, formatEventTimeRange, getCheckInReviewDeadline, getEventJourneyState, hasEventEnded, isEventInProgress, isEventRegistrationOpen, isEventToday } from '../../src/utils/eventSchedule';
 import { useEventClock } from '@/src/hooks/useEventClock';
 import { scheduleEventReminder, cancelEventReminder, setActiveNotificationTarget } from '../../src/utils/Notifications';
 import { ReportReasonModal } from '@/src/components/ReportReasonModal';
@@ -61,6 +61,7 @@ export default function MeetingDetailsScreen() {
     const [linkIssueLoading, setLinkIssueLoading] = useState(false);
     const [isFavorited, setIsFavorited] = useState(false);
     const [creatorName, setCreatorName] = useState('Usuário');
+    const [startingConversation, setStartingConversation] = useState(false);
     const [reputationFeedback, setReputationFeedback] = useState<ReputationFeedback | null>(null);
     const [retryKey, setRetryKey] = useState(0);
     const shownNotificationContext = useRef<string | null>(null);
@@ -553,6 +554,85 @@ export default function MeetingDetailsScreen() {
     const endedBySchedule = hasEventEnded(meeting, eventClock);
     const canFavoriteEvent = canRequestFavoriteAttendedEvent(meeting, Boolean(hasCheckedIn), hasPendingCheckIn, eventClock);
     const canCompleteManually = isCreator && canManuallyCompleteEvent(meeting, eventClock);
+    // A regra das 24 h vive em eventSchedule.ts e é revalidada pela Function
+    // `editEvent` — aqui é só para não oferecer um botão que o servidor recusaria.
+    const canEdit = isCreator && canEditEvent(meeting, eventClock);
+    // Rota só faz sentido em evento presencial com coordenada utilizável.
+    const routeLatitude = Number(meeting.lat);
+    const routeLongitude = Number(meeting.lng);
+    const routeUrl = meeting.type !== 'online'
+        && Number.isFinite(routeLatitude)
+        && Number.isFinite(routeLongitude)
+        && !(routeLatitude === 0 && routeLongitude === 0)
+        // URL universal do Maps: no Android e no iOS abre o app instalado, e no
+        // resto cai no navegador. Mandamos coordenada, não nome, para não depender
+        // de a busca textual acertar o lugar.
+        ? `https://www.google.com/maps/dir/?api=1&destination=${routeLatitude},${routeLongitude}`
+        : null;
+
+    const openRoute = () => {
+        if (!routeUrl) return;
+        Linking.openURL(routeUrl).catch(() => {
+            console.error('[EventDetail] route_open_failed');
+            Alert.alert('Não foi possível abrir', 'Nenhum aplicativo de mapas respondeu neste aparelho.');
+        });
+    };
+
+    /**
+     * Compartilha o evento fora do app.
+     *
+     * O texto é AUTOSSUFICIENTE de propósito: `reunionhub://` é um esquema
+     * próprio, então só abre em quem já tem o app instalado — para todo o resto
+     * é texto morto. Levando título, data, horário e local no corpo da mensagem,
+     * o convite continua útil para quem ainda não instalou.
+     *
+     * O `meetingLink` de evento online NÃO entra: ele é a sala da reunião e
+     * pertence a quem confirmou presença, não a um grupo de WhatsApp.
+     *
+     * Quando existir a página de destino (Hosting), basta trocar a linha do
+     * esquema por uma URL `https://` — o resto da mensagem continua valendo.
+     */
+    const shareEvent = async () => {
+        if (!eventId) return;
+        const lines = [
+            `${meeting.title}`,
+            `📅 ${formatDateDisplay(meeting.date)}${meeting.time ? ` · ${formatEventTimeRange(meeting)}` : ''}`,
+            meeting.locationName
+                ? `${meeting.type === 'online' ? '💻' : '📍'} ${meeting.locationName}`
+                : null,
+            '',
+            `Abrir no Reunion Hub: reunionhub://event/${eventId}`,
+        ].filter((line) => line !== null);
+
+        try {
+            await Share.share({ message: lines.join('\n') });
+        } catch {
+            // Cancelar o menu do sistema também cai aqui em algumas versões do
+            // Android, então nada de Alert: não houve falha de verdade.
+            console.warn('[EventDetail] share_dismissed_or_failed');
+        }
+    };
+
+    const openCreatorChat = async () => {
+        if (!meeting.createdBy || !currentUid || startingConversation) return;
+        setStartingConversation(true);
+        try {
+            const getOrCreateConversation = httpsCallable<
+                { targetUserId: string },
+                { conversationId: string; participantName: string }
+            >(functions, 'getOrCreateConversation');
+            const result = await getOrCreateConversation({ targetUserId: meeting.createdBy });
+            router.push({
+                pathname: '/conversation/[id]',
+                params: { id: result.data.conversationId, name: result.data.participantName || creatorName },
+            } as never);
+        } catch {
+            console.error('[EventDetail] creator_conversation_failed');
+            Alert.alert('Não foi possível abrir a conversa', 'Tente novamente em instantes.');
+        } finally {
+            setStartingConversation(false);
+        }
+    };
     const checkInReviewDeadline = getCheckInReviewDeadline(meeting);
     const checkInReviewDeadlineLabel = checkInReviewDeadline?.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
     const journeyState = getEventJourneyState(meeting, eventClock, {
@@ -572,7 +652,27 @@ export default function MeetingDetailsScreen() {
 
     return (
         <>
-            <Stack.Screen options={{ title: 'Detalhes do Evento', headerBackTitle: 'Voltar' }} />
+            <Stack.Screen
+                options={{
+                    title: 'Detalhes do Evento',
+                    headerBackTitle: 'Voltar',
+                    // Compartilhar fica no cabeçalho, que é onde se procura por isso, e
+                    // vale para qualquer pessoa — não só o criador: quem vai ao evento
+                    // é quem costuma querer chamar alguém. Some em evento encerrado ou
+                    // cancelado, que não faz sentido divulgar.
+                    headerRight: () => (isCompleted || meeting.status === 'cancelled' ? null : (
+                        <TouchableOpacity
+                            onPress={shareEvent}
+                            style={{ padding: 8 }}
+                            accessibilityRole="button"
+                            accessibilityLabel="Compartilhar este evento"
+                            hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+                        >
+                            <FontAwesome name="share-alt" size={19} color="#6366f1" />
+                        </TouchableOpacity>
+                    )),
+                }}
+            />
             <SafeAreaView style={styles.container} edges={['bottom']}>
             <ScrollView contentContainerStyle={styles.content}>
                 <Text style={styles.theme}>{meeting.theme}</Text>
@@ -588,27 +688,70 @@ export default function MeetingDetailsScreen() {
                     <Text style={styles.journeyMessage}>{journeyState.message}</Text>
                 </View>
 
-                {/* Criador do Evento */}
+                {/* Organizador. Em destaque e com atalho direto para a conversa:
+                    quem vai a um evento quase sempre tem uma dúvida antes, e o
+                    caminho até aqui era perfil público → botão de mensagem. */}
                 {meeting.createdBy && (
-                    <TouchableOpacity 
-                        style={styles.creatorCard} 
-                        onPress={() => router.push(`/public-profile/${meeting.createdBy}` as never)}
-                    >
-                        <View style={styles.creatorAvatar}>
-                            <Text style={{color: '#fff', fontWeight: 'bold'}}>{creatorName.charAt(0).toUpperCase()}</Text>
-                        </View>
-                        <View>
-                            <Text style={styles.creatorLabel}>Organizado por</Text>
-                            <Text style={styles.creatorName}>{creatorName}</Text>
-                        </View>
-                        <FontAwesome name="chevron-right" size={16} color="#9ca3af" style={{ marginLeft: 'auto' }} />
-                    </TouchableOpacity>
+                    <View style={styles.creatorCard}>
+                        <TouchableOpacity
+                            style={styles.creatorIdentity}
+                            onPress={() => router.push(`/public-profile/${meeting.createdBy}` as never)}
+                            accessibilityRole="button"
+                            accessibilityLabel={`Ver o perfil de ${creatorName}`}
+                        >
+                            <View style={styles.creatorAvatar}>
+                                <Text style={{color: '#fff', fontWeight: 'bold'}}>{creatorName.charAt(0).toUpperCase()}</Text>
+                            </View>
+                            <View style={{ flex: 1 }}>
+                                <Text style={styles.creatorLabel}>Organizado por</Text>
+                                <Text style={styles.creatorName} numberOfLines={1}>{creatorName}</Text>
+                                {isCreator && <Text style={styles.creatorYouTag}>Você organiza este evento</Text>}
+                            </View>
+                            <FontAwesome name="chevron-right" size={16} color="#9ca3af" />
+                        </TouchableOpacity>
+                        {!isCreator && currentUid && (
+                            <TouchableOpacity
+                                style={styles.creatorChatButton}
+                                onPress={openCreatorChat}
+                                disabled={startingConversation}
+                                accessibilityRole="button"
+                                accessibilityLabel={`Enviar mensagem para ${creatorName}`}
+                            >
+                                {startingConversation
+                                    ? <ActivityIndicator size="small" color="#4F46E5" />
+                                    : <FontAwesome name="comment" size={15} color="#4F46E5" />}
+                                <Text style={styles.creatorChatText}>
+                                    {startingConversation ? 'Abrindo...' : 'Tirar dúvida com o organizador'}
+                                </Text>
+                            </TouchableOpacity>
+                        )}
+                    </View>
                 )}
 
-            <View style={styles.infoRow}>
-                <FontAwesome name="map-marker" size={18} color="#6b7280" />
-                <Text style={styles.infoText}>{meeting.locationName || 'Local a definir'}</Text>
-            </View>
+            {/* Local. Presencial com coordenadas válidas abre a rota no Maps —
+                antes o endereço era só texto e a pessoa copiava à mão. */}
+            {routeUrl ? (
+                <TouchableOpacity
+                    style={styles.locationRow}
+                    onPress={openRoute}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Ver rota até ${meeting.locationName || 'o local do evento'}`}
+                >
+                    <FontAwesome name="map-marker" size={18} color="#6b7280" />
+                    <Text style={[styles.infoText, styles.locationLink]} numberOfLines={2}>
+                        {meeting.locationName || 'Local definido no mapa'}
+                    </Text>
+                    <View style={styles.routeBadge}>
+                        <FontAwesome name="location-arrow" size={12} color="#4F46E5" />
+                        <Text style={styles.routeBadgeText}>Rota</Text>
+                    </View>
+                </TouchableOpacity>
+            ) : (
+                <View style={styles.infoRow}>
+                    <FontAwesome name={meeting.type === 'online' ? 'video-camera' : 'map-marker'} size={18} color="#6b7280" />
+                    <Text style={styles.infoText}>{meeting.locationName || 'Local a definir'}</Text>
+                </View>
+            )}
 
             <View style={styles.infoRow}>
                 <FontAwesome name="calendar" size={18} color="#6b7280" />
@@ -792,6 +935,28 @@ export default function MeetingDetailsScreen() {
                                     <Text style={styles.autoCloseNoticeText}>Após o término, se você tiver feito check-in, receberá a lista para revisar em até duas horas. Sem seu check-in, as solicitações dos participantes serão aprovadas automaticamente.</Text>
                                 </View>
                                 <View style={{ height: 12 }} />
+                                {/* Editar vem ANTES de cancelar: cancelar custa 15 pontos
+                                    de reputação quando há confirmados, e por muito tempo
+                                    era o único jeito de consertar um horário errado. */}
+                                {canEdit ? (
+                                    <TouchableOpacity
+                                        style={styles.editEventButton}
+                                        onPress={() => router.push(`/event/edit/${eventId}` as never)}
+                                        accessibilityRole="button"
+                                        accessibilityLabel="Editar este evento"
+                                    >
+                                        <FontAwesome name="pencil" size={15} color="#4F46E5" />
+                                        <Text style={styles.editEventText}>Editar Evento</Text>
+                                    </TouchableOpacity>
+                                ) : (
+                                    <View style={styles.editLockedNotice}>
+                                        <FontAwesome name="lock" size={14} color="#92400E" />
+                                        <Text style={styles.editLockedText}>
+                                            A edição fecha 24 horas antes do início, para ninguém ser pego de surpresa.
+                                        </Text>
+                                    </View>
+                                )}
+                                <View style={{ height: 12 }} />
                                 <TouchableOpacity
                                     style={{ padding: 16, alignItems: 'center', borderWidth: 1, borderColor: '#ef4444', borderRadius: 12 }}
                                     onPress={handleCancelEvent}
@@ -923,9 +1088,12 @@ const styles = StyleSheet.create({
     inviteContent: { flex: 1 },
     inviteTitle: { color: '#312E81', fontWeight: '800', fontSize: 15 },
     inviteHint: { color: '#6B7280', fontSize: 12, marginTop: 3 },
+    // Coluna, não linha: o cartão passou a ter DOIS filhos empilhados — a
+    // identidade e o botão de conversa. Com o `flexDirection: 'row'` que ele
+    // tinha quando era só a linha do avatar, o botão virava irmão lateral e saía
+    // da tela. O `alignItems: 'center'` também saiu: em coluna ele encolheria o
+    // botão ao tamanho do texto em vez de ocupar a largura do cartão.
     creatorCard: {
-        flexDirection: 'row',
-        alignItems: 'center',
         backgroundColor: '#f9fafb',
         padding: 12,
         borderRadius: 12,
@@ -944,6 +1112,31 @@ const styles = StyleSheet.create({
     },
     creatorLabel: { fontSize: 12, color: '#6b7280' },
     creatorName: { fontSize: 16, fontWeight: 'bold', color: '#1f2937' },
+    creatorIdentity: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+    creatorYouTag: { fontSize: 11, color: '#4F46E5', fontWeight: '700', marginTop: 2 },
+    creatorChatButton: {
+        flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8,
+        marginTop: 12, paddingVertical: 11, borderRadius: 12,
+        backgroundColor: '#EEF2FF', borderWidth: 1, borderColor: '#C7D2FE',
+    },
+    creatorChatText: { color: '#4F46E5', fontSize: 14, fontWeight: '800' },
+    locationRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 8, gap: 8 },
+    locationLink: { flex: 1, marginLeft: 0, color: '#4F46E5', fontWeight: '600' },
+    routeBadge: {
+        flexDirection: 'row', alignItems: 'center', gap: 5,
+        paddingHorizontal: 10, paddingVertical: 5, borderRadius: 999, backgroundColor: '#EEF2FF',
+    },
+    routeBadgeText: { color: '#4F46E5', fontSize: 12, fontWeight: '800' },
+    editEventButton: {
+        flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8,
+        padding: 16, borderRadius: 12, borderWidth: 1, borderColor: '#4F46E5', backgroundColor: '#EEF2FF',
+    },
+    editEventText: { color: '#4F46E5', fontWeight: '800', fontSize: 15 },
+    editLockedNotice: {
+        flexDirection: 'row', alignItems: 'center', gap: 8,
+        padding: 12, borderRadius: 12, backgroundColor: '#FFFBEB', borderWidth: 1, borderColor: '#FDE68A',
+    },
+    editLockedText: { flex: 1, color: '#92400E', fontSize: 12, lineHeight: 17 },
     reportButton: {
         flexDirection: 'row',
         alignItems: 'center',
@@ -967,25 +1160,6 @@ const styles = StyleSheet.create({
         color: '#fff',
         fontSize: 10,
         fontWeight: 'bold',
-    },
-    checkedInContainer: {
-        alignItems: 'center',
-        backgroundColor: '#ecfdf5',
-        padding: 20,
-        borderRadius: 16,
-        borderWidth: 1,
-        borderColor: '#a7f3d0',
-    },
-    checkedInText: {
-        fontSize: 18,
-        fontWeight: 'bold',
-        color: '#047857',
-        marginTop: 8,
-    },
-    checkedInSubtext: {
-        fontSize: 13,
-        color: '#6b7280',
-        marginTop: 4,
     },
     waitingCheckIn: {
         alignItems: 'center',

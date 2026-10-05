@@ -5,6 +5,9 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { EventInviteCandidate } from '@/src/types';
 import { getEventInviteCandidates, inviteUserToEvent } from '@/src/services/eventInvitationService';
 import { NICK_MAX_LENGTH } from '@/src/constants/textLimits';
+import { STRINGS } from '@/src/constants/strings';
+import { isValidNickname, normalizeNickname } from '@/src/services/profileService';
+import { getFirebaseErrorCode } from '@/src/utils/authError';
 
 type EventInviteModalProps = {
     visible: boolean;
@@ -12,8 +15,33 @@ type EventInviteModalProps = {
     onClose: () => void;
 };
 
-function inviteLog(event: string, context: Record<string, number | boolean> = {}) {
+function inviteLog(event: string, context: Record<string, number | boolean | string> = {}) {
     if (__DEV__) console.info(`[EventInvite] ${event}`, context);
+}
+
+/**
+ * Traduz o erro da callable `inviteUserToEvent` no motivo real. Antes toda falha
+ * virava "a pessoa pode ter bloqueado contatos" — inclusive nick digitado errado.
+ * As mensagens de `failed-precondition`, `resource-exhausted` e `permission-denied`
+ * já vêm em pt-BR do servidor; a de bloqueio é neutra de propósito e é mantida assim.
+ */
+function getInviteErrorAlert(error: unknown, targetNick: string | null): { title: string; message: string } {
+    const code = getFirebaseErrorCode(error)?.replace(/^functions\//, '');
+    const serverMessage = error instanceof Error ? error.message : '';
+
+    if (code === 'not-found') {
+        if (serverMessage.startsWith('Evento')) return { title: 'Evento indisponível', message: STRINGS.EVENT_INVITE_EVENT_GONE };
+        return targetNick
+            ? { title: 'Nick não encontrado', message: `Não encontramos ninguém com o nick "@${targetNick}". ${STRINGS.EVENT_INVITE_NICK_HINT}` }
+            : { title: 'Pessoa indisponível', message: STRINGS.EVENT_INVITE_USER_GONE };
+    }
+    if ((code === 'failed-precondition' || code === 'resource-exhausted' || code === 'permission-denied') && serverMessage) {
+        return { title: 'Convite não enviado', message: serverMessage };
+    }
+    if (code === 'unavailable' || code === 'deadline-exceeded') {
+        return { title: 'Sem conexão', message: STRINGS.ERROR_NETWORK };
+    }
+    return { title: 'Convite não enviado', message: STRINGS.EVENT_INVITE_FAILED };
 }
 
 export function EventInviteModal({ visible, eventId, onClose }: EventInviteModalProps) {
@@ -44,9 +72,15 @@ export function EventInviteModal({ visible, eventId, onClose }: EventInviteModal
     }, [eventId, visible]);
 
     const sendInvite = async (candidate?: EventInviteCandidate) => {
-        const targetNick = nick.trim().toLowerCase().replace(/\s+/g, '');
+        // Quem copia o nick do perfil costuma trazer o "@" junto.
+        const targetNick = normalizeNickname(nick).replace(/^@+/, '');
         if (!candidate && !targetNick) {
             Alert.alert('Informe um nick', 'Digite o nick da pessoa que deseja convidar.');
+            return;
+        }
+        // Nick fora do formato não pode existir: avisa sem invocar a Function.
+        if (!candidate && !isValidNickname(targetNick)) {
+            Alert.alert('Nick inválido', `${STRINGS.EVENT_INVITE_NICK_INVALID} ${STRINGS.EVENT_INVITE_NICK_HINT}`);
             return;
         }
 
@@ -63,8 +97,11 @@ export function EventInviteModal({ visible, eventId, onClose }: EventInviteModal
             setNick('');
             inviteLog('invite_sent', { fromRecentList: Boolean(candidate) });
             Alert.alert('Convite enviado', 'A pessoa receberá uma notificação e poderá confirmar presença se quiser participar.');
-        } catch {
-            Alert.alert('Convite indisponível', 'Não foi possível enviar este convite. A pessoa pode já estar no evento, ter bloqueado contatos ou o evento não aceitar mais convites.');
+        } catch (error) {
+            const code = getFirebaseErrorCode(error) ?? 'unknown';
+            inviteLog('invite_failed', { code, fromRecentList: Boolean(candidate) });
+            const { title, message } = getInviteErrorAlert(error, candidate ? null : targetNick);
+            Alert.alert(title, message);
         } finally {
             setSending(false);
         }

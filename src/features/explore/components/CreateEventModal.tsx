@@ -13,6 +13,10 @@ import type { EventReminder } from '@/src/utils/Notifications';
 import type { CreateMeetingDraft } from '@/src/types';
 import { getDateStr } from '@/src/utils/dateUtils';
 import { getFirebaseErrorCode } from '@/src/utils/authError';
+import { STRINGS } from '@/src/constants/strings';
+// Compartilhados com a tela de edição: as duas escrevem os mesmos campos e
+// precisam interpretar o calendário igual.
+import { formatPickerDate, formatPickerTime, pickerDate, pickerTime } from '@/src/utils/eventDateTimePicker';
 import { describeConflicts, findScheduleConflicts, type CandidateSchedule } from '@/src/services/scheduleConflictService';
 
 const TITLE_MAX_LENGTH = 100;
@@ -54,32 +58,6 @@ function normalizeHttpsUrl(value: string): string {
         .replace(/^https:\/\//i, 'https://');
 }
 
-function pickerDate(value: string): Date {
-    const parsed = /^\d{4}-\d{2}-\d{2}$/.test(value) ? new Date(`${value}T12:00:00`) : new Date();
-    return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
-}
-
-function pickerTime(value: string): Date {
-    const result = new Date();
-    const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(value);
-    result.setSeconds(0, 0);
-    if (match) result.setHours(Number(match[1]), Number(match[2]), 0, 0);
-    return result;
-}
-
-function formatPickerDate(value: Date): string {
-    const year = value.getFullYear();
-    const month = String(value.getMonth() + 1).padStart(2, '0');
-    const day = String(value.getDate()).padStart(2, '0');
-    return `${year}-${month}-${day}`;
-}
-
-function formatPickerTime(value: Date): string {
-    const hours = String(value.getHours()).padStart(2, '0');
-    const minutes = String(value.getMinutes()).padStart(2, '0');
-    return `${hours}:${minutes}`;
-}
-
 interface CreateEventModalProps {
     visible: boolean;
     onClose: () => void;
@@ -108,6 +86,7 @@ export function CreateEventModal({
     onCreated,
 }: CreateEventModalProps) {
     const [submitting, setSubmitting] = useState(false);
+    const creationFlowRef = useRef(false);
     const creatingRef = useRef(false);
 
     // Reabrir o modal é o único ponto em que uma nova criação é legítima: a trava
@@ -164,13 +143,30 @@ export function CreateEventModal({
 
 
     const handleCreateEvent = async () => {
-        // O botão só fica `disabled` depois que `submitting` vira true, mas o
-        // primeiro await abaixo (reload do e-mail) acontece antes disso: dois
-        // toques rápidos disparavam dois fluxos inteiros e dois batch.commit(),
-        // criando o evento em duplicado. A trava é um ref porque precisa
-        // sobreviver aos Alerts, que devolvem o controle entre um passo e outro.
-        if (creatingRef.current) return;
+        // A ref trava no primeiro toque, antes do React desabilitar o botão.
+        // Os alertas são aguardados: cancelar, falhar ou terminar a validação
+        // passa pelo mesmo finally, sem deixar o formulário preso.
+        if (creationFlowRef.current || creatingRef.current) return;
+        creationFlowRef.current = true;
+        setSubmitting(true);
+        try {
+            await validateAndCreateEvent();
+        } catch (error) {
+            console.error('[CreateEvent] validation_failed', { code: getFirebaseErrorCode(error) });
+            Alert.alert('Erro', STRINGS.EVENT_CREATE_ERROR);
+        } finally {
+            creationFlowRef.current = false;
+            setSubmitting(false);
+        }
+    };
 
+    const requestClose = () => {
+        // Fechar e reabrir durante a consulta/gravação permitiria que o fluxo
+        // antigo continuasse sobre um formulário novo.
+        if (!creationFlowRef.current) onClose();
+    };
+
+    const validateAndCreateEvent = async () => {
         const currentUser = auth.currentUser;
         if (!currentUser) {
             Alert.alert('Sessão Expirada', 'Por favor, faça login novamente para criar um evento.');
@@ -287,49 +283,50 @@ export function CreateEventModal({
             });
         }
 
-        setSubmitting(true);
         let conflicts: Awaited<ReturnType<typeof findScheduleConflicts>> = [];
         try {
             conflicts = await findScheduleConflicts(currentUser.uid, occurrences);
         } catch {
             // Aviso é conveniência: uma falha na consulta não pode impedir a criação.
             console.warn('[CreateEvent] conflict_check_failed');
-        } finally {
-            setSubmitting(false);
         }
 
         if (conflicts.length > 0) {
-            Alert.alert(
+            const proceed = await new Promise<boolean>((resolve) => Alert.alert(
                 'Conflito de agenda',
                 `Você já tem compromisso no mesmo horário:\n\n${describeConflicts(conflicts)}\n\nDeseja criar mesmo assim?`,
                 [
-                    { text: 'Revisar horário', style: 'cancel' },
-                    { text: 'Criar mesmo assim', onPress: () => confirmResponsibility(occurrences, normalizedInterests, meetingLink) },
+                    { text: 'Revisar horário', style: 'cancel', onPress: () => resolve(false) },
+                    { text: 'Criar mesmo assim', onPress: () => resolve(true) },
                 ],
-            );
-            return;
+                { cancelable: true, onDismiss: () => resolve(false) },
+            ));
+            if (!proceed) return;
         }
 
-        confirmResponsibility(occurrences, normalizedInterests, meetingLink);
+        if (await confirmResponsibility()) {
+            await createEvents(occurrences, normalizedInterests, meetingLink);
+        }
     };
 
     // `meetingLink` viaja validado daqui até a gravação. Antes o write relia
     // `newMeeting.meetingLink` por conta própria, então o valor conferido e o
     // valor gravado podiam divergir — foi exatamente assim que o link com
     // esquema em maiúsculas passou pela validação e quebrou nas regras.
-    const confirmResponsibility = (occurrences: PlannedOccurrence[], normalizedInterests: string[], meetingLink: string) => {
+    const confirmResponsibility = (): Promise<boolean> => new Promise((resolve) => {
         Alert.alert(
             'Responsabilidade do Organizador',
             'Como criador deste evento, VOCÊ é o único responsável por sua organização, segurança e veracidade. O Reunion Hub é apenas um facilitador tecnológico e se isenta de qualquer responsabilidade legal. Deseja criar o evento sob sua responsabilidade?',
             [
-                { text: 'Cancelar', style: 'cancel' },
+                { text: 'Cancelar', style: 'cancel', onPress: () => resolve(false) },
                 {
                     text: 'Assumo a Responsabilidade',
-                    onPress: () => createEvents(occurrences, normalizedInterests, meetingLink),
+                    onPress: () => resolve(true),
                 }
-            ]
+            ],
+            { cancelable: true, onDismiss: () => resolve(false) },
         );
-    };
+    });
 
     const createEvents = async (occurrences: PlannedOccurrence[], normalizedInterests: string[], meetingLink: string) => {
         // Segunda barreira, na própria escrita: entre a validação e este ponto o
@@ -341,7 +338,6 @@ export function CreateEventModal({
             return;
         }
         creatingRef.current = true;
-        setSubmitting(true);
         let created = false;
         try {
             const creatorProfile = await getDoc(doc(db, 'users', creatorId));
@@ -444,23 +440,19 @@ export function CreateEventModal({
                 Alert.alert('Erro', 'Ocorreu um problema ao criar seu evento. Confira sua conexão e tente novamente.');
             }
         } finally {
-            setSubmitting(false);
-            // Só libera se NÃO gravou. Depois de gravar a trava permanece: um
-            // segundo Alert de responsabilidade empilhado (de um toque duplo)
-            // chamaria createEvents de novo, com as ocorrências já capturadas
-            // por parâmetro, e gravaria o mesmo evento uma segunda vez.
-            // Quem reabre a trava é a reabertura do modal, abaixo.
+            // A trava da escrita permanece após sucesso até reabrir o modal.
+            // Uma falha permite tentar novamente com o mesmo rascunho.
             if (!created) creatingRef.current = false;
         }
     };
 
     return (
-        <Modal animationType="slide" transparent={true} visible={visible} onRequestClose={onClose}>
+        <Modal animationType="slide" transparent={true} visible={visible} onRequestClose={requestClose}>
             <SafeAreaView style={styles.modalOverlay} edges={['bottom']}>
                 <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={styles.modalContent}>
                     <View style={styles.modalHeader}>
                         <Text style={styles.modalTitle}>Criar Novo Evento</Text>
-                        <TouchableOpacity onPress={onClose}>
+                        <TouchableOpacity onPress={requestClose} disabled={submitting}>
                             <Ionicons name="close" size={24} color="#6B7280" />
                         </TouchableOpacity>
                     </View>
@@ -471,7 +463,7 @@ export function CreateEventModal({
                         re-render reverte campos alterados nesse intervalo. Foi assim
                         que digitar o link zerava `time` e o relógio voltava para a
                         hora atual — só em evento online, porque só ele tem o campo. */}
-                    <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.formContent}>
+                    <ScrollView pointerEvents={submitting ? 'none' : 'auto'} showsVerticalScrollIndicator={false} contentContainerStyle={styles.formContent}>
                         <View style={styles.inputGroup}>
                             <Text style={styles.inputLabel}>Nome do Evento</Text>
                             <TextInput style={styles.input} maxLength={TITLE_MAX_LENGTH} placeholderTextColor="#B6C0CE" placeholder="Ex: Café com Tecnologia" value={newMeeting.title} onChangeText={(text) => setNewMeeting((current) => ({ ...current, title: text }))} />

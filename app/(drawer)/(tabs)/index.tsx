@@ -8,7 +8,7 @@ import { collection, doc, limit, onSnapshot, query, where, orderBy } from 'fireb
 import { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, FlatList, Image, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { auth, db } from '../../../src/services/firebaseConfig';
-import { Meeting, User } from '../../../src/types';
+import { Meeting } from '../../../src/types';
 import { STRINGS } from '../../../src/constants/strings';
 import { CONFIG } from '../../../src/constants/Config';
 import { normalizeDate, getTodayStr, getDateAfterDays } from '../../../src/utils/dateUtils';
@@ -18,6 +18,8 @@ import { ManualModal } from '../../../src/components/ManualModal';
 import { ScreenTutorialModal } from '../../../src/components/ScreenTutorialModal';
 import { useFirstVisitTutorial } from '../../../src/hooks/useFirstVisitTutorial';
 import { normalizeInterests } from '../../../src/constants/Interests';
+import { useUserProfile } from '@/src/hooks/useUserProfile';
+import { updateRecommendationLocation } from '@/src/services/recommendationLocationService';
 import { DISCOVERY_REASON_BADGE_LABELS, DiscoveryReason, getDiscoveryBadgeReason, getEventDiscovery, isMeetingNearby, isNewMeeting, shouldSuggestEvent } from '../../../src/utils/eventDiscovery';
 
 import { getDistanceFromLatLonInKm } from '../../../src/utils/distance';
@@ -63,7 +65,7 @@ const belongsToUserAgenda = (meeting: Meeting, userId: string | undefined, agend
 
 export default function HomeScreen() {
   const eventClock = useEventClock();
-  const [userProfile, setUserProfile] = useState<User | null>(null);
+  const userProfile = useUserProfile();
   const [highlights, setHighlights] = useState<Meeting[]>([]);
   const [allUpcomingEvents, setAllUpcomingEvents] = useState<Meeting[]>([]);
   const [myEvents, setMyEvents] = useState<Meeting[]>([]);
@@ -77,6 +79,13 @@ export default function HomeScreen() {
   const [showManualModal, setShowManualModal] = useState(false);
 
   const isMounted = useRef(true);
+
+  useEffect(() => {
+    const uid = auth.currentUser?.uid;
+    if (!uid || !location) return;
+    updateRecommendationLocation(uid, location.coords).catch(() =>
+      console.warn('[Index] recommendation_location_sync_failed'));
+  }, [location?.coords.latitude, location?.coords.longitude]);
 
   // A primeira execução abria o manual completo, de 12 passos. Quem acaba de
   // instalar não lê isso — e, com o tutorial curto em cada tela, o Início
@@ -148,7 +157,6 @@ export default function HomeScreen() {
     isMounted.current = true;
     let unsubConversations: any;
     let unsubNotifications: any;
-    let unsubUserProfile: (() => void) | undefined;
     let unsubHighlights: (() => void) | undefined;
     let unsubMyEvents: (() => void) | undefined;
 
@@ -163,11 +171,10 @@ export default function HomeScreen() {
 
       const currentUid = user.uid;
 
-      unsubUserProfile = onSnapshot(doc(db, 'users', currentUid), (snap) => {
-        if (snap.exists()) {
-          setUserProfile({ uid: snap.id, ...snap.data() } as User);
-        }
-      });
+      // O perfil vem do Context (`userProfile` abaixo). Esta tela mantinha o
+      // próprio `onSnapshot` em `users/{uid}` — e, por usar `as User` sobre o dado
+      // cru, aceitava qualquer forma do documento sem validar. O Context entrega
+      // o perfil já passado por `toUserProfile`.
 
       const qConversations = query(
         collection(db, 'conversations'),
@@ -299,7 +306,6 @@ export default function HomeScreen() {
       unsubscribeAuth();
       if (unsubConversations) unsubConversations();
       if (unsubNotifications) unsubNotifications();
-      if (unsubUserProfile) unsubUserProfile();
       if (unsubHighlights) unsubHighlights();
       if (unsubMyEvents) unsubMyEvents();
     };
@@ -696,7 +702,6 @@ const styles = StyleSheet.create({
   section: { padding: 24, paddingBottom: 0 },
   sectionHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 },
   sectionTitle: { fontSize: 18, fontWeight: 'bold', color: '#1f2937' },
-  seeAll: { color: '#4f46e5', fontSize: 14, fontWeight: '600' },
   refreshNearbyButton: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 6, paddingHorizontal: 10, borderRadius: 12, backgroundColor: '#EEF2FF' },
   refreshNearbyText: { color: '#4F46E5', fontSize: 12, fontWeight: '700' },
   interestTag: { fontSize: 12, color: '#6b7280', marginBottom: 12, fontStyle: 'italic' },
@@ -777,8 +782,6 @@ const styles = StyleSheet.create({
   // linha, e com quatro linhas empilhadas isso somava vários pixels invisíveis.
   listTitle: { fontSize: 15, lineHeight: 19, fontWeight: 'bold', color: '#1f2937', marginBottom: 3 },
   listTime: { fontSize: 12, lineHeight: 16, color: '#6b7280' },
-  todayEventBadge: { backgroundColor: '#FEF3C7', borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 },
-  todayEventBadgeText: { color: '#B45309', fontSize: 9, fontWeight: '800' },
   inProgressBadge: { flexShrink: 0, backgroundColor: '#059669', borderRadius: 6, paddingHorizontal: 7, paddingVertical: 3 },
   inProgressBadgeText: { color: '#FFFFFF', fontSize: 9, lineHeight: 12, fontWeight: '800' },
   badgeText: { color: '#fff', fontSize: 10, fontWeight: 'bold' },

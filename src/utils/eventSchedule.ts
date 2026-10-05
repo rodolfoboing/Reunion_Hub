@@ -129,6 +129,28 @@ export function canCancelActiveEvent(event: EventLifecycle, now = new Date()): b
     return !isEventClosed(event) && !hasEventEnded(event, now);
 }
 
+/**
+ * Prazo em que a edição do evento fecha, contado do horário de início.
+ *
+ * Duplicado de propósito em `EVENT_EDIT_LOCK_MS` na callable `editEvent`
+ * (`functions/src/index.ts`), que é quem realmente garante a regra — o cliente
+ * só evita oferecer um botão que o servidor recusaria. Mudar um exige mudar o
+ * outro (§9).
+ */
+export const EVENT_EDIT_LOCK_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * O criador pode editar até 24 h antes do início. Depois disso não: quem já
+ * confirmou presença organizou o dia com a informação que estava na tela, e
+ * mudança de véspera transforma isso em surpresa.
+ */
+export function canEditEvent(event: EventLifecycle, now = new Date()): boolean {
+    if (isEventClosed(event)) return false;
+    const interval = getEventInterval(event);
+    if (!interval) return false;
+    return interval.start.getTime() - now.getTime() >= EVENT_EDIT_LOCK_MS;
+}
+
 /** Participantes só podem sair antes do horário de início. */
 export function canLeaveActiveEvent(event: EventLifecycle, now = new Date()): boolean {
     return !isEventClosed(event) && isEventRegistrationOpen(event, now);

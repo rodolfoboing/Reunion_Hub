@@ -3,7 +3,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as Location from 'expo-location';
 import { router, useFocusEffect, useLocalSearchParams } from 'expo-router';
-import { collection, doc, getDocs, onSnapshot, query, where, limit, orderBy } from 'firebase/firestore';
+import { collection, doc, getDocs, query, where, limit, orderBy } from 'firebase/firestore';
 import { httpsCallable } from 'firebase/functions';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, Animated, FlatList, LayoutAnimation, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, ToastAndroid, TouchableOpacity, View } from 'react-native';
@@ -21,6 +21,8 @@ import { normalizeInterests } from '../../../src/constants/Interests';
 import { cancelEventReminder, scheduleEventReminders, syncEventReminders } from '../../../src/utils/Notifications';
 import { DISCOVERY_REASON_BADGE_LABELS, getDiscoveryBadgeReason, getEventDiscovery, isNewMeeting, shouldSuggestEvent, type EventDiscovery } from '../../../src/utils/eventDiscovery';
 import { ScreenTutorialModal } from '../../../src/components/ScreenTutorialModal';
+import { useUserProfile } from '@/src/hooks/useUserProfile';
+import { updateRecommendationLocation } from '@/src/services/recommendationLocationService';
 import { useFirstVisitTutorial } from '../../../src/hooks/useFirstVisitTutorial';
 import { ReputationFeedbackModal } from '../../../src/components/ReputationFeedbackModal';
 
@@ -382,6 +384,7 @@ export default function AgendaScreen() {
 
     // Data State
     const [filteredEvents, setFilteredEvents] = useState<any[]>([]);
+    const sharedProfile = useUserProfile();
     const [favorites, setFavorites] = useState<string[]>([]);
     const [userInterests, setUserInterests] = useState<string[]>([]);
     const [showPopularOutsideInterests, setShowPopularOutsideInterests] = useState(true);
@@ -448,19 +451,11 @@ export default function AgendaScreen() {
             // vez que a aba era aberta. A Function é idempotente, mas eram invocações
             // e leituras repetidas sem necessidade.
             setRefreshKey((current) => current + 1);
-            let unsubProfile: any;
+            // Favoritos, interesses e a preferência de populares vêm do perfil
+            // compartilhado (efeito abaixo). Esta tela mantinha um `onSnapshot`
+            // próprio em `users/{uid}`, que ficava vivo mesmo com a aba oculta.
             const unsubscribeAuth = auth.onAuthStateChanged((user) => {
-                if (user && isMounted.current) {
-                    setRefreshKey((current) => current + 1);
-                    if (unsubProfile) unsubProfile();
-                    unsubProfile = onSnapshot(doc(db, 'users', user.uid), (snap) => {
-                        if (snap.exists() && isMounted.current) {
-                            setFavorites(snap.data().favorites || []);
-                            setUserInterests(normalizeInterests(snap.data().interests));
-                            setShowPopularOutsideInterests(snap.data().showPopularOutsideInterests !== false);
-                        }
-                    });
-                }
+                if (user && isMounted.current) setRefreshKey((current) => current + 1);
             });
 
             (async () => {
@@ -470,7 +465,12 @@ export default function AgendaScreen() {
                     if (lastLoc && isMounted.current) setUserLocation(lastLoc);
                     
                     const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
-                    if (isMounted.current) setUserLocation(loc);
+                    if (isMounted.current) {
+                        setUserLocation(loc);
+                        const uid = auth.currentUser?.uid;
+                        if (uid) updateRecommendationLocation(uid, loc.coords).catch(() =>
+                            console.warn('[Agenda] recommendation_location_sync_failed'));
+                    }
                 }
             })().catch((locationError: unknown) => {
                 if (__DEV__) console.warn('[Agenda] location_unavailable', locationError instanceof Error ? locationError.message : 'unknown');
@@ -480,10 +480,19 @@ export default function AgendaScreen() {
                 isMounted.current = false;
                 fetchRequestId.current += 1;
                 unsubscribeAuth();
-                if (unsubProfile) unsubProfile();
             };
         }, [])
     );
+
+    // Espelha o perfil compartilhado no estado local da tela. Fica em estado, e
+    // não derivado direto do Context, porque `favorites` é atualizado de forma
+    // otimista pelo toque no coração antes de a Function responder.
+    useEffect(() => {
+        if (!sharedProfile) return;
+        setFavorites(sharedProfile.favorites || []);
+        setUserInterests(normalizeInterests(sharedProfile.interests));
+        setShowPopularOutsideInterests(sharedProfile.showPopularOutsideInterests !== false);
+    }, [sharedProfile]);
 
     useEffect(() => {
         fetchEvents();
@@ -1526,8 +1535,6 @@ const styles = StyleSheet.create({
 
     headerTopRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 20 },
     headerTitle: { fontSize: 24, fontWeight: '800', color: '#fff' },
-    headerSubtitle: { fontSize: 13, color: 'rgba(255,255,255,0.85)', marginTop: 4, maxWidth: 230 },
-    pulseRing: { position: 'absolute', width: 36, height: 36, borderRadius: 18, backgroundColor: 'rgba(239,68,68,0.2)', top: -10, left: -10 },
 
     headerIconChip: { width: 42, height: 42, borderRadius: 15, backgroundColor: 'rgba(255,255,255,0.18)', justifyContent: 'center', alignItems: 'center' },
 
@@ -1690,7 +1697,9 @@ const styles = StyleSheet.create({
     recDate: { fontSize: 12, fontWeight: 'bold', color: '#6366F1' },
     recTitle: { fontSize: 14, fontWeight: 'bold', color: '#1E293B', marginBottom: 14 },
     recBadgeRow: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 6, marginBottom: 10 },
-    recAttendees: { flexDirection: 'row', alignItems: 'center', gap: 3, marginLeft: 'auto', marginRight: 8 },
+    // Sem `marginLeft: 'auto'`: o `recFooter` já é `space-between`, e os dois
+    // juntos brigavam pela distribuição dos três filhos da linha.
+    recAttendees: { flexDirection: 'row', alignItems: 'center', gap: 3 },
     recAttendeesText: { fontSize: 11, fontWeight: '700', color: '#64748B' },
     badgeNew: { backgroundColor: '#FEF3C7', paddingHorizontal: 7, paddingVertical: 3, borderRadius: 8 },
     badgeNewText: { fontSize: 9, fontWeight: '800', color: '#B45309', letterSpacing: 0.5 },

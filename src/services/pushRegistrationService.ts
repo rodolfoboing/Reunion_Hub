@@ -1,5 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { deleteField, deleteDoc, doc, getDoc, serverTimestamp, setDoc } from 'firebase/firestore';
+import { deleteField, deleteDoc, doc, getDoc, serverTimestamp, setDoc, updateDoc } from 'firebase/firestore';
 import { auth, db } from '@/src/services/firebaseConfig';
 import type { PushRegistration } from '@/src/utils/Notifications';
 
@@ -40,10 +40,17 @@ export async function savePushRegistration(userId: string, registration: PushReg
     if (auth.currentUser?.uid !== userId || (!registration.expoToken && !registration.nativeToken)) return;
 
     const deviceId = await getPushDeviceId();
-    await setDoc(doc(db, 'pushDevices', deviceId), {
+    const deviceRef = doc(db, 'pushDevices', deviceId);
+    // Uma falha temporária em um dos provedores não pode apagar o token válido
+    // do mesmo aparelho. Ao trocar de conta, nunca herdamos tokens da anterior.
+    // A leitura de um registro pertencente à conta anterior é negada pelas
+    // regras; a nova conta ainda pode assumir o mesmo aparelho pela escrita.
+    const previous = await getDoc(deviceRef).catch(() => null);
+    const sameOwner = previous?.exists() && previous.data().userId === userId;
+    await setDoc(deviceRef, {
         userId,
-        expoPushToken: registration.expoToken,
-        nativePushToken: registration.nativeToken,
+        expoPushToken: registration.expoToken ?? (sameOwner ? previous?.data().expoPushToken ?? null : null),
+        nativePushToken: registration.nativeToken ?? (sameOwner ? previous?.data().nativePushToken ?? null : null),
         platform: registration.platform,
         updatedAt: serverTimestamp(),
     });
@@ -57,9 +64,12 @@ export async function savePushRegistration(userId: string, registration: PushReg
 
     // Migração segura: o servidor novo envia apenas para registros por dispositivo.
     // Remover o formato antigo evita que dados privados permaneçam duplicados.
+    // updateDoc, não setDoc com merge: o merge num perfil que ainda não chegou do
+    // servidor criava localmente um `users/{uid}` só com esse campo, e o portão
+    // do RootLayout lia a falta de `termsVersion` como "Atualizamos os termos".
     await Promise.all([
         deleteDoc(doc(db, 'pushTokens', userId)).catch(() => undefined),
-        setDoc(doc(db, 'users', userId), { expoPushToken: deleteField() }, { merge: true }).catch(() => undefined),
+        updateDoc(doc(db, 'users', userId), { expoPushToken: deleteField() }).catch(() => undefined),
     ]);
 }
 

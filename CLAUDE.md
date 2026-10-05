@@ -109,11 +109,11 @@ O projeto é React Native + Expo Router. Na prática:
 - **`/src/types/index.ts`** — contratos compartilhados do banco (`User`, `Meeting`, `Place`, `Notification`, …). Reutilize antes de criar tipo novo.
 - **`/functions/src/`** — Cloud Functions (TypeScript, Node 22, `firebase-functions` v5 / API de 1ª geração): um `index.ts` grande (~2800 linhas) + `eventLifecycle.ts`, `recommendations.ts`, `pushNotifications.ts`, `validation.ts`.
 
-**Sessão e roteamento:** `app/_layout.tsx` é o cérebro da sessão — `onAuthStateChanged` + snapshot de `users/{uid}` que força a rota para `/(auth)/onboarding` (quando `isProfileComplete === false`), depois `/(auth)/accept-terms` (quando `termsVersion !== CURRENT_TERMS_VERSION`), depois `/(drawer)/(tabs)`. Também desloga conta banida, registra push device e trata deep link de notificação.
+**Sessão e roteamento:** `app/_layout.tsx` é o cérebro da sessão — `onAuthStateChanged` + snapshot de `users/{uid}` que força a rota para `/(auth)/onboarding` (quando `isProfileComplete === false`), depois `/(auth)/accept-terms` (quando `termsVersion !== CURRENT_TERMS_VERSION`), depois `/(drawer)/(tabs)`. Também desloga conta banida, registra push device e trata deep link de notificação. A regra é pura em `src/utils/sessionGate.ts`, e o `SessionRedirect` compara a rota **atual** (`useSegments`) com a exigida — ele é o único que navega por sessão; telas não fazem `router.replace('/login')` após `signOut`. **Só snapshot confirmado pelo servidor bloqueia** (cache offline dá `exists() === false`; merge local pendente dá doc parcial — ambos faziam onboarding/termos piscarem). Por isso: nunca `setDoc(..., { merge: true })` em `users/{uid}` no cliente (use `updateDoc`), e não reintroduza `unstable_settings.initialRouteName: '(auth)'` (empilhava o auth sob a Home e o voltar o revelava).
 
-**Fronteira cliente ↔ Functions:** escritas com autoridade ou reputação passam por **callables**, não por escrita direta no Firestore — `rsvpToEvent`, `leaveEvent`, `checkInToEvent`, `reviewAndCompleteEvent`, `completeEvent`, `settleMyExpiredEvents`, `cancelEvent`, `toggleEventFavorite`, `recreateFavoriteEvent`, `proposeFavoriteEventRepeat`, `getEventInviteCandidates`, `inviteUserToEvent`, `getOrCreateConversation`, `sendChatMessage`, `savePlaceHabit`, `removePlaceHabit`, `setFrequentedPlacesPrivacy`, `reportEventLinkIssue`, `removeReportedEvent`, `banUser`, `deleteMyAccount`. Trigger/crons: `onReportCreated`, `dailyEventRecommendations` (07:00 e 13:00 SP), `processEventCheckInReviews` (a cada 5 min), `closeExpiredEventsDaily` (00:10 SP).
+**Fronteira cliente ↔ Functions:** escritas com autoridade ou reputação passam por **callables**, não por escrita direta no Firestore — `rsvpToEvent`, `leaveEvent`, `checkInToEvent`, `reviewAndCompleteEvent`, `completeEvent`, `settleMyExpiredEvents`, `cancelEvent`, `editEvent` (criador, até 24 h antes do início — `EVENT_EDIT_LOCK_MS` espelhado em `src/utils/eventSchedule.ts`), `toggleEventFavorite`, `recreateFavoriteEvent`, `proposeFavoriteEventRepeat`, `getEventInviteCandidates`, `inviteUserToEvent`, `getOrCreateConversation`, `sendChatMessage`, `savePlaceHabit`, `removePlaceHabit`, `setFrequentedPlacesPrivacy`, `reportEventLinkIssue`, `removeReportedEvent`, `banUser`, `deleteMyAccount`. Trigger/crons: `onReportCreated`, `recoverEventNotifications`, `dailyEventRecommendations` (07:00, 13:00 e 19:00 SP), `checkExpoPushReceipts` (15 min), `retryPendingEventPushes` (10 min), `processEventCheckInReviews` (5 min), `closeExpiredEventsDaily` (00:10 SP).
 
-**Coleções do Firestore:** `users` (+ subcoleções `favoriteEvents`, `placeHabits`), `nicknames`, `pushDevices` (atual) / `pushTokens` (legado), `notificationSettings`, `meetings`, `conversations/{id}/messages`, `places`, `notifications`, `reports`, `eventCheckInReviews`.
+**Coleções do Firestore:** `users` (+ subcoleções `favoriteEvents`, `placeHabits`), `nicknames`, `pushDevices` (atual) / `pushTokens` (legado), `notificationSettings`, `meetings`, `conversations/{id}/messages`, `places`, `notifications`, `pushOutbox`, `expoPushReceipts`, `reports`, `eventCheckInReviews`.
 
 ### 3.2 Arquitetura-alvo — **ASPIRACIONAL, não implementar agora**
 
@@ -226,7 +226,7 @@ Antes de tornar um campo obrigatório ou mudar um formato persistido, considere 
 
 - `meetings` **sem `status`** → tratados como `active`.
 - `meetings` **sem `endTime`/`endsAt`** → duração assumida `LEGACY_EVENT_DURATION_MINUTES = 180`.
-- Interesses fora da taxonomia atual → `LEGACY_INTEREST_ALIASES` em `Interests.ts`. **O servidor não aplica esses aliases**; perfil nunca reeditado pode não casar em recomendação.
+- Interesses fora da taxonomia atual → `LEGACY_INTEREST_ALIASES` em `Interests.ts` e mapa equivalente em `functions/src/recommendations.ts`; mantenha os dois sincronizados para perfis antigos continuarem recebendo recomendações.
 - `users.expoPushToken` e coleção `pushTokens` (legado) → migrados para `pushDevices` (1 doc por instalação).
 - `COMPLETION_LEDGER_V2_STARTED_AT_MS` — fronteira de reputação: eventos encerrados antes disso não recebem cálculo retroativo.
 
@@ -237,18 +237,18 @@ Compatibilidade com dados antigos é escopo do mesmo fluxo (§16.3).
 ## 11. Notificações e recomendações
 
 - **`notifications`** é escrita **só por Cloud Functions** (regra `create`/`delete: if false`; o cliente só marca `read: true`). Novo tipo de notificação ⇒ criar na Function **e** tratar ícone/rota em `app/(drawer)/notifications.tsx` + `getNotificationRoute`/`getNotificationTarget` em `src/utils/Notifications.ts`.
-- **Push** (`functions/src/pushNotifications.ts`): FCM nativo → fallback Expo; token inválido é limpo de `pushDevices`. Canais Android: `messages`, `events`, `reminders`, `recommendations` — renomear canal quebra o agrupamento/`collapseKey`.
+- **Push** (`functions/src/pushNotifications.ts`): FCM nativo → fallback Expo em lotes; token inválido é limpo de `pushDevices` apenas se ainda corresponder ao token rejeitado. Tickets Expo são conferidos por `checkExpoPushReceipts`; `pushOutbox` guarda envios de evento/recomendação que precisam de nova tentativa. Canais Android: `messages`, `events`, `reminders`, `recommendations` — renomear canal quebra o agrupamento/`collapseKey`.
 - **`notificationSettings/{uid}`** tem **allowlist de chaves imposta por `firestore.rules`**. Nova preferência ⇒ tocar em: `firestore.rules` + `src/constants/userPreferences.ts` + `app/(drawer)/profile.tsx` + `preferenceField` nas Functions.
 - Desativar um push/lembrete **nunca** apaga a notificação in-app (sino) — ela sempre persiste.
 - **Lembretes locais** (`src/utils/Notifications.ts`) são agendados **no aparelho**, sem servidor: não disparam se o app nunca roda. `notifyEventReminders` → lembrete de evento; `notifyRecommendations` → lembrete de reengajamento (7 dias).
-- **Recomendação diária** é um cron às 07:00 e 13:00 (SP) proporcional a `pushDevices`, com cooldown de 72 h feito só consultando notificações existentes (sem doc de estado) — a 2ª execução do dia não gera 2ª notificação para quem já foi notificado na 1ª, só uma nova chance de pegar evento criado ao longo do dia. Não há aviso em tempo real de evento novo.
+- **Recomendação diária** roda às 07:00, 13:00 e 19:00 (SP), percorre usuários/eventos em páginas e cria aviso in-app mesmo sem token push. O cooldown usa 72 h reais consultando notificações existentes; eventos novos publicados depois das 13 h podem entrar na execução das 19 h. A localização aproximada vem do app ao navegar pelas telas principais e é atualizada no máximo a cada 7 dias por célula de 0,01°. Não há aviso em tempo real de evento novo.
 
 ---
 
 ## 12. Cloud Functions
 
 - Use Function só quando o trabalho exige execução confiável fora do aparelho, credencial privada, autoridade administrativa, processamento agendado ou integridade que o cliente não pode garantir.
-- **Toda Function é idempotente:** rodar duas vezes não pode duplicar pontos, notificações nem operações. Use IDs determinísticos e transações.
+- **Toda Function é idempotente:** rodar duas vezes não pode duplicar pontos, notificações nem operações. Use IDs determinísticos e transações. `recoverEventNotifications` usa retry automático e IDs determinísticos; o envio push em `pushOutbox` é de pelo menos uma tentativa e pode reenviar em falhas parciais do provedor.
 - Custo: os wrappers `runWith` já existentes são `smallFunction` (128MB, `maxInstances: 5`), `dailyFunction` (`maxInstances: 1`) e `accountFunction` (timeout maior). Reutilize-os em vez de criar outro perfil. Cron enxuto e proporcional a dispositivos ativos, **não** ao histórico de usuários/eventos.
 - **`functions/lib/` é versionado.** Não edite `lib/` à mão. Toda mudança em `functions/src/` exige `cd functions && npm run build`. **Você tem acesso ao terminal: execute o comando.** **Nunca** tente gerar ou alterar os arquivos de `lib/` escrevendo código na sua resposta — deixe o compilador fazer isso.
 - Testes: `cd functions && npm test` (§0).

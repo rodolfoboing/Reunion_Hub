@@ -5,6 +5,7 @@ import { DEFAULT_NOTIFICATION_SETTINGS } from '@/src/constants/userPreferences';
 
 const LOCATION_CACHE_KEY_PREFIX = '@reunionhub_recommendation_location:';
 const LOCATION_REFRESH_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+const activeUpdates = new Map<string, { cell: string; promise: Promise<void> }>();
 
 type Coordinates = {
     latitude: number;
@@ -12,7 +13,7 @@ type Coordinates = {
 };
 
 function approximateCoordinate(value: number): number {
-    return Math.round(value * 10) / 10;
+    return Math.round(value * 100) / 100;
 }
 
 function validCoordinates(coordinates: Coordinates): boolean {
@@ -37,12 +38,12 @@ function recentCell(value: string | null, cellKey: string): boolean {
     }
 }
 
-export async function updateRecommendationLocation(userId: string, coordinates: Coordinates): Promise<void> {
+async function persistRecommendationLocation(userId: string, coordinates: Coordinates): Promise<void> {
     if (!userId || !validCoordinates(coordinates)) return;
 
     const latitude = approximateCoordinate(coordinates.latitude);
     const longitude = approximateCoordinate(coordinates.longitude);
-    const cellKey = `${latitude.toFixed(1)}:${longitude.toFixed(1)}`;
+    const cellKey = `${latitude.toFixed(2)}:${longitude.toFixed(2)}`;
     const cacheKey = `${LOCATION_CACHE_KEY_PREFIX}${userId}`;
     if (recentCell(await AsyncStorage.getItem(cacheKey), cellKey)) return;
 
@@ -60,6 +61,23 @@ export async function updateRecommendationLocation(userId: string, coordinates: 
         updatedAt: serverTimestamp(),
     }, { merge: true });
     await AsyncStorage.setItem(cacheKey, JSON.stringify({ cellKey, savedAt: Date.now() }));
+}
+
+export async function updateRecommendationLocation(userId: string, coordinates: Coordinates): Promise<void> {
+    if (!userId || !validCoordinates(coordinates)) return;
+    const cell = `${approximateCoordinate(coordinates.latitude)}:${approximateCoordinate(coordinates.longitude)}`;
+    const previous = activeUpdates.get(userId);
+    if (previous?.cell === cell) return previous.promise;
+    if (previous) {
+        await previous.promise;
+        return updateRecommendationLocation(userId, coordinates);
+    }
+    const update = persistRecommendationLocation(userId, coordinates)
+        .finally(() => {
+            if (activeUpdates.get(userId)?.promise === update) activeUpdates.delete(userId);
+        });
+    activeUpdates.set(userId, { cell, promise: update });
+    return update;
 }
 
 export async function clearRecommendationLocationCache(userId: string): Promise<void> {

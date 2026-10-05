@@ -3,11 +3,11 @@ import { View, Text, StyleSheet, FlatList, TouchableOpacity, ActivityIndicator, 
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons, MaterialIcons } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import { auth, db, functions } from '../../../src/services/firebaseConfig';
-import { collection, getDocs, query, orderBy, deleteDoc, doc, getDoc, limit, onSnapshot } from 'firebase/firestore';
-import { onAuthStateChanged } from 'firebase/auth';
+import { db, functions } from '../../../src/services/firebaseConfig';
+import { collection, getDocs, query, orderBy, deleteDoc, doc, getDoc, limit } from 'firebase/firestore';
 import { httpsCallable } from 'firebase/functions';
 import { Report, ReportTargetType } from '../../../src/types';
+import { useUserProfile } from '@/src/hooks/useUserProfile';
 
 const REPORTS_FETCH_LIMIT = 100;
 const LEGACY_REPORT_REASON = 'Motivo não informado';
@@ -32,39 +32,19 @@ export default function ModerationScreen() {
     const [aggregatedEvents, setAggregatedEvents] = useState<AggregatedReport[]>([]);
     const [loading, setLoading] = useState(true);
     const [activeTab, setActiveTab] = useState<'users' | 'events'>('users');
-    const [isStaff, setIsStaff] = useState(false);
-    const [checkingAccess, setCheckingAccess] = useState(true);
+    // Papel e estado de verificação derivam do perfil compartilhado. Esta tela
+    // mantinha um `onSnapshot` próprio em `users/{uid}` para ler o MESMO `role`
+    // que o layout das abas já lia — dois listeners para um campo.
+    const profile = useUserProfile();
+    const isStaff = profile?.role === 'admin' || profile?.role === 'moderator';
+    // `null` = perfil ainda não chegou. Sem sessão o portão já redireciona ao
+    // login, então não há como ficar preso neste estado.
+    const checkingAccess = profile === null;
 
+    // Sem acesso não há relatório para carregar: encerra o spinner que começa true.
     useEffect(() => {
-        let unsubscribeProfile: (() => void) | undefined;
-        const unsubscribeAuth = onAuthStateChanged(auth, (currentUser) => {
-            if (unsubscribeProfile) {
-                unsubscribeProfile();
-                unsubscribeProfile = undefined;
-            }
-            if (!currentUser) {
-                setIsStaff(false);
-                setCheckingAccess(false);
-                setLoading(false);
-                return;
-            }
-            unsubscribeProfile = onSnapshot(doc(db, 'users', currentUser.uid), (profile) => {
-                const role = profile.data()?.role;
-                setIsStaff(role === 'admin' || role === 'moderator');
-                setCheckingAccess(false);
-                if (role !== 'admin' && role !== 'moderator') setLoading(false);
-            }, () => {
-                console.warn('[Moderation] staff_check_failed');
-                setIsStaff(false);
-                setCheckingAccess(false);
-                setLoading(false);
-            });
-        });
-        return () => {
-            unsubscribeAuth();
-            if (unsubscribeProfile) unsubscribeProfile();
-        };
-    }, []);
+        if (!checkingAccess && !isStaff) setLoading(false);
+    }, [checkingAccess, isStaff]);
 
     const fetchReports = async () => {
         setLoading(true);

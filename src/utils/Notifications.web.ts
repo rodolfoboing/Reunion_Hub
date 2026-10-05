@@ -102,6 +102,10 @@ export async function setEventRemindersEnabled(_userId: string, _enabled: boolea
   return;
 }
 
+export async function areEventRemindersEnabled(_userId: string): Promise<boolean> {
+  return false;
+}
+
 export async function setReengagementReminderEnabled(_userId: string, _enabled: boolean): Promise<void> {
   return;
 }

@@ -13,15 +13,16 @@ import { ManualModal } from '@/src/components/ManualModal';
 import { router } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-import { INTERESTS_OPTIONS, normalizeInterests } from '../../src/constants/Interests';
+import { INTERESTS_OPTIONS, MAX_PROFILE_INTERESTS, normalizeInterests } from '../../src/constants/Interests';
 import { User } from '../../src/types';
-import { toUserProfile } from '../../src/utils/userProfile';
 import { BIO_MAX_LENGTH, NICK_MAX_LENGTH, PASSWORD_MAX_LENGTH } from '@/src/constants/textLimits';
 import { ScreenTutorialModal } from '@/src/components/ScreenTutorialModal';
+import { useUserProfile } from '@/src/hooks/useUserProfile';
 import { useFirstVisitTutorial } from '@/src/hooks/useFirstVisitTutorial';
 import { unregisterCurrentPushDevice } from '@/src/services/pushRegistrationService';
 import { setEventRemindersEnabled, setReengagementReminderEnabled } from '@/src/utils/Notifications';
 import { clearRecommendationLocationCache } from '@/src/services/recommendationLocationService';
+import { syncOwnEventReminders } from '@/src/services/eventReminderSyncService';
 import { isValidNickname, NicknameUnavailableError, normalizeNickname, updateOwnProfile, uploadProfileImage } from '@/src/services/profileService';
 import { DEFAULT_NOTIFICATION_SETTINGS } from '@/src/constants/userPreferences';
 import { getFirebaseErrorCode } from '@/src/utils/authError';
@@ -29,13 +30,15 @@ import { getFirebaseErrorCode } from '@/src/utils/authError';
 const VERIFICATION_RESEND_COOLDOWN_SECONDS = 60;
 // BIO_MAX_LENGTH vinha declarado aqui E em onboarding.tsx, com o mesmo valor:
 // dois lugares para mudar e nenhuma garantia de que mudariam juntos.
-const MAX_INTERESTS = 10;
 
 function profileLog(event: string, context: Record<string, boolean | number> = {}) {
     if (__DEV__) console.info(`[Profile] ${event}`, context);
 }
 
 export default function ProfileScreen() {
+    const sharedProfile = useUserProfile();
+    // Continua em estado local: a tela mostra os interesses já normalizados, e o
+    // formulário de edição trabalha sobre essa cópia.
     const [userProfile, setUserProfile] = useState<User | null>(null);
     const [isEditing, setIsEditing] = useState(false);
     const [editBio, setEditBio] = useState('');
@@ -118,26 +121,15 @@ export default function ProfileScreen() {
         }
     };
 
+    // O perfil vem do Context: esta tela mantinha o sétimo `onSnapshot` em
+    // `users/{uid}`. A normalização dos interesses fica aqui porque é a única
+    // tela que os edita — o resto do app consome a taxonomia canônica direto.
     useEffect(() => {
-        const user = auth.currentUser;
-        if (!user) return;
-
-        const docRef = doc(db, 'users', user.uid);
-        return onSnapshot(docRef, (snap) => {
-                if (snap.exists()) {
-                    const data = toUserProfile(user.uid, snap.data());
-                    setUserProfile({ ...data, interests: normalizeInterests(data.interests) });
-                    // Default nick to display name part if not set (fallback)
-                    if (!data.nick && auth.currentUser?.displayName) {
-                        setEditNick(auth.currentUser.displayName.replace(/\s/g, '').toLowerCase());
-                    } else {
-                        setEditNick(data.nick || '');
-                    }
-                }
-            }, (profileError) => {
-                console.error('[Profile] Erro ao atualizar perfil:', profileError);
-            });
-    }, []);
+        if (!sharedProfile) return;
+        setUserProfile({ ...sharedProfile, interests: normalizeInterests(sharedProfile.interests) });
+        // Nick ausente (perfil antigo): cai para o displayName do Auth.
+        setEditNick(sharedProfile.nick || auth.currentUser?.displayName?.replace(/\s/g, '').toLowerCase() || '');
+    }, [sharedProfile]);
 
     useEffect(() => {
         const user = auth.currentUser;
@@ -267,8 +259,8 @@ export default function ProfileScreen() {
         }
         // Marcar tudo faz o perfil casar com qualquer evento e esvazia o sentido
         // da recomendação — mesmo teto de 10 usado na criação de evento.
-        if (list.length >= MAX_INTERESTS) {
-            Alert.alert('Limite de interesses', `Escolha até ${MAX_INTERESTS} interesses para manter as recomendações relevantes.`);
+        if (list.length >= MAX_PROFILE_INTERESTS) {
+            Alert.alert('Limite de interesses', `Escolha até ${MAX_PROFILE_INTERESTS} interesses para manter as recomendações relevantes.`);
             return;
         }
         setList([...list, item]);
@@ -374,6 +366,9 @@ export default function ProfileScreen() {
                 updatedAt: serverTimestamp(),
             }, { merge: true });
             await setEventRemindersEnabled(user.uid, notifyEventReminders);
+            if (notifyEventReminders && !savedNotificationSettings.notifyEventReminders) {
+                await syncOwnEventReminders(user.uid, true);
+            }
             await setReengagementReminderEnabled(user.uid, notifyRecommendations);
             if (notifyRecommendations !== savedNotificationSettings.notifyRecommendations) {
                 await clearRecommendationLocationCache(user.uid);
@@ -447,7 +442,8 @@ export default function ProfileScreen() {
             }
             await auth.signOut();
             profileLog('logout_completed');
-            router.replace('/login');
+            // O portão do RootLayout leva ao login ao ver a sessão encerrada;
+            // navegar daqui também montava o login duas vezes.
         } catch (error) {
             console.error('[Profile] logout_failed', { code: getFirebaseErrorCode(error) });
             Alert.alert('Erro', 'Falha ao sair.');
@@ -497,7 +493,7 @@ export default function ProfileScreen() {
                 console.warn('[Profile] account_deleted_local_signout_failed', { code: getFirebaseErrorCode(signOutError) });
             });
             profileLog('account_deletion_completed');
-            router.replace('/login');
+            // Login fica a cargo do portão do RootLayout (ver handleLogout).
         } catch (error) {
             const code = getFirebaseErrorCode(error);
             setDeleteConfirmationPassword('');

@@ -228,9 +228,20 @@ export async function setupNotifications(): Promise<PushRegistration> {
   try {
     const devicePushToken = await Notifications.getDevicePushTokenAsync();
     nativeToken = typeof devicePushToken.data === 'string' ? devicePushToken.data : null;
-    expoToken = await getExpoPushToken(devicePushToken);
+    try {
+      expoToken = await getExpoPushToken(devicePushToken);
+    } catch (error) {
+      // Um erro do Expo não deve apagar o token nativo Android disponível.
+      reportNotificationOperationError('expo_push_token_registration', error);
+    }
   } catch (error) {
-    reportNotificationOperationError('push_token_registration', error);
+    reportNotificationOperationError('native_push_token_registration', error);
+    // iOS e aparelhos sem FCM ainda podem obter o token Expo diretamente.
+    try {
+      expoToken = await getExpoPushToken();
+    } catch (expoError) {
+      reportNotificationOperationError('expo_push_token_registration', expoError);
+    }
   }
 
   // Só a presença dos tokens (§14: nunca logar o valor). Sem isso não dava pra
@@ -286,6 +297,10 @@ async function saveReminderIds(userId: string, reminders: Record<string, StoredE
 
 async function eventRemindersEnabled(userId: string): Promise<boolean> {
   return (await AsyncStorage.getItem(`${EVENT_REMINDERS_ENABLED_PREFIX}${userId}`)) !== 'false';
+}
+
+export function areEventRemindersEnabled(userId: string): Promise<boolean> {
+  return eventRemindersEnabled(userId);
 }
 
 export async function setEventRemindersEnabled(userId: string, enabled: boolean): Promise<void> {

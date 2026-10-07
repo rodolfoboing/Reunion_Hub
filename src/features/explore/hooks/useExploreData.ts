@@ -7,7 +7,8 @@ import { auth, db } from '@/src/services/firebaseConfig';
 import { fetchNearbyPlaces, mapOsmToPlace } from '@/src/services/osmService';
 import { updateRecommendationLocation } from '@/src/services/recommendationLocationService';
 import { Meeting, Place } from '@/src/types';
-import { normalizeDate, getTodayStr } from '@/src/utils/dateUtils';
+import { normalizeDate, getDateAfterDays, getTodayStr } from '@/src/utils/dateUtils';
+import { hasEventEnded, isEventInProgress } from '@/src/utils/eventSchedule';
 
 const toFiniteCoordinate = (value: unknown): number | undefined => {
     const coordinate = typeof value === 'number' ? value : Number(value);
@@ -124,6 +125,7 @@ export function useExploreData(
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(false);
     const [retryKey, setRetryKey] = useState(0);
+    const [osmRetryKey, setOsmRetryKey] = useState(0);
     const [locationRetryKey, setLocationRetryKey] = useState(0);
     const [locationStatus, setLocationStatus] = useState<LocationAccessStatus>('checking');
     const [locationIssue, setLocationIssue] = useState<LocationIssue>(null);
@@ -228,10 +230,12 @@ export function useExploreData(
         if (!meetingsLoaded.current) setLoading(true);
 
         const todayStr = getTodayStr();
+        const earliestStartDate = getDateAfterDays(-1);
 
         const q = query(
             collection(db, 'meetings'),
-            where('date', '>=', todayStr),
+            where('status', '==', 'active'),
+            where('date', '>=', earliestStartDate),
             orderBy('date'),
             limit(30)
         );
@@ -251,8 +255,8 @@ export function useExploreData(
                     };
                 }).filter(m => {
                     if (!m.date) return false;
-                    if (m.status === 'cancelled' || m.status === 'completed') return false;
-                    return m.date >= todayStr;
+                    if (hasEventEnded(m)) return false;
+                    return m.date >= todayStr || isEventInProgress(m);
                 }) as Meeting[];
                 if (isActive) {
                     meetingsLoaded.current = true;
@@ -349,6 +353,7 @@ export function useExploreData(
             } catch (error) {
                 if (!abortController.signal.aborted) {
                     console.warn('Erro ao buscar locais OSM (Overpass):', error);
+                    setOsmPlaces([]);
                     setOsmError(true);
                 }
             } finally {
@@ -358,15 +363,25 @@ export function useExploreData(
 
         fetchOsmPlaces();
         return () => abortController.abort();
-    }, [loadOsmPlaces, mapActive, retryKey, visibleRegion.latitude, visibleRegion.longitude, visibleRegion.latitudeDelta, visibleRegion.longitudeDelta]);
+    }, [loadOsmPlaces, mapActive, retryKey, osmRetryKey, visibleRegion.latitude, visibleRegion.longitude, visibleRegion.latitudeDelta, visibleRegion.longitudeDelta]);
 
     const places = useMemo(() => {
         const osmById = new Map(osmPlaces.map((place) => [place.id, place]));
+        const matchedDatabaseIds = new Set<string>();
         const mergedOsmPlaces = osmPlaces.map((place) => {
-            const databasePlace = databasePlaces.find((candidate) => candidate.id === place.id);
+            // IDs antigos não guardavam o tipo OSM. Só reutilizamos o local salvo
+            // quando nome e coordenadas também batem, evitando unir node e way.
+            const legacyId = place.id.replace(/^osm_(?:node|way|relation)_/, 'osm_');
+            const databasePlace = databasePlaces.find((candidate) => candidate.id === place.id)
+                ?? databasePlaces.find((candidate) => candidate.id === legacyId
+                    && !matchedDatabaseIds.has(candidate.id)
+                    && candidate.name === place.name
+                    && Math.abs(candidate.latitude - place.latitude) < 0.0001
+                    && Math.abs(candidate.longitude - place.longitude) < 0.0001);
+            if (databasePlace) matchedDatabaseIds.add(databasePlace.id);
             return databasePlace ? { ...place, ...databasePlace, isCommunity: true } : { ...place, isCommunity: false };
         });
-        const remainingDatabasePlaces = databasePlaces.filter((place) => !osmById.has(place.id));
+        const remainingDatabasePlaces = databasePlaces.filter((place) => !osmById.has(place.id) && !matchedDatabaseIds.has(place.id));
         return [...mergedOsmPlaces, ...remainingDatabasePlaces];
     }, [databasePlaces, osmPlaces]);
 
@@ -396,6 +411,11 @@ export function useExploreData(
         setRetryKey((current) => current + 1);
     };
 
+    const retryOsm = () => {
+        setOsmError(false);
+        setOsmRetryKey((current) => current + 1);
+    };
+
     const retryLocation = async () => {
         if (Platform.OS === 'android' && locationIssue === 'services-disabled') {
             try {
@@ -420,6 +440,7 @@ export function useExploreData(
         osmError,
         osmLoading,
         retry,
+        retryOsm,
         retryLocation,
         refreshPlace,
     };

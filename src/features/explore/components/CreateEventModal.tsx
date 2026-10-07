@@ -214,7 +214,7 @@ export function CreateEventModal({
             return;
         }
         if (durationIssue === 'too-long') {
-            Alert.alert('Evento muito longo', 'Um evento pode durar no máximo 24 horas. Crie outra edição caso precise continuar depois disso.');
+            Alert.alert('Evento muito longo', 'Um evento pode durar no máximo 12 horas. Crie outra edição caso precise continuar depois disso.');
             return;
         }
         if (title.length > TITLE_MAX_LENGTH || locationName.length > LOCATION_MAX_LENGTH || description.length > DESCRIPTION_MAX_LENGTH) {
@@ -287,8 +287,17 @@ export function CreateEventModal({
         try {
             conflicts = await findScheduleConflicts(currentUser.uid, occurrences);
         } catch {
-            // Aviso é conveniência: uma falha na consulta não pode impedir a criação.
             console.warn('[CreateEvent] conflict_check_failed');
+            const proceed = await new Promise<boolean>((resolve) => Alert.alert(
+                'Agenda indisponível',
+                'Não foi possível verificar se você já tem compromissos nesses horários. Deseja criar mesmo assim?',
+                [
+                    { text: 'Revisar horário', style: 'cancel', onPress: () => resolve(false) },
+                    { text: 'Criar mesmo assim', onPress: () => resolve(true) },
+                ],
+                { cancelable: true, onDismiss: () => resolve(false) },
+            ));
+            if (!proceed) return;
         }
 
         if (conflicts.length > 0) {
@@ -499,7 +508,7 @@ export function CreateEventModal({
                                     <Text style={{ color: newMeeting.endTime ? '#111827' : '#B6C0CE' }}>{newMeeting.endTime || 'Horário'}</Text>
                                 </TouchableOpacity>
                             </View>
-                            <Text style={styles.helperText}>Duração permitida: de 15 minutos a 24 horas. O término pode ser no dia seguinte.</Text>
+                            <Text style={styles.helperText}>Duração permitida: de 15 minutos a 12 horas. O término pode ser no dia seguinte.</Text>
                         </View>
                         {showDatePicker && (
                             <DateTimePicker value={startDatePickerValue} minimumDate={todayMinimumDate} mode="date" display={Platform.OS === 'ios' ? 'spinner' : 'default'} onChange={(event, selectedDate) => {

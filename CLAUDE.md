@@ -209,7 +209,7 @@ Ao criar hook/service/context novo, declare a responsabilidade específica de ca
 
 Este repo **duplica de propósito** parte da lógica. Alterar uma regra costuma exigir mudar **até 3 lugares em sincronia**:
 
-1. **Cliente** — `src/utils/eventSchedule.ts` (janela de check-in, duração 15 min–24 h, `getEventJourneyState`), `src/utils/eventDiscovery.ts`, `src/constants/Config.ts`.
+1. **Cliente** — `src/utils/eventSchedule.ts` (janela de check-in, duração 15 min–12 h, `getEventJourneyState`), `src/utils/eventDiscovery.ts`, `src/constants/Config.ts`.
 2. **Servidor** — `functions/src/eventLifecycle.ts` + helpers de data em `functions/src/index.ts` (reputação: **+10** check-in, **−20** falta, **−1** quando ninguém fez check-in, **−15** cancelamento com participantes).
 3. **Regras** — `firestore.rules` (validação na criação de `meetings`, duração, `reputation > -50` via `hasEventTrust()`, allowlist de campos em `editableUserFields()`).
 

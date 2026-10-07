@@ -8,7 +8,7 @@ type EventLifecycle = EventSchedule & Pick<Meeting, 'status' | 'checkInReviewDea
 // até que esses registros sejam atualizados, sem alterar seu comportamento.
 const LEGACY_EVENT_DURATION_MINUTES = 180;
 export const MIN_EVENT_DURATION_MINUTES = 15;
-export const MAX_EVENT_DURATION_MINUTES = 24 * 60;
+export const MAX_EVENT_DURATION_MINUTES = 12 * 60;
 export const CHECK_IN_REVIEW_WINDOW_MS = 2 * 60 * 60 * 1000;
 
 export type EventDurationIssue = 'invalid' | 'too-short' | 'too-long' | null;

@@ -953,7 +953,7 @@ export const recreateFavoriteEvent = smallFunction.https.onCall(async (data, con
         const favoriteEnd = getEventEndDate(favorite);
         if (!favoriteStart || !favoriteEnd) throw new functions.https.HttpsError('failed-precondition', 'Este favorito não possui uma duração válida.');
         const durationMs = favoriteEnd.getTime() - favoriteStart.getTime();
-        if (durationMs < 15 * 60 * 1000 || durationMs > 24 * 60 * 60 * 1000) {
+        if (durationMs < 15 * 60 * 1000 || durationMs > 12 * 60 * 60 * 1000) {
             throw new functions.https.HttpsError('failed-precondition', 'Este favorito possui uma duração incompatível com as regras atuais.');
         }
         const newStart = new Date(`${date}T${favorite.time}:00-03:00`);
@@ -2921,7 +2921,7 @@ export const cancelEvent = smallFunction.https.onCall(async (data, context) => {
 const EVENT_EDIT_LOCK_MS = 24 * 60 * 60 * 1000;
 const EVENT_MIN_LEAD_MS = 5 * 60 * 1000;
 const EVENT_MIN_DURATION_MS = 15 * 60 * 1000;
-const EVENT_MAX_DURATION_MS = 24 * 60 * 60 * 1000;
+const EVENT_MAX_DURATION_MS = 12 * 60 * 60 * 1000;
 
 /**
  * Edição de evento pelo criador, até 24 h antes do início.
@@ -2972,7 +2972,7 @@ export const editEvent = smallFunction.https.onCall(async (data, context) => {
         throw new functions.https.HttpsError('invalid-argument', 'O evento precisa durar pelo menos 15 minutos.');
     }
     if (durationMs > EVENT_MAX_DURATION_MS) {
-        throw new functions.https.HttpsError('invalid-argument', 'Um evento pode durar no máximo 24 horas.');
+        throw new functions.https.HttpsError('invalid-argument', 'Um evento pode durar no máximo 12 horas.');
     }
     if (nextStart.getTime() <= Date.now() + EVENT_MIN_LEAD_MS) {
         throw new functions.https.HttpsError('invalid-argument', 'Escolha um horário com pelo menos 5 minutos de antecedência.');

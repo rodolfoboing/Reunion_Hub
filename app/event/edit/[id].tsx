@@ -183,7 +183,7 @@ export default function EditEventScreen() {
             return;
         }
         if (durationIssue === 'too-long') {
-            Alert.alert('Evento muito longo', 'Um evento pode durar no máximo 24 horas.');
+            Alert.alert('Evento muito longo', 'Um evento pode durar no máximo 12 horas.');
             return;
         }
 

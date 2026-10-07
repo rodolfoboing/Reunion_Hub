@@ -229,16 +229,30 @@ export default function MeetingDetailsScreen() {
             return;
         }
 
-        // Aviso de conflito antes de confirmar. É conveniência: se a consulta
-        // falhar, seguimos para o fluxo normal em vez de bloquear a presença.
+        // A verificação é informativa; se ela falhar, a pessoa escolhe
+        // explicitamente se quer confirmar sem consultar a própria agenda.
         setRsvpLoading(true);
         let conflicts: Meeting[] = [];
+        let conflictCheckFailed = false;
         try {
             conflicts = await findScheduleConflicts(currentUser.uid, [meeting], eventId);
         } catch {
             console.warn('[Event] conflict_check_failed');
+            conflictCheckFailed = true;
         } finally {
             setRsvpLoading(false);
+        }
+
+        if (conflictCheckFailed) {
+            Alert.alert(
+                'Agenda indisponível',
+                'Não foi possível verificar se você já tem um compromisso neste horário. Deseja confirmar presença mesmo assim?',
+                [
+                    { text: 'Cancelar', style: 'cancel' },
+                    { text: 'Confirmar mesmo assim', onPress: confirmRSVP },
+                ],
+            );
+            return;
         }
 
         if (conflicts.length > 0) {

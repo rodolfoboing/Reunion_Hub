@@ -1,21 +1,24 @@
-import { collection, getDocs, limit, query, startAfter, where, type QueryDocumentSnapshot } from 'firebase/firestore';
+import { collection, getDocs, limit, orderBy, query, startAfter, where, type QueryDocumentSnapshot } from 'firebase/firestore';
 import { auth, db } from '@/src/services/firebaseConfig';
 import { areEventRemindersEnabled, syncEventReminders, type EventReminder } from '@/src/utils/Notifications';
 import { hasEventEnded } from '@/src/utils/eventSchedule';
 import type { Meeting } from '@/src/types';
+import { getDateAfterDays } from '@/src/utils/dateUtils';
 
 const EVENT_QUERY_LIMIT = 100;
 const REFRESH_INTERVAL_MS = 15 * 60 * 1000;
 const lastSyncedAt = new Map<string, number>();
 const activeSyncs = new Map<string, Promise<void>>();
 
-async function loadMatchingEvents(field: 'attendees' | 'createdBy', userId: string): Promise<QueryDocumentSnapshot[]> {
+async function loadMatchingEvents(field: 'attendees' | 'createdBy', userId: string, earliestStartDate: string): Promise<QueryDocumentSnapshot[]> {
   const documents: QueryDocumentSnapshot[] = [];
   let cursor: QueryDocumentSnapshot | undefined;
   while (true) {
     const page = await getDocs(query(
       collection(db, 'meetings'),
       where(field, field === 'attendees' ? 'array-contains' : '==', userId),
+      where('date', '>=', earliestStartDate),
+      orderBy('date', 'desc'),
       limit(EVENT_QUERY_LIMIT),
       ...(cursor ? [startAfter(cursor)] : []),
     ));
@@ -38,9 +41,11 @@ export function syncOwnEventReminders(userId: string, force = false): Promise<vo
 
   const operation = (async () => {
     if (!(await areEventRemindersEnabled(userId))) return;
+    // Um evento pode atravessar a meia-noite; os anteriores a ontem já terminaram.
+    const earliestStartDate = getDateAfterDays(-1);
     const [attending, created] = await Promise.all([
-      loadMatchingEvents('attendees', userId),
-      loadMatchingEvents('createdBy', userId),
+      loadMatchingEvents('attendees', userId, earliestStartDate),
+      loadMatchingEvents('createdBy', userId, earliestStartDate),
     ]);
     if (auth.currentUser?.uid !== userId) return;
 

@@ -185,7 +185,8 @@ export function getEventDiscovery(
     const reasons: DiscoveryReason[] = [];
     const active = hasActiveStatus(meeting);
     const ended = active && hasEventEnded(meeting, now);
-    const withinWindow = active && !ended && isWithinDiscoveryWindow(meeting, now);
+    const inProgress = active && !ended && isEventInProgress(meeting, now);
+    const withinWindow = active && !ended && (isWithinDiscoveryWindow(meeting, now) || inProgress);
     const nearby = withinWindow && isMeetingNearby(meeting, context.userCoordinates);
     const geographicallyEligible = meeting.type === 'online' || nearby;
     const matchesInterest = withinWindow
@@ -196,7 +197,6 @@ export function getEventDiscovery(
         && typeof meeting.title === 'string'
         && (context.historyTitles?.includes(meeting.title) ?? false);
     const popular = withinWindow && isPopularForUser(meeting, context.userCoordinates);
-    const inProgress = active && !ended && isEventInProgress(meeting, now);
 
     if (inProgress) reasons.push('in_progress');
     if (matchesInterest) reasons.push('interest');

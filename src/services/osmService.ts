@@ -5,6 +5,7 @@ const OVERPASS_TIMEOUT_SECONDS = 10;
 
 type OsmElement = {
     id: number;
+    type: 'node' | 'way' | 'relation';
     lat?: number;
     lon?: number;
     center?: { lat?: number; lon?: number };
@@ -32,10 +33,11 @@ export const fetchNearbyPlaces = async (south: number, west: number, north: numb
     const url = 'https://overpass-api.de/api/interpreter';
     const body = `data=${encodeURIComponent(query)}`;
     
-    let retries = 2;
+    const maxAttempts = 2;
     let delay = 750;
 
-    while (retries > 0) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        let retryable = true;
         try {
             const response = await fetch(url, {
                 method: 'POST',
@@ -50,41 +52,27 @@ export const fetchNearbyPlaces = async (south: number, west: number, north: numb
             
             if (response.ok) {
                 const data = await response.json() as OverpassResponse;
-                return Array.isArray(data.elements) ? data.elements.slice(0, MAX_OSM_PLACES) : [];
+                if (!Array.isArray(data.elements)) throw new Error('Resposta inválida do OpenStreetMap.');
+                return data.elements.slice(0, MAX_OSM_PLACES);
             }
-            
-            if (response.status === 429 || response.status >= 500) {
-                // Rate limit ou erro de servidor (504 Timeout) - tentar novamente
-                retries--;
-                if (retries > 0) {
-                    await new Promise(res => setTimeout(res, delay));
-                    delay *= 2; // Exponential backoff (1s -> 2s)
-                    continue;
-                }
+            if (response.status !== 429 && response.status < 500) {
+                retryable = false;
+                throw new Error(`OpenStreetMap HTTP ${response.status}`);
             }
-            
-            // Outros erros ou falhou todas as tentativas
-            console.warn(`[OSM Service] Falha na API (Status ${response.status}). Exibindo apenas locais do banco.`);
-            return [];
-            
+            if (attempt === maxAttempts) throw new Error(`OpenStreetMap HTTP ${response.status}`);
         } catch (error: unknown) {
             if (signal?.aborted) return [];
-            retries--;
-            if (retries > 0) {
-                await new Promise(res => setTimeout(res, delay));
-                delay *= 2;
-                continue;
-            }
-            console.warn("[OSM Service] Timeout ou Erro de rede:", error);
-            return [];
+            if (!retryable || attempt === maxAttempts) throw error;
         }
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        delay *= 2;
     }
-    return [];
+    throw new Error('Falha ao consultar o OpenStreetMap.');
 };
 
 export const mapOsmToPlace = (element: OsmElement): Place | null => {
     const tags = element.tags || {};
-    if (!tags.name) return null;
+    if (!tags.name || !['node', 'way', 'relation'].includes(element.type) || !Number.isSafeInteger(element.id)) return null;
 
     const vocations = [];
     
@@ -95,13 +83,13 @@ export const mapOsmToPlace = (element: OsmElement): Place | null => {
     if (tags.amenity === 'library' || tags.amenity === 'arts_centre' || tags.amenity === 'community_centre') vocations.push('cultura');
     if (tags.amenity === 'bar' || tags.amenity === 'cafe') vocations.push('social');
     
-    const lat = Number(element.lat || element.center?.lat);
-    const lon = Number(element.lon || element.center?.lon);
+    const lat = Number(element.lat ?? element.center?.lat);
+    const lon = Number(element.lon ?? element.center?.lon);
 
     if (!lat || !lon || isNaN(lat) || isNaN(lon)) return null;
 
     return {
-        id: `osm_${element.id}`,
+        id: `osm_${element.type}_${element.id}`,
         name: tags.name,
         latitude: lat,
         longitude: lon,

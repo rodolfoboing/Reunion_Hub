@@ -1,4 +1,4 @@
-import { collection, getDocs, limit, orderBy, query, where } from 'firebase/firestore';
+import { collection, getDocs, limit, orderBy, query, startAfter, where, type QueryDocumentSnapshot } from 'firebase/firestore';
 import { db } from '@/src/services/firebaseConfig';
 import type { Meeting } from '@/src/types';
 import { eventsOverlap, isEventClosed } from '@/src/utils/eventSchedule';
@@ -11,18 +11,18 @@ import { getDateAfterDays, normalizeDate } from '@/src/utils/dateUtils';
 
 export type CandidateSchedule = Pick<Meeting, 'date' | 'time' | 'endDate' | 'endTime'>;
 
-// Uma agenda pessoal raramente tem muitos eventos no mesmo par de dias; 20 cobre
-// o caso real com folga e mantém o custo previsível (§6).
+// A primeira consulta continua pequena; páginas extras só são lidas se houver
+// mais compromissos no intervalo solicitado.
 const CONFLICT_QUERY_LIMIT = 20;
 
 /**
  * Retorna os eventos do usuário que se sobrepõem a algum dos candidatos.
  *
- * Custo: **uma** consulta, com janela de datas fechada. Reaproveita o índice
+ * Custo: uma consulta na maioria das agendas; pagina apenas se necessário.
+ * Reaproveita o índice
  * `attendees CONTAINS + date DESC` que já existe em firestore.indexes.json —
- * por isso o `orderBy('date', 'desc')`. Como um evento dura no máximo 24h, um
- * conflito só pode começar no dia anterior ao primeiro candidato ou depois,
- * o que fecha a janela sem precisar varrer a agenda inteira.
+ * por isso o `orderBy('date', 'desc')`. Mesmo eventos antigos de até 24h só
+ * podem conflitar se começaram no dia do candidato ou no dia anterior.
  */
 export async function findScheduleConflicts(
     userId: string,
@@ -35,23 +35,36 @@ export async function findScheduleConflicts(
         .sort();
     if (dates.length === 0) return [];
 
-    const firstDay = new Date(`${dates[0]}T12:00:00-03:00`);
-    if (Number.isNaN(firstDay.getTime())) return [];
+    const relevantDates = [...new Set(dates.flatMap((date) => [
+        getDateAfterDays(-1, new Date(`${date}T12:00:00-03:00`)),
+        date,
+    ]))].sort();
+    // A UI permite até cinco ocorrências (dez dias com os dias anteriores).
+    // O fallback mantém a função correta caso outro consumidor ultrapasse o
+    // limite de 30 valores do operador `in`.
+    const dateFilter = relevantDates.length <= 30
+        ? [where('date', 'in', relevantDates)]
+        : [where('date', '>=', relevantDates[0]), where('date', '<=', relevantDates[relevantDates.length - 1])];
 
-    const snapshot = await getDocs(query(
-        collection(db, 'meetings'),
-        where('attendees', 'array-contains', userId),
-        where('date', '>=', getDateAfterDays(-1, firstDay)),
-        where('date', '<=', dates[dates.length - 1]),
-        orderBy('date', 'desc'),
-        limit(CONFLICT_QUERY_LIMIT),
-    ));
-
-    return snapshot.docs
-        .map((document) => ({ id: document.id, ...document.data() } as Meeting))
-        .filter((existing) => existing.id !== ignoreEventId
-            && !isEventClosed(existing)
-            && candidates.some((candidate) => eventsOverlap(candidate, existing)));
+    const conflicts: Meeting[] = [];
+    let cursor: QueryDocumentSnapshot | undefined;
+    while (true) {
+        const snapshot = await getDocs(query(
+            collection(db, 'meetings'),
+            where('attendees', 'array-contains', userId),
+            ...dateFilter,
+            orderBy('date', 'desc'),
+            limit(CONFLICT_QUERY_LIMIT),
+            ...(cursor ? [startAfter(cursor)] : []),
+        ));
+        conflicts.push(...snapshot.docs
+            .map((document) => ({ id: document.id, ...document.data() } as Meeting))
+            .filter((existing) => existing.id !== ignoreEventId
+                && !isEventClosed(existing)
+                && candidates.some((candidate) => eventsOverlap(candidate, existing))));
+        if (snapshot.size < CONFLICT_QUERY_LIMIT) return conflicts;
+        cursor = snapshot.docs[snapshot.docs.length - 1];
+    }
 }
 
 /** Resumo curto para alerta, sem estourar a caixa de diálogo. */

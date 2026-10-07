@@ -345,6 +345,7 @@ export default function ExploreScreen() {
         osmError,
         osmLoading,
         retry,
+        retryOsm,
         retryLocation,
         refreshPlace,
     } = useExploreData(mapFilters.osmPlaces, mapFilters.communityPlaces, isFocused, mapActive, searchRegion);
@@ -1222,9 +1223,9 @@ export default function ExploreScreen() {
                                 </View>
                             )}
                             {mapFilters.osmPlaces && osmError && !osmLoading && (
-                                <TouchableOpacity style={styles.mapStatusError} onPress={retry}>
+                                <TouchableOpacity style={styles.mapStatusError} onPress={retryOsm}>
                                     <Ionicons name="refresh" size={15} color="#B91C1C" />
-                                    <Text style={styles.mapStatusErrorText}>Overpass indisponível. Tentar novamente</Text>
+                                    <Text style={styles.mapStatusErrorText}>Falha ao buscar locais do OpenStreetMap. Tentar novamente</Text>
                                 </TouchableOpacity>
                             )}
                         </View>

@@ -226,7 +226,7 @@ service cloud.firestore {
         && request.resource.data.endsAt is timestamp
         && request.resource.data.startsAt > request.time
         && request.resource.data.endsAt >= request.resource.data.startsAt + duration.value(15, 'm')
-        && request.resource.data.endsAt <= request.resource.data.startsAt + duration.value(24, 'h')
+        && request.resource.data.endsAt <= request.resource.data.startsAt + duration.value(12, 'h')
         && request.resource.data.get('description', '') is string
         && request.resource.data.get('description', '').size() >= 1
         && request.resource.data.get('description', '').size() <= 2000

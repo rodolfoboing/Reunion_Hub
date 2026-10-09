@@ -420,8 +420,8 @@ async function deleteEventChatMessages(eventId) {
 function eventChatNotificationId(eventId, userId) {
     return `event_chat_${eventId}_${userId}`;
 }
-function eventChatPushMessages(delivery) {
-    return pushMessagesForUser(delivery.userId, delivery.title, delivery.body, {
+async function eventChatPushMessages(delivery) {
+    const messages = await pushMessagesForUser(delivery.userId, delivery.title, delivery.body, {
         path: `/event/chat/${delivery.eventChatId}`,
         eventChatId: delivery.eventChatId,
         notificationType: delivery.type,
@@ -434,6 +434,7 @@ function eventChatPushMessages(delivery) {
         tag: `event_chat_${delivery.eventChatId}`,
         collapseKey: `event_chat_${delivery.eventChatId}`,
     });
+    return messages.map((message) => (Object.assign(Object.assign({}, message), { expiresAtMs: delivery.expiresAtMs })));
 }
 // Um aviso pendente por participante/evento. A transação no estado privado do chat
 // resolve mensagens simultâneas sem consultar cada notificação a cada mensagem.
@@ -487,11 +488,28 @@ exports.notifyEventChatMessage = functions.runWith({
         if (created.length < 150)
             break;
     }
-    for (const delivery of deliveries) {
+    const currentTime = Date.now();
+    const expired = deliveries.filter((delivery) => delivery.expiresAtMs <= currentTime);
+    if (expired.length > 0) {
+        const batch = db.batch();
+        expired.forEach((delivery) => batch.delete(db.collection('pushOutbox').doc(delivery.id)));
+        await batch.commit();
+    }
+    const ready = deliveries.filter((delivery) => delivery.expiresAtMs > currentTime);
+    if (ready.length === 0)
+        return;
+    const pushResults = await Promise.allSettled(ready.map(async (delivery) => ({
+        delivery, messages: await eventChatPushMessages(delivery),
+    })));
+    const prepared = pushResults.flatMap((result) => result.status === 'fulfilled' ? [result.value] : []);
+    if (prepared.length < ready.length) {
+        console.error('[EventChat] push_preparation_failed', { eventId, failed: ready.length - prepared.length });
+    }
+    if (prepared.length > 0) {
         try {
-            const messages = await eventChatPushMessages(delivery);
+            const messages = prepared.flatMap(({ messages: userMessages }) => userMessages);
             const summary = await (0, pushNotifications_1.sendPushMessages)(db, messages);
-            await settlePushOutbox([delivery], messages, summary);
+            await settlePushOutbox(prepared.map(({ delivery }) => delivery), messages, summary);
         }
         catch (_a) {
             console.error('[EventChat] push_delivery_failed', { eventId });

@@ -1,5 +1,5 @@
 import { useLocalSearchParams, router, Stack } from 'expo-router';
-import { View, Text, StyleSheet, ScrollView, Alert, ActivityIndicator, TouchableOpacity, Linking, Modal, Share } from 'react-native';
+import { View, Text, StyleSheet, ScrollView, Alert as NativeAlert, ActivityIndicator, TouchableOpacity, Linking, Modal, Share, Platform } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { doc, getDoc, onSnapshot } from 'firebase/firestore';
@@ -28,6 +28,18 @@ type ReputationFeedback = {
     delta: number;
     title: string;
     body: string;
+};
+
+type EventAlertButton = {
+    text?: string;
+    style?: 'default' | 'cancel' | 'destructive';
+    onPress?: () => void;
+};
+
+type EventAlert = {
+    title: string;
+    message?: string;
+    buttons: EventAlertButton[];
 };
 
 // Helper para verificar se hoje é o dia do evento
@@ -68,10 +80,23 @@ export default function MeetingDetailsScreen() {
     const [startingConversation, setStartingConversation] = useState(false);
     const [reputationFeedback, setReputationFeedback] = useState<ReputationFeedback | null>(null);
     const [retryKey, setRetryKey] = useState(0);
+    const [eventAlert, setEventAlert] = useState<EventAlert | null>(null);
     const shownNotificationContext = useRef<string | null>(null);
     const shownReputationNotificationId = useRef<string | null>(null);
     const cleanedReminderEventId = useRef<string | null>(null);
     const promptedReviewEventId = useRef<string | null>(null);
+
+    // Alert.alert não apresenta seus botões no React Native Web. O diálogo da web
+    // usa Modal para que a ação de confirmar seja acessível também no navegador.
+    const Alert = {
+        alert: (title: string, message?: string, buttons?: EventAlertButton[]) => {
+            if (Platform.OS === 'web') {
+                setEventAlert({ title, message, buttons: buttons?.length ? buttons : [{ text: STRINGS.EVENT_ALERT_OK }] });
+            } else {
+                NativeAlert.alert(title, message, buttons);
+            }
+        },
+    };
 
     useFocusEffect(useCallback(() => {
         if (!eventId) return;
@@ -1026,7 +1051,34 @@ export default function MeetingDetailsScreen() {
                 onClose={() => setReputationFeedback(null)}
             />
             {meeting && <EventInviteModal visible={showInviteModal} eventId={meeting.id} onClose={() => setShowInviteModal(false)} />}
-            <ScreenTutorialModal screen="evento" visible={showTutorial && !loading && !error && meeting !== null && !showCheckInReview && !showInviteModal} onClose={() => void dismissTutorial()} />
+            <ScreenTutorialModal screen="evento" visible={showTutorial && !loading && !error && meeting !== null && !showCheckInReview && !showInviteModal && !eventAlert} onClose={() => void dismissTutorial()} />
+            <Modal visible={eventAlert !== null} transparent animationType="fade" onRequestClose={() => setEventAlert(null)}>
+                <View style={styles.alertOverlay}>
+                    <View style={styles.alertCard} accessibilityViewIsModal>
+                        <Text style={styles.alertTitle}>{eventAlert?.title}</Text>
+                        {!!eventAlert?.message && (
+                            <ScrollView style={styles.alertMessageScroll} contentContainerStyle={styles.alertMessageContent}>
+                                <Text style={styles.alertMessage}>{eventAlert.message}</Text>
+                            </ScrollView>
+                        )}
+                        <View style={styles.alertActions}>
+                            {eventAlert?.buttons.map((button, index) => (
+                                <TouchableOpacity
+                                    key={`${index}:${button.text ?? ''}`}
+                                    accessibilityRole="button"
+                                    style={[styles.alertButton, button.style !== 'cancel' && styles.alertPrimaryButton, button.style === 'destructive' && styles.alertDestructiveButton]}
+                                    onPress={() => {
+                                        setEventAlert(null);
+                                        button.onPress?.();
+                                    }}
+                                >
+                                    <Text style={[styles.alertButtonText, button.style !== 'cancel' && styles.alertPrimaryButtonText]}>{button.text ?? STRINGS.EVENT_ALERT_OK}</Text>
+                                </TouchableOpacity>
+                            ))}
+                        </View>
+                    </View>
+                </View>
+            </Modal>
             <Modal visible={showCheckInReview} transparent animationType="slide" onRequestClose={() => !reviewLoading && setShowCheckInReview(false)}>
                 <SafeAreaView style={styles.reviewOverlay} edges={['bottom']}>
                     <View style={styles.reviewSheet}>
@@ -1240,6 +1292,18 @@ const styles = StyleSheet.create({
     endEventButtonText: { color: '#FFF', fontSize: 14, fontWeight: '800' },
     autoCloseNotice: { flexDirection: 'row', alignItems: 'center', gap: 8, padding: 12, borderRadius: 12, backgroundColor: '#EEF2FF' },
     autoCloseNoticeText: { flex: 1, color: '#4338CA', fontSize: 12, lineHeight: 17, fontWeight: '600' },
+    alertOverlay: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 20, backgroundColor: 'rgba(15,23,42,0.55)' },
+    alertCard: { width: '100%', maxWidth: 440, maxHeight: '85%', padding: 20, borderRadius: 18, backgroundColor: '#FFF' },
+    alertTitle: { color: '#111827', fontSize: 19, fontWeight: '800' },
+    alertMessageScroll: { flexGrow: 0, marginTop: 10 },
+    alertMessageContent: { paddingBottom: 2 },
+    alertMessage: { color: '#374151', fontSize: 14, lineHeight: 21 },
+    alertActions: { gap: 8, marginTop: 20 },
+    alertButton: { minHeight: 44, paddingHorizontal: 12, borderRadius: 10, alignItems: 'center', justifyContent: 'center', backgroundColor: '#F3F4F6' },
+    alertPrimaryButton: { backgroundColor: '#4F46E5' },
+    alertDestructiveButton: { backgroundColor: '#DC2626' },
+    alertButtonText: { color: '#374151', fontSize: 14, fontWeight: '700', textAlign: 'center' },
+    alertPrimaryButtonText: { color: '#FFF' },
     reviewOverlay: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(15,23,42,0.55)' },
     reviewSheet: { maxHeight: '82%', padding: 20, borderTopLeftRadius: 24, borderTopRightRadius: 24, backgroundColor: '#FFF' },
     reviewTitle: { color: '#111827', fontSize: 21, fontWeight: '900' },

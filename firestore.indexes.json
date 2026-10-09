@@ -12,6 +12,15 @@
       "collectionGroup": "meetings",
       "queryScope": "COLLECTION",
       "fields": [
+        { "fieldPath": "attendees", "arrayConfig": "CONTAINS" },
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "endsAt", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "meetings",
+      "queryScope": "COLLECTION",
+      "fields": [
         { "fieldPath": "createdBy", "order": "ASCENDING" },
         { "fieldPath": "date", "order": "DESCENDING" }
       ]

@@ -1,4 +1,5 @@
 export const STRINGS = {
+    EVENT_ALERT_OK: 'Entendi',
     // Erros Gerais
     ERROR_DEFAULT: 'Ocorreu um erro inesperado. Tente novamente mais tarde.',
     ERROR_NETWORK: 'Sua conexão caiu ou está instável. Verifique sua internet e tente novamente.',
@@ -42,7 +43,7 @@ export const STRINGS = {
     EVENT_CHAT_NOTIFICATIONS_HELP: 'Um aviso por vez, até abrir o chat. Respeita o ajuste geral do Perfil.',
     EVENT_CHAT_NOTIFICATIONS_ERROR: 'Não foi possível salvar a preferência. Tente novamente.',
     EVENT_CHAT_NOTIFICATIONS_RETRY: 'Não foi possível carregar os avisos. Tentar novamente',
-    MANUAL_EVENT_CHAT: 'Quem criou ou confirmou presença pode conversar no chat da página do evento. Quando houver mensagens novas, você recebe um aviso por vez; abrir o chat libera o próximo. Desative os avisos só deste grupo na própria tela do chat. O ajuste geral de mensagens fica no Perfil. O chat fecha ao fim do evento e as mensagens são apagadas depois. Toque no nome de alguém para ver o perfil e denunciar, se necessário.',
+    MANUAL_EVENT_CHAT: 'Quem criou ou confirmou presença encontra o grupo na página do evento e na tela Mensagens, separado das conversas privadas. O grupo sai da lista ao término do evento e suas mensagens são apagadas depois. Quando houver mensagens novas, você recebe um aviso por vez; abrir o chat libera o próximo. Desative os avisos só deste grupo na própria tela do chat. O ajuste geral de mensagens fica no Perfil. Toque no nome de alguém para ver o perfil e denunciar, se necessário.',
     EVENT_REQUIRED_FIELDS_HINT: '* Campos obrigatórios',
     EXTERNAL_EVENT_LOCAL_TIME_LABEL: 'horário local do evento',
     EXTERNAL_EVENT_APP_TIME_LABEL: 'No Reunion Hub (horário de São Paulo)',

@@ -14,6 +14,8 @@ import { ScreenTutorialModal } from '@/src/components/ScreenTutorialModal';
 import { useFirstVisitTutorial } from '@/src/hooks/useFirstVisitTutorial';
 import { useUserProfile } from '@/src/hooks/useUserProfile';
 import { formatRelativeMessageTimestamp } from '@/src/utils/dateUtils';
+import { useEventChatInbox } from '@/src/features/messages/hooks/useEventChatInbox';
+import type { Meeting } from '@/src/types';
 
 function getErrorMessage(error: unknown): string {
     return error instanceof Error ? error.message : '';
@@ -25,6 +27,7 @@ export default function MessagesScreen() {
     const [loadError, setLoadError] = useState(false);
     const [listenerRetryKey, setListenerRetryKey] = useState(0);
     const userProfile = useUserProfile();
+    const eventInbox = useEventChatInbox(auth.currentUser?.uid);
 
     const [showNewChatModal, setShowNewChatModal] = useState(false);
     const [targetNick, setTargetNick] = useState('');
@@ -296,6 +299,34 @@ export default function MessagesScreen() {
         );
     };
 
+    const renderEventChat = (event: Meeting) => {
+        const unread = eventInbox.unreadEventIds.has(event.id);
+        const ending = event.endsAt?.toDate().toLocaleString('pt-BR', {
+            timeZone: 'America/Sao_Paulo', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
+        });
+        return (
+            <TouchableOpacity
+                key={event.id}
+                style={[styles.conversationItem, styles.eventChatItem]}
+                onPress={() => router.push({ pathname: '/event/chat/[id]', params: { id: event.id } })}
+                accessibilityRole="button"
+                accessibilityLabel={`Abrir chat temporário do evento ${event.title}`}
+            >
+                <View style={[styles.avatarContainer, styles.eventChatAvatar]}>
+                    <Ionicons name="people" size={23} color="#6D28D9" />
+                </View>
+                <View style={styles.contentContainer}>
+                    <View style={styles.rowTop}>
+                        <Text style={[styles.name, styles.eventChatName, unread && styles.nameUnread]} numberOfLines={1}>{event.title}</Text>
+                        {unread && <View style={styles.eventChatUnread}><Text style={styles.eventChatUnreadText}>Novo</Text></View>}
+                    </View>
+                    <Text style={styles.eventChatSubtitle} numberOfLines={1}>Grupo do evento · disponível até {ending || 'o término'}</Text>
+                </View>
+                <Ionicons name="chevron-forward" size={17} color="#8B5CF6" />
+            </TouchableOpacity>
+        );
+    };
+
     return (
         <View style={styles.container}>
             <LinearGradient
@@ -319,33 +350,49 @@ export default function MessagesScreen() {
                 <View style={styles.center}>
                     <ActivityIndicator size="large" color="#6366f1" />
                 </View>
-            ) : loadError ? (
-                <View style={styles.center}>
-                    <ErrorState
-                        title="Não foi possível carregar as conversas"
-                        message="Confira sua conexão e tente novamente."
-                        onRetry={() => {
-                            setLoading(true);
-                            setLoadError(false);
-                            setListenerRetryKey((current) => current + 1);
-                        }}
-                    />
-                </View>
             ) : (
                 <FlatList
-                    data={visibleConversations}
+                    data={loadError ? [] : visibleConversations}
                     renderItem={renderItem}
                     keyExtractor={item => item.id}
                     contentContainerStyle={styles.list}
                     showsVerticalScrollIndicator={false}
+                    ListHeaderComponent={
+                        <>
+                            {eventInbox.error && (
+                                <TouchableOpacity style={styles.eventChatError} onPress={eventInbox.retry} accessibilityRole="button">
+                                    <Text style={styles.eventChatErrorText}>Não foi possível atualizar os chats de eventos. Tentar novamente</Text>
+                                </TouchableOpacity>
+                            )}
+                            {eventInbox.eventChats.length > 0 && (
+                                <View style={styles.eventChatsSection}>
+                                    <Text style={styles.sectionTitle}>Chats de eventos</Text>
+                                    <Text style={styles.sectionHint}>Grupos temporários dos eventos de que você participa</Text>
+                                    {eventInbox.eventChats.map(renderEventChat)}
+                                </View>
+                            )}
+                            {loadError && (
+                                <ErrorState
+                                    title="Não foi possível carregar as conversas privadas"
+                                    message="Confira sua conexão e tente novamente."
+                                    onRetry={() => {
+                                        setLoading(true);
+                                        setLoadError(false);
+                                        setListenerRetryKey((current) => current + 1);
+                                    }}
+                                />
+                            )}
+                            {visibleConversations.length > 0 && !loadError && <Text style={styles.sectionTitle}>Conversas privadas</Text>}
+                        </>
+                    }
                     ListEmptyComponent={
-                        <View style={styles.emptyContainer}>
+                        !loadError && !eventInbox.loading && !eventInbox.error && eventInbox.eventChats.length === 0 ? <View style={styles.emptyContainer}>
                             <View style={styles.emptyIconBox}>
                                 <Ionicons name="chatbubbles-outline" size={48} color="#c7ccf0" />
                             </View>
                             <Text style={styles.emptyText}>Nenhuma conversa ainda.</Text>
-                            <Text style={styles.emptySubText}>Toque no ícone acima para iniciar um chat com seus amigos.</Text>
-                        </View>
+                            <Text style={styles.emptySubText}>Participe de um evento ou toque no ícone acima para iniciar uma conversa.</Text>
+                        </View> : null
                     }
                 />
             )}
@@ -521,6 +568,17 @@ const styles = StyleSheet.create({
         paddingHorizontal: 20,
         flexGrow: 1
     },
+    sectionTitle: { color: '#374151', fontSize: 15, fontWeight: '800', marginBottom: 7, marginTop: 5 },
+    sectionHint: { color: '#6B7280', fontSize: 12, marginBottom: 12 },
+    eventChatsSection: { marginBottom: 12 },
+    eventChatItem: { backgroundColor: '#F5F3FF', borderColor: '#DDD6FE' },
+    eventChatAvatar: { width: 54, height: 54, borderRadius: 17, alignItems: 'center', justifyContent: 'center', backgroundColor: '#EDE9FE' },
+    eventChatName: { flex: 1, color: '#4C1D95', marginRight: 8 },
+    eventChatSubtitle: { color: '#6D28D9', fontSize: 12 },
+    eventChatUnread: { backgroundColor: '#6D28D9', paddingHorizontal: 7, paddingVertical: 3, borderRadius: 10, marginRight: 8 },
+    eventChatUnreadText: { color: '#fff', fontSize: 10, fontWeight: '800' },
+    eventChatError: { backgroundColor: '#FEF3C7', padding: 12, borderRadius: 12, marginBottom: 14 },
+    eventChatErrorText: { color: '#92400E', fontSize: 12, fontWeight: '600' },
     conversationItem: {
         flexDirection: 'row',
         padding: 16,

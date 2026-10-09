@@ -26,9 +26,9 @@ export function ExternalEventModal({ event, onClose, onCreateMeeting }: Props) {
     return (
         <Modal visible transparent animationType="fade" onRequestClose={onClose}>
             <Pressable style={styles.backdrop} onPress={onClose}>
-                <SafeAreaView style={styles.safeArea} edges={['bottom']}>
+                <SafeAreaView style={styles.safeArea} edges={['top', 'bottom']}>
                     <Pressable style={styles.card} onPress={() => undefined}>
-                        <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.cardContent}>
+                        <ScrollView style={styles.scroll} showsVerticalScrollIndicator={false} contentContainerStyle={styles.cardContent}>
                         <View style={styles.header}>
                             <Text style={styles.source}>EVENTO EXTERNO · VIA TICKETMASTER</Text>
                             <TouchableOpacity onPress={onClose} accessibilityLabel="Fechar detalhes do evento externo">
@@ -62,9 +62,10 @@ export function ExternalEventModal({ event, onClose, onCreateMeeting }: Props) {
 
 const styles = StyleSheet.create({
     backdrop: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(15,23,42,0.55)' },
-    safeArea: { width: '100%' },
+    safeArea: { flex: 1, width: '100%', justifyContent: 'flex-end' },
     card: { backgroundColor: '#fff', borderTopLeftRadius: 24, borderTopRightRadius: 24, maxHeight: '90%' },
-    cardContent: { padding: 20, gap: 10 },
+    scroll: { flexShrink: 1 },
+    cardContent: { padding: 20, paddingBottom: 32, gap: 10 },
     header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
     source: { color: '#7C3AED', fontSize: 12, fontWeight: '800', letterSpacing: 0.5 },
     image: { width: '100%', height: 160, borderRadius: 12 },

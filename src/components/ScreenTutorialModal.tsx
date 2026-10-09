@@ -67,8 +67,9 @@ const TUTORIALS: Record<TutorialScreen, TutorialContent> = {
     mensagens: {
         icon: 'chatbubbles',
         title: 'Mensagens',
-        intro: 'Converse com quem você encontra nos eventos.',
+        intro: 'Converse em privado ou com o grupo de um evento.',
         topics: [
+            { icon: 'people-outline', title: 'Chats de eventos', text: 'Aparecem enquanto o evento está ativo. Um selo indica novidades; o grupo sai da lista ao terminar.' },
             { icon: 'at-outline', title: 'Comece pelo nick', text: 'Busque a pessoa pelo nick para abrir uma conversa, ou toque no perfil dela em qualquer evento.' },
             { icon: 'shield-checkmark-outline', title: 'Bloquear e denunciar', text: 'Pelo menu dentro da conversa. Enquanto o bloqueio estiver ativo, nenhuma das partes envia mensagem.' },
             { icon: 'warning-outline', title: 'Nunca envie dinheiro', text: 'Nem senhas, dados de cartão ou códigos de verificação. Ninguém do Reunion Hub vai pedir isso.' },

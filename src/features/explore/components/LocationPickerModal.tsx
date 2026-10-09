@@ -12,6 +12,7 @@ interface LocationPickerModalProps {
     location: Location.LocationObject | null;
     currentLat: number;
     currentLng: number;
+    suggestedCoordinate?: { latitude: number; longitude: number } | null;
     onLocationChange: (lat: number, lng: number) => void;
 }
 
@@ -21,19 +22,24 @@ export function LocationPickerModal({
     location,
     currentLat,
     currentLng,
+    suggestedCoordinate,
     onLocationChange
 }: LocationPickerModalProps) {
-    const fallbackLatitude = currentLat || location?.coords.latitude || -23.5505;
-    const fallbackLongitude = currentLng || location?.coords.longitude || -46.6333;
+    const currentCoordinate = currentLat !== 0 || currentLng !== 0
+        ? { latitude: currentLat, longitude: currentLng }
+        : null;
+    const fallbackCoordinate = currentCoordinate ?? suggestedCoordinate ?? location?.coords;
+    const fallbackLatitude = fallbackCoordinate?.latitude ?? -23.5505;
+    const fallbackLongitude = fallbackCoordinate?.longitude ?? -46.6333;
     const [pendingCoordinate, setPendingCoordinate] = useState({ latitude: fallbackLatitude, longitude: fallbackLongitude });
 
     useEffect(() => {
         if (!visible) return;
         setPendingCoordinate({
-            latitude: currentLat || location?.coords.latitude || -23.5505,
-            longitude: currentLng || location?.coords.longitude || -46.6333,
+            latitude: fallbackLatitude,
+            longitude: fallbackLongitude,
         });
-    }, [visible, currentLat, currentLng, location?.coords.latitude, location?.coords.longitude]);
+    }, [visible, fallbackLatitude, fallbackLongitude]);
 
     const confirmLocation = () => {
         onLocationChange(pendingCoordinate.latitude, pendingCoordinate.longitude);
@@ -53,12 +59,12 @@ export function LocationPickerModal({
                     </TouchableOpacity>
                 </View>
                 <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
-                    <MapView
+                    {visible && <MapView
                         style={{ ...StyleSheet.absoluteFillObject }}
                         provider={Platform.OS === 'android' ? PROVIDER_GOOGLE : PROVIDER_DEFAULT}
                         initialRegion={{
-                            latitude: pendingCoordinate.latitude,
-                            longitude: pendingCoordinate.longitude,
+                            latitude: fallbackLatitude,
+                            longitude: fallbackLongitude,
                             latitudeDelta: 0.005,
                             longitudeDelta: 0.005,
                         }}
@@ -66,7 +72,7 @@ export function LocationPickerModal({
                             setPendingCoordinate({ latitude: region.latitude, longitude: region.longitude });
                         }}
                         showsUserLocation
-                    />
+                    />}
                     <View style={styles.fixedMarker} pointerEvents="none">
                         <Ionicons name="location" size={48} color="#4F46E5" style={{ marginBottom: 24 }} />
                     </View>

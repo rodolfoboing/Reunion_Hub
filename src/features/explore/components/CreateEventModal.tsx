@@ -473,12 +473,13 @@ export function CreateEventModal({
                         que digitar o link zerava `time` e o relógio voltava para a
                         hora atual — só em evento online, porque só ele tem o campo. */}
                     <ScrollView pointerEvents={submitting ? 'none' : 'auto'} showsVerticalScrollIndicator={false} contentContainerStyle={styles.formContent}>
+                        <Text style={styles.requiredFieldsHint}>{STRINGS.EVENT_REQUIRED_FIELDS_HINT}</Text>
                         <View style={styles.inputGroup}>
-                            <Text style={styles.inputLabel}>Nome do Evento</Text>
+                            <Text style={styles.inputLabel}>Nome do Evento<Text style={styles.requiredMark}> *</Text></Text>
                             <TextInput style={styles.input} maxLength={TITLE_MAX_LENGTH} placeholderTextColor="#B6C0CE" placeholder="Ex: Café com Tecnologia" value={newMeeting.title} onChangeText={(text) => setNewMeeting((current) => ({ ...current, title: text }))} />
                         </View>
                         <View style={styles.inputGroup}>
-                            <Text style={styles.inputLabel}>Interesses Envolvidos</Text>
+                            <Text style={styles.inputLabel}>Interesses Envolvidos<Text style={styles.requiredMark}> *</Text></Text>
                             <View style={styles.interestsContainer}>
                                 {INTERESTS_OPTIONS.map((interest: string) => (
                                     <TouchableOpacity key={interest} style={[styles.interestChip, newMeeting.interests.includes(interest) && styles.interestChipSelected]} onPress={() => toggleInterest(interest)}>
@@ -488,7 +489,7 @@ export function CreateEventModal({
                             </View>
                         </View>
                         <View style={styles.inputGroup}>
-                            <Text style={styles.inputLabel}>Início</Text>
+                            <Text style={styles.inputLabel}>Início<Text style={styles.requiredMark}> *</Text></Text>
                             <View style={styles.row}>
                                 <TouchableOpacity style={[styles.input, { flex: 1, marginRight: 8, justifyContent: 'center' }]} onPress={() => setShowDatePicker(true)}>
                                     <Text style={{ color: newMeeting.date ? '#111827' : '#B6C0CE' }}>{newMeeting.date ? newMeeting.date.split('-').reverse().join('/') : 'Data (Dia/Mês)'}</Text>
@@ -499,7 +500,7 @@ export function CreateEventModal({
                             </View>
                         </View>
                         <View style={styles.inputGroup}>
-                            <Text style={styles.inputLabel}>Término</Text>
+                            <Text style={styles.inputLabel}>Término<Text style={styles.requiredMark}> *</Text></Text>
                             <View style={styles.row}>
                                 <TouchableOpacity style={[styles.input, { flex: 1, marginRight: 8, justifyContent: 'center' }]} onPress={() => setShowEndDatePicker(true)}>
                                     <Text style={{ color: newMeeting.endDate ? '#111827' : '#B6C0CE' }}>{newMeeting.endDate ? newMeeting.endDate.split('-').reverse().join('/') : 'Data de término'}</Text>
@@ -548,12 +549,12 @@ export function CreateEventModal({
                             }} />
                         )}
                         <View style={styles.inputGroup}>
-                            <Text style={styles.inputLabel}>{eventType === 'online' ? 'Plataforma (ex: Zoom, Meet)' : 'Nome do Local'}</Text>
+                            <Text style={styles.inputLabel}>{eventType === 'online' ? 'Plataforma (ex: Zoom, Meet)' : 'Nome do Local'}<Text style={styles.requiredMark}> *</Text></Text>
                             <TextInput style={styles.input} maxLength={LOCATION_MAX_LENGTH} placeholderTextColor="#B6C0CE" placeholder={eventType === 'online' ? "Ex: Google Meet" : "Ex: Parque do Ibirapuera, SP"} value={newMeeting.locationName} onChangeText={(text) => setNewMeeting((current) => ({ ...current, locationName: text }))} />
                         </View>
                         {eventType === 'online' && (
                             <View style={styles.inputGroup}>
-                                <Text style={styles.inputLabel}>Link da Reunião</Text>
+                                <Text style={styles.inputLabel}>Link da Reunião<Text style={styles.requiredMark}> *</Text></Text>
                                 <TextInput style={styles.input} maxLength={LINK_MAX_LENGTH} placeholderTextColor="#B6C0CE" placeholder="Cole aqui o link (https://...)" value={newMeeting.meetingLink}
                                     onChangeText={(text) => setNewMeeting((current) => ({ ...current, meetingLink: text }))}
                                     // Normaliza ao sair do campo, não a cada tecla: no Fabric o
@@ -569,16 +570,16 @@ export function CreateEventModal({
                         )}
                         {eventType === 'in-person' && (
                             <View style={styles.inputGroup}>
-                                <Text style={styles.inputLabel}>Localização Geográfica</Text>
+                                <Text style={styles.inputLabel}>Localização Geográfica<Text style={styles.requiredMark}> *</Text></Text>
                                 <TouchableOpacity style={styles.mapPickerButton} onPress={onOpenLocationPicker}>
                                     <Ionicons name="location" size={20} color="#4F46E5" />
-                                    <Text style={styles.mapPickerText}>{newMeeting.lat !== 0 ? 'Localização definida no mapa' : 'Selecionar no Mapa'}</Text>
+                                    <Text style={styles.mapPickerText}>{newMeeting.lat !== 0 || newMeeting.lng !== 0 ? 'Localização definida no mapa' : 'Selecionar no Mapa'}</Text>
                                 </TouchableOpacity>
                             </View>
                         )}
 
                         <View style={styles.inputGroup}>
-                            <Text style={styles.inputLabel}>Descrição Detalhada</Text>
+                            <Text style={styles.inputLabel}>Descrição Detalhada<Text style={styles.requiredMark}> *</Text></Text>
                             <TextInput style={[styles.input, styles.textArea]} maxLength={DESCRIPTION_MAX_LENGTH} placeholderTextColor="#B6C0CE" placeholder="Conte mais sobre o que vai acontecer no evento..." multiline numberOfLines={4} textAlignVertical="top" value={newMeeting.description} onChangeText={(text) => setNewMeeting((current) => ({ ...current, description: text }))} />
                         </View>
                         <View style={styles.inputGroup}>
@@ -595,7 +596,7 @@ export function CreateEventModal({
                         </View>
                         {repeatCount > 0 && (
                             <View style={styles.inputGroup}>
-                                <Text style={styles.inputLabel}>Data da próxima repetição</Text>
+                                <Text style={styles.inputLabel}>Data da próxima repetição<Text style={styles.requiredMark}> *</Text></Text>
                                 <TouchableOpacity style={[styles.input, { justifyContent: 'center' }]} onPress={() => setShowRepeatStartDatePicker(true)}>
                                     <Text style={{ color: repeatStartDate ? '#111827' : '#9CA3AF' }}>
                                         {repeatStartDate ? repeatStartDate.split('-').reverse().join('/') : 'Escolher próxima data'}
@@ -647,10 +648,12 @@ const styles = StyleSheet.create({
     modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'flex-end' },
     modalContent: { backgroundColor: '#fff', borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 24, maxHeight: '90%' },
     formContent: { paddingBottom: 12 },
+    requiredFieldsHint: { color: '#6B7280', fontSize: 12, marginBottom: 16 },
     modalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 },
     modalTitle: { fontSize: 20, fontWeight: 'bold', color: '#111827' },
     inputGroup: { marginBottom: 20 },
     inputLabel: { fontSize: 14, fontWeight: '600', color: '#374151', marginBottom: 8 },
+    requiredMark: { color: '#DC2626' },
     input: { backgroundColor: '#F3F4F6', borderRadius: 12, padding: 12, fontSize: 16, color: '#111827', borderWidth: 1, borderColor: '#E5E7EB' },
     textArea: { height: 120, paddingTop: 12 },
     modalFooter: { marginTop: 12, marginBottom: 24 },

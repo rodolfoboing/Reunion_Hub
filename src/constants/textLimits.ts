@@ -18,6 +18,9 @@
  */
 export const CHAT_MESSAGE_MAX_LENGTH = 2000;
 
+/** Mensagens do chat temporário do evento têm limite menor nas firestore.rules. */
+export const EVENT_CHAT_MESSAGE_MAX_LENGTH = 500;
+
 /**
  * Nick. Espelha o `NICK_PATTERN` de `src/services/profileService.ts`
  * (`/^[a-z0-9._-]{3,20}$/`), que é validado antes de reservar o documento em

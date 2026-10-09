@@ -33,6 +33,17 @@ service cloud.firestore {
         && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('reputation', 0) > -50;
     }
 
+    function canUseEventChat(meetingId) {
+      let meetingPath = /databases/$(database)/documents/meetings/$(meetingId);
+      return hasVerifiedEmail()
+        && exists(meetingPath)
+        && get(meetingPath).data.get('status', 'active') == 'active'
+        && get(meetingPath).data.endsAt is timestamp
+        && get(meetingPath).data.endsAt > request.time
+        && (get(meetingPath).data.createdBy == request.auth.uid
+          || request.auth.uid in get(meetingPath).data.attendees);
+    }
+
     function isValidReportReason(type, reason) {
       return (type == 'event' && reason in [
         'Informação enganosa ou incorreta',
@@ -256,6 +267,20 @@ service cloud.firestore {
         && !request.resource.data.keys().hasAny(['checkedIn'])
         && (!request.resource.data.keys().hasAny(['status']) || request.resource.data.status == 'active');
       allow update, delete: if false;
+
+      match /chatMessages/{messageId} {
+        allow list: if canUseEventChat(meetingId) && request.query.limit <= 50;
+        allow get: if canUseEventChat(meetingId);
+        allow create: if canUseEventChat(meetingId)
+          && request.resource.data.keys().hasOnly(['text', 'senderId', 'createdAt'])
+          && request.resource.data.keys().hasAll(['text', 'senderId', 'createdAt'])
+          && request.resource.data.senderId == request.auth.uid
+          && request.resource.data.text is string
+          && request.resource.data.text.size() >= 1
+          && request.resource.data.text.size() <= 500
+          && request.resource.data.createdAt == request.time;
+        allow update, delete: if false;
+      }
     }
 
     match /conversations/{conversationId} {

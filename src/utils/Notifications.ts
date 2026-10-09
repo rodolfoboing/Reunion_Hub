@@ -95,6 +95,7 @@ export type PushRegistration = {
 export type NotificationTarget = {
   conversationId?: string;
   meetingId?: string;
+  eventChatId?: string;
   notificationType?: string;
 };
 
@@ -119,7 +120,8 @@ export async function getExpoPushToken(devicePushToken?: Notifications.DevicePus
 
 export function getNotificationTarget(data: unknown): NotificationTarget | null {
   if (!data || typeof data !== 'object') return null;
-  const payload = data as { eventId?: unknown; meetingId?: unknown; conversationId?: unknown; notificationType?: unknown };
+  const payload = data as { eventId?: unknown; meetingId?: unknown; conversationId?: unknown; eventChatId?: unknown; notificationType?: unknown };
+  if (typeof payload.eventChatId === 'string') return { eventChatId: payload.eventChatId };
   if (typeof payload.conversationId === 'string') return { conversationId: payload.conversationId };
   if (typeof payload.meetingId === 'string') return { meetingId: payload.meetingId };
   if (typeof payload.eventId === 'string') return { meetingId: payload.eventId };
@@ -129,7 +131,7 @@ export function getNotificationTarget(data: unknown): NotificationTarget | null 
 
 export function getNotificationRoute(data: unknown): string | null {
   if (!data || typeof data !== 'object') return null;
-  const payload = data as { path?: unknown; url?: unknown; eventId?: unknown; meetingId?: unknown; conversationId?: unknown; notificationType?: unknown; notificationId?: unknown };
+  const payload = data as { path?: unknown; url?: unknown; eventId?: unknown; meetingId?: unknown; conversationId?: unknown; eventChatId?: unknown; notificationType?: unknown; notificationId?: unknown };
   const directPath = typeof payload.path === 'string' ? payload.path : payload.url;
   if (typeof directPath === 'string' && directPath.startsWith('/')) {
     if (directPath.startsWith('/event/')) {
@@ -146,6 +148,7 @@ export function getNotificationRoute(data: unknown): string | null {
     return directPath;
   }
   const target = getNotificationTarget(data);
+  if (target?.eventChatId) return `/event/chat/${target.eventChatId}`;
   if (target?.conversationId) return `/conversation/${target.conversationId}`;
   if (target?.meetingId) {
     const context = new URLSearchParams();
@@ -168,7 +171,9 @@ export async function setupNotifications(): Promise<PushRegistration> {
         && ((incomingTarget.conversationId
           && incomingTarget.conversationId === activeNotificationTarget.conversationId)
           || (incomingTarget.meetingId
-            && incomingTarget.meetingId === activeNotificationTarget.meetingId))
+            && incomingTarget.meetingId === activeNotificationTarget.meetingId)
+          || (incomingTarget.eventChatId
+            && incomingTarget.eventChatId === activeNotificationTarget.eventChatId))
       );
       return ({
       shouldShowAlert: !isCurrentTarget,

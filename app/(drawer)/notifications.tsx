@@ -10,7 +10,7 @@ import { markAllNotificationsAsRead } from '@/src/services/notificationReadServi
 
 const getIconName = (type: string, reputationDelta?: number): keyof typeof Ionicons.glyphMap => {
     if (typeof reputationDelta === 'number' && reputationDelta !== 0) return 'star-outline';
-    if (type === 'chat') return 'chatbubble-outline';
+    if (type === 'chat' || type === 'event_chat') return 'chatbubble-outline';
     if (type.startsWith('checkin_')) return 'checkmark-circle-outline';
     if (type === 'repeat_proposal') return 'repeat-outline';
     if (type.startsWith('report_')) return 'shield-checkmark-outline';
@@ -83,6 +83,10 @@ export default function NotificationsScreen() {
 
         if (notification.conversationId) {
             router.push(`/conversation/${notification.conversationId}` as never);
+            return;
+        }
+        if (notification.eventChatId) {
+            router.push(`/event/chat/${notification.eventChatId}` as never);
             return;
         }
         if (notification.type === 'repeat_proposal') {

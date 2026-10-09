@@ -20,6 +20,9 @@ import { EventInviteModal } from '@/src/features/events/components/EventInviteMo
 import { submitReport } from '@/src/services/reportService';
 import { ReputationFeedbackModal } from '@/src/components/ReputationFeedbackModal';
 import { describeConflicts, findScheduleConflicts } from '@/src/services/scheduleConflictService';
+import { STRINGS } from '@/src/constants/strings';
+import { ScreenTutorialModal } from '@/src/components/ScreenTutorialModal';
+import { useFirstVisitTutorial } from '@/src/hooks/useFirstVisitTutorial';
 
 type ReputationFeedback = {
     delta: number;
@@ -45,6 +48,7 @@ const formatDateDisplay = (dateString: string | undefined): string => {
 
 export default function MeetingDetailsScreen() {
     const eventClock = useEventClock();
+    const { visible: showTutorial, dismiss: dismissTutorial } = useFirstVisitTutorial('evento');
     const { id, notificationType, notificationId } = useLocalSearchParams<{ id?: string; notificationType?: string; notificationId?: string }>();
     const eventId = typeof id === 'string' ? id : null;
     const [meeting, setMeeting] = useState<Meeting | null>(null);
@@ -813,6 +817,24 @@ export default function MeetingDetailsScreen() {
                 </Text>
             </TouchableOpacity>
 
+            {(isCreator || isAttending) && meeting.endsAt && !endedBySchedule
+                && (!meeting.status || meeting.status === 'active') && (
+                <TouchableOpacity
+                    style={styles.eventChatSection}
+                    onPress={() => router.push({ pathname: '/event/chat/[id]', params: { id: eventId || '' } } as never)}
+                    activeOpacity={0.75}
+                    accessibilityRole="button"
+                    accessibilityLabel={STRINGS.EVENT_CHAT_OPEN}
+                >
+                    <View style={styles.inviteIcon}><FontAwesome name="comments" size={18} color="#4338CA" /></View>
+                    <View style={styles.inviteContent}>
+                        <Text style={styles.inviteTitle}>{STRINGS.EVENT_CHAT_OPEN}</Text>
+                        <Text style={styles.inviteHint}>{STRINGS.EVENT_CHAT_HINT}</Text>
+                    </View>
+                    <FontAwesome name="chevron-right" size={16} color="#6B7280" />
+                </TouchableOpacity>
+            )}
+
             {isAttending && !endedBySchedule && (!meeting.status || meeting.status === 'active') && (
                 <TouchableOpacity style={styles.inviteSection} onPress={() => setShowInviteModal(true)} activeOpacity={0.75}>
                     <View style={styles.inviteIcon}><FontAwesome name="user-plus" size={17} color="#4338CA" /></View>
@@ -1004,6 +1026,7 @@ export default function MeetingDetailsScreen() {
                 onClose={() => setReputationFeedback(null)}
             />
             {meeting && <EventInviteModal visible={showInviteModal} eventId={meeting.id} onClose={() => setShowInviteModal(false)} />}
+            <ScreenTutorialModal screen="evento" visible={showTutorial && !loading && !error && meeting !== null && !showCheckInReview && !showInviteModal} onClose={() => void dismissTutorial()} />
             <Modal visible={showCheckInReview} transparent animationType="slide" onRequestClose={() => !reviewLoading && setShowCheckInReview(false)}>
                 <SafeAreaView style={styles.reviewOverlay} edges={['bottom']}>
                     <View style={styles.reviewSheet}>
@@ -1098,6 +1121,7 @@ const styles = StyleSheet.create({
         marginTop: 8,
     },
     inviteSection: { flexDirection: 'row', alignItems: 'center', marginTop: 12, padding: 16, backgroundColor: '#F5F3FF', borderRadius: 16, borderWidth: 1, borderColor: '#DDD6FE' },
+    eventChatSection: { flexDirection: 'row', alignItems: 'center', marginTop: 12, padding: 16, backgroundColor: '#EEF2FF', borderRadius: 16, borderWidth: 1, borderColor: '#C7D2FE' },
     inviteIcon: { width: 38, height: 38, borderRadius: 19, alignItems: 'center', justifyContent: 'center', backgroundColor: '#EDE9FE', marginRight: 12 },
     inviteContent: { flex: 1 },
     inviteTitle: { color: '#312E81', fontWeight: '800', fontSize: 15 },

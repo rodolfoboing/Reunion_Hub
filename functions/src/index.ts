@@ -1,6 +1,7 @@
 import * as functions from 'firebase-functions';
 import * as admin from 'firebase-admin';
 import { createHash } from 'crypto';
+import { selectEventChatRecipients } from './eventChatNotifications';
 import {
     PushChannel,
     PushDeliverySummary,
@@ -161,6 +162,17 @@ type ChatPushDelivery = {
     title: string;
     body: string;
     conversationId: string;
+};
+
+type EventChatPushDelivery = {
+    id: string;
+    userId: string;
+    type: 'event_chat';
+    title: string;
+    body: string;
+    eventChatId: string;
+    messageId: string;
+    expiresAtMs: number;
 };
 
 async function settlePushOutbox(
@@ -546,6 +558,158 @@ async function notifyCancelledEvents(events: CancelledEventNotification[]): Prom
     console.info('[MeetingNotification] cancellations_delivered', { eventCount: events.length, recipientCount: deliveries.length });
 }
 
+async function deleteEventChatMessages(eventId: string): Promise<void> {
+    const messagesRef = db.collection('meetings').doc(eventId).collection('chatMessages');
+    let deleted = 0;
+    while (true) {
+        const page = await messagesRef.limit(400).get();
+        if (page.empty) break;
+        const batch = db.batch();
+        page.docs.forEach((message) => batch.delete(message.ref));
+        await batch.commit();
+        deleted += page.size;
+        if (page.size < 400) break;
+    }
+    if (deleted > 0) console.info('[EventChat] messages_deleted', { eventId, deleted });
+    const notificationsRef = db.collection('notifications');
+    while (true) {
+        const page = await notificationsRef.where('eventChatId', '==', eventId).limit(400).get();
+        if (page.empty) break;
+        const batch = db.batch();
+        page.docs.forEach((notification) => batch.delete(notification.ref));
+        await batch.commit();
+        if (page.size < 400) break;
+    }
+    await db.collection('eventChatStates').doc(eventId).delete();
+}
+
+function eventChatNotificationId(eventId: string, userId: string): string {
+    return `event_chat_${eventId}_${userId}`;
+}
+
+function eventChatPushMessages(delivery: EventChatPushDelivery): Promise<PushMessage[]> {
+    return pushMessagesForUser(delivery.userId, delivery.title, delivery.body, {
+        path: `/event/chat/${delivery.eventChatId}`,
+        eventChatId: delivery.eventChatId,
+        notificationType: delivery.type,
+        notificationId: eventChatNotificationId(delivery.eventChatId, delivery.userId),
+        outboxId: delivery.id,
+    }, {
+        channel: 'messages',
+        priority: 'high',
+        preferenceField: 'notifyMessages',
+        tag: `event_chat_${delivery.eventChatId}`,
+        collapseKey: `event_chat_${delivery.eventChatId}`,
+    });
+}
+
+// Um aviso pendente por participante/evento. A transação no estado privado do chat
+// resolve mensagens simultâneas sem consultar cada notificação a cada mensagem.
+export const notifyEventChatMessage = functions.runWith({
+    memory: '128MB', timeoutSeconds: 120, maxInstances: 5, failurePolicy: true,
+}).firestore.document('meetings/{eventId}/chatMessages/{messageId}').onCreate(async (snapshot, context) => {
+    const eventId = context.params.eventId as string;
+    const senderId = snapshot.data().senderId;
+    if (typeof senderId !== 'string') return;
+    const eventRef = db.collection('meetings').doc(eventId);
+    const stateRef = db.collection('eventChatStates').doc(eventId);
+    const deliveries: EventChatPushDelivery[] = [];
+    while (true) {
+        const created = await db.runTransaction(async (transaction) => {
+            const [eventSnapshot, stateSnapshot] = await Promise.all([transaction.get(eventRef), transaction.get(stateRef)]);
+            if (!eventSnapshot.exists) return [];
+            const event = eventSnapshot.data()!;
+            const end = getEventEndDate(event);
+            if (!isEventStillActive(event.status) || !end || end.getTime() <= Date.now()) return [];
+            const members = [...new Set([...stringIds(event.attendees), ...(typeof event.createdBy === 'string' ? [event.createdBy] : [])])];
+            if (!members.includes(senderId)) return [];
+            const recipients = selectEventChatRecipients(
+                stringIds(event.attendees),
+                typeof event.createdBy === 'string' ? event.createdBy : '',
+                senderId,
+                stringIds(stateSnapshot.data()?.mutedUserIds),
+                stringIds(stateSnapshot.data()?.notifiedUserIds),
+            );
+            if (recipients.length === 0) return [];
+            const title = 'Novas mensagens no evento';
+            const body = `Há novidades no chat de ${String(event.title || 'seu evento').slice(0, 80)}. Toque para abrir.`;
+            const newDeliveries = recipients.map((userId): EventChatPushDelivery => ({
+                id: `event_chat_push_${eventId}_${userId}_${snapshot.id}`,
+                userId, type: 'event_chat', title, body, eventChatId: eventId,
+                messageId: snapshot.id, expiresAtMs: end.getTime(),
+            }));
+            transaction.set(stateRef, { notifiedUserIds: admin.firestore.FieldValue.arrayUnion(...recipients) }, { merge: true });
+            newDeliveries.forEach((delivery) => {
+                transaction.set(db.collection('notifications').doc(eventChatNotificationId(eventId, delivery.userId)), {
+                    userId: delivery.userId, type: delivery.type, title, body,
+                    eventChatId: eventId, messageId: snapshot.id,
+                    createdAt: admin.firestore.FieldValue.serverTimestamp(), read: false,
+                });
+                transaction.set(db.collection('pushOutbox').doc(delivery.id), {
+                    delivery, createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                });
+            });
+            return newDeliveries;
+        });
+        deliveries.push(...created);
+        if (created.length < 150) break;
+    }
+    for (const delivery of deliveries) {
+        try {
+            const messages = await eventChatPushMessages(delivery);
+            const summary = await deliverPushMessages(db, messages);
+            await settlePushOutbox([delivery], messages, summary);
+        } catch {
+            console.error('[EventChat] push_delivery_failed', { eventId });
+        }
+    }
+});
+
+export const setEventChatNotifications = smallFunction.https.onCall(async (data, context) => {
+    const uid = requireAuthenticated(context);
+    const eventId = requireEventId(data);
+    const enabled = isRecord(data) ? data.enabled : undefined;
+    const markRead = isRecord(data) && data.markRead === true;
+    if (enabled !== undefined && typeof enabled !== 'boolean') {
+        throw new functions.https.HttpsError('invalid-argument', 'Preferência inválida.');
+    }
+    if (enabled === undefined && !markRead) {
+        throw new functions.https.HttpsError('invalid-argument', 'Informe uma ação para o chat.');
+    }
+    const eventRef = db.collection('meetings').doc(eventId);
+    const stateRef = db.collection('eventChatStates').doc(eventId);
+    const notificationRef = db.collection('notifications').doc(eventChatNotificationId(eventId, uid));
+    const currentEnabled = await db.runTransaction(async (transaction) => {
+        const [eventSnapshot, stateSnapshot] = await Promise.all([transaction.get(eventRef), transaction.get(stateRef)]);
+        if (!eventSnapshot.exists) throw new functions.https.HttpsError('not-found', 'Evento não encontrado.');
+        const event = eventSnapshot.data()!;
+        if (event.createdBy !== uid && !stringIds(event.attendees).includes(uid)) {
+            throw new functions.https.HttpsError('permission-denied', 'Você não participa deste evento.');
+        }
+        if (enabled !== undefined && (!isEventStillActive(event.status)
+            || (getEventEndDate(event)?.getTime() ?? 0) <= Date.now())) {
+            throw new functions.https.HttpsError('failed-precondition', 'O chat deste evento terminou.');
+        }
+        const wasNotified = stringIds(stateSnapshot.data()?.notifiedUserIds).includes(uid);
+        const wasMuted = stringIds(stateSnapshot.data()?.mutedUserIds).includes(uid);
+        const notificationSnapshot = (markRead || enabled === false) && wasNotified
+            ? await transaction.get(notificationRef) : null;
+        const updates: FirebaseFirestore.UpdateData<FirebaseFirestore.DocumentData> = {};
+        if (enabled !== undefined && enabled === wasMuted) updates.mutedUserIds = enabled
+            ? admin.firestore.FieldValue.arrayRemove(uid)
+            : admin.firestore.FieldValue.arrayUnion(uid);
+        if ((markRead || enabled === false) && wasNotified) {
+            updates.notifiedUserIds = admin.firestore.FieldValue.arrayRemove(uid);
+            if (notificationSnapshot?.exists && notificationSnapshot.data()?.read !== true) {
+                transaction.update(notificationRef, { read: true });
+            }
+        }
+        if (Object.keys(updates).length > 0) transaction.set(stateRef, updates, { merge: true });
+        return enabled === undefined ? !wasMuted : enabled;
+    });
+    return { enabled: currentEnabled };
+});
+
 // A gravação do evento e o envio podem ocorrer em processos diferentes. Este
 // gatilho recupera avisos que faltaram após uma falha entre essas duas etapas.
 export const recoverEventNotifications = functions.runWith({
@@ -556,6 +720,13 @@ export const recoverEventNotifications = functions.runWith({
     const before = change.before.data();
     const after = change.after.data();
     const eventId = context.params.eventId as string;
+    // O gatilho já acompanha todas as transições; nenhuma nova rotina periódica
+    // precisa consultar o histórico de chats. Com retry ativo, falha de limpeza
+    // repete este evento até todas as páginas de mensagens serem removidas.
+    if ((before.status === 'active' || before.status === undefined)
+        && ['awaiting_review', 'completed', 'cancelled'].includes(after.status)) {
+        await deleteEventChatMessages(eventId);
+    }
     const attendees = [...new Set(stringIds(after.attendees))].filter((userId) => userId !== after.createdBy);
     const eventTitle = typeof after.title === 'string' ? after.title : 'Evento';
     let deliveries: EventNotificationDelivery[] = [];
@@ -1052,11 +1223,15 @@ export const leaveEvent = smallFunction.https.onCall(async (data, context) => {
     const uid = requireAuthenticated(context);
     const eventId = requireEventId(data);
     const eventRef = db.collection('meetings').doc(eventId);
+    const chatStateRef = db.collection('eventChatStates').doc(eventId);
+    const chatNotificationRef = db.collection('notifications').doc(eventChatNotificationId(eventId, uid));
 
     const result = await db.runTransaction(async (transaction) => {
-        const [eventSnap, attendeeSnap] = await Promise.all([
+        const [eventSnap, attendeeSnap, chatStateSnap, chatNotificationSnap] = await Promise.all([
             transaction.get(eventRef),
             transaction.get(db.collection('users').doc(uid)),
+            transaction.get(chatStateRef),
+            transaction.get(chatNotificationRef),
         ]);
         if (!eventSnap.exists) throw new functions.https.HttpsError('not-found', 'Evento não encontrado.');
         const event = eventSnap.data()!;
@@ -1075,6 +1250,10 @@ export const leaveEvent = smallFunction.https.onCall(async (data, context) => {
             checkedIn: admin.firestore.FieldValue.arrayRemove(uid),
             pendingCheckIns: pendingCheckIns(event.pendingCheckIns).filter((request) => request.userId !== uid),
         });
+        if (chatStateSnap.exists && stringIds(chatStateSnap.data()?.notifiedUserIds).includes(uid)) {
+            transaction.update(chatStateRef, { notifiedUserIds: admin.firestore.FieldValue.arrayRemove(uid) });
+        }
+        if (chatNotificationSnap.exists) transaction.delete(chatNotificationRef);
         return {
             creatorId: typeof event.createdBy === 'string' ? event.createdBy : '',
             eventTitle: typeof event.title === 'string' ? event.title : 'seu evento',
@@ -2248,7 +2427,20 @@ async function cleanUpOldEventHistory(): Promise<number> {
         .get();
     if (oldEvents.empty) return 0;
 
-    const eventIds = oldEvents.docs.map((eventDocument) => eventDocument.id);
+    // Firestore não apaga subcoleções ao remover o documento pai. A limpeza
+    // normal ocorre no encerramento; isto cobre qualquer evento legado/órfão.
+    const readyToDelete: FirebaseFirestore.QueryDocumentSnapshot[] = [];
+    for (const eventDocument of oldEvents.docs) {
+        try {
+            await deleteEventChatMessages(eventDocument.id);
+            readyToDelete.push(eventDocument);
+        } catch {
+            console.error('[EventHistoryCleanup] chat_cleanup_failed', { eventId: eventDocument.id });
+        }
+    }
+    if (readyToDelete.length === 0) return 0;
+
+    const eventIds = readyToDelete.map((eventDocument) => eventDocument.id);
     const relatedDocuments: FirebaseFirestore.QueryDocumentSnapshot[] = [];
     for (let index = 0; index < eventIds.length; index += 10) {
         const eventIdChunk = eventIds.slice(index, index + 10);
@@ -2260,13 +2452,13 @@ async function cleanUpOldEventHistory(): Promise<number> {
         relatedDocuments.push(...invitations.docs, ...notifications.docs, ...checkInReviewDocuments.docs);
     }
 
-    const documentsToDelete = [...oldEvents.docs, ...relatedDocuments];
+    const documentsToDelete = [...readyToDelete, ...relatedDocuments];
     for (let index = 0; index < documentsToDelete.length; index += 400) {
         const batch = db.batch();
         documentsToDelete.slice(index, index + 400).forEach((document) => batch.delete(document.ref));
         await batch.commit();
     }
-    return oldEvents.size;
+    return readyToDelete.length;
 }
 
 /**
@@ -2375,8 +2567,9 @@ export const retryPendingEventPushes = dailyFunction.pubsub
         const pending = await db.collection('pushOutbox').orderBy('createdAt').limit(100).get();
         let retried = 0;
         for (const document of pending.docs) {
-            const delivery = document.data().delivery as EventNotificationDelivery | ChatPushDelivery | undefined;
-            if (!delivery?.userId || ('conversationId' in delivery ? !delivery.conversationId : !delivery.meetingId)) {
+            const delivery = document.data().delivery as EventNotificationDelivery | ChatPushDelivery | EventChatPushDelivery | undefined;
+            if (!delivery?.userId || ('conversationId' in delivery ? !delivery.conversationId
+                : 'eventChatId' in delivery ? !delivery.eventChatId : !delivery.meetingId)) {
                 await document.ref.delete();
                 continue;
             }
@@ -2391,7 +2584,25 @@ export const retryPendingEventPushes = dailyFunction.pubsub
             }
             try {
                 const isChat = 'conversationId' in delivery;
-                const allMessages = await pushMessagesForUser(delivery.userId, delivery.title, delivery.body, isChat ? {
+                const isEventChat = 'eventChatId' in delivery;
+                if (isEventChat) {
+                    const [notification, event, state] = await Promise.all([
+                        db.collection('notifications').doc(eventChatNotificationId(delivery.eventChatId, delivery.userId)).get(),
+                        db.collection('meetings').doc(delivery.eventChatId).get(),
+                        db.collection('eventChatStates').doc(delivery.eventChatId).get(),
+                    ]);
+                    const eventData = event.data();
+                    if (!notification.exists || notification.data()?.read === true
+                        || notification.data()?.messageId !== delivery.messageId
+                        || !eventData || !isEventStillActive(eventData.status)
+                        || !stringIds(state.data()?.notifiedUserIds).includes(delivery.userId)
+                        || stringIds(state.data()?.mutedUserIds).includes(delivery.userId)
+                        || (eventData.createdBy !== delivery.userId && !stringIds(eventData.attendees).includes(delivery.userId))) {
+                        await document.ref.delete();
+                        continue;
+                    }
+                }
+                const allMessages = isEventChat ? await eventChatPushMessages(delivery) : await pushMessagesForUser(delivery.userId, delivery.title, delivery.body, isChat ? {
                     path: `/conversation/${delivery.conversationId}`,
                     conversationId: delivery.conversationId,
                     notificationType: delivery.type,

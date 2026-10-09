@@ -1,7 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useCallback, useEffect, useState } from 'react';
 
-export type TutorialScreen = 'inicio' | 'explorar' | 'agenda' | 'mensagens' | 'perfil';
+export type TutorialScreen = 'inicio' | 'explorar' | 'agenda' | 'mensagens' | 'perfil' | 'evento';
 
 const storageKey = (screen: TutorialScreen) => `@reunionhub_tutorial_${screen}`;
 

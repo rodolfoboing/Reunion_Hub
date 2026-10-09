@@ -8,7 +8,9 @@ import { useIsFocused } from '@react-navigation/native';
 import MapView, { Marker, PROVIDER_GOOGLE, PROVIDER_DEFAULT } from '../../../src/components/MapView';
 
 import { useExploreData } from '@/src/features/explore/hooks/useExploreData';
+import { useExternalEvents } from '@/src/features/explore/hooks/useExternalEvents';
 import { CreateEventModal } from '@/src/features/explore/components/CreateEventModal';
+import { ExternalEventModal } from '@/src/features/explore/components/ExternalEventModal';
 import { PlaceModal } from '@/src/features/explore/components/PlaceModal';
 import { LocationPickerModal } from '@/src/features/explore/components/LocationPickerModal';
 import { EventInviteModal } from '@/src/features/events/components/EventInviteModal';
@@ -18,7 +20,10 @@ import { db, auth } from '../../../src/services/firebaseConfig';
 import { functions } from '../../../src/services/firebaseConfig';
 import { httpsCallable } from 'firebase/functions';
 import { hasMatchingInterest, INTERESTS_OPTIONS, normalizeInterests } from '@/src/constants/Interests';
+import { STRINGS } from '@/src/constants/strings';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { isTicketmasterConfigured, type ExternalEvent } from '@/src/services/ticketmasterEventService';
+import { getExternalMeetingSchedule } from '@/src/utils/externalMeetingSchedule';
 
 const { width } = Dimensions.get('window');
 
@@ -26,17 +31,20 @@ type StoredMapRegion = { latitude: number; longitude: number; latitudeDelta: num
 const LAST_MAP_REGION_KEY = '@reunionhub_last_map_region';
 const MAP_FILTERS_KEY = '@reunionhub_map_filters';
 
-type MapFilters = { events: boolean; communityPlaces: boolean; osmPlaces: boolean; googlePoi: boolean };
+type MapFilters = { events: boolean; externalEvents: boolean; communityPlaces: boolean; osmPlaces: boolean; googlePoi: boolean };
 
 /**
  * Padrão de instalação nova. Tudo ligado, EXCETO a Descoberta (OSM): ela consulta
  * a Overpass, uma API comunitária gratuita com limite de taxa, e o cache é só de
  * sessão — ligada para todos por padrão, multiplicaria o tráfego contra um
  * serviço que pode nos bloquear. Fica como opt-in consciente do usuário.
- * Os Pontos do Google são só estilo do mapa, sem custo, então vêm ligados.
+ * Os eventos externos usam a Ticketmaster, com cache e limite por região;
+ * sua preferência é carregada antes de iniciar a busca. Os Pontos do Google
+ * são só estilo do mapa, sem custo, então vêm ligados.
  */
 const DEFAULT_MAP_FILTERS: MapFilters = {
     events: true,
+    externalEvents: isTicketmasterConfigured && Platform.OS !== 'web',
     communityPlaces: true,
     osmPlaces: false,
     googlePoi: true,
@@ -52,6 +60,8 @@ function parseStoredMapFilters(raw: string | null): MapFilters {
         // padrão em vez de virar `undefined` e desligar o filtro sem querer.
         return {
             events: typeof record.events === 'boolean' ? record.events : DEFAULT_MAP_FILTERS.events,
+            externalEvents: isTicketmasterConfigured && Platform.OS !== 'web'
+                && (typeof record.externalEvents === 'boolean' ? record.externalEvents : DEFAULT_MAP_FILTERS.externalEvents),
             communityPlaces: typeof record.communityPlaces === 'boolean' ? record.communityPlaces : DEFAULT_MAP_FILTERS.communityPlaces,
             osmPlaces: typeof record.osmPlaces === 'boolean' ? record.osmPlaces : DEFAULT_MAP_FILTERS.osmPlaces,
             googlePoi: typeof record.googlePoi === 'boolean' ? record.googlePoi : DEFAULT_MAP_FILTERS.googlePoi,
@@ -305,8 +315,9 @@ const isMeetingAtPlace = (place: Place, meeting: Meeting) => {
         && Math.abs(Number(meeting.lng) - place.longitude) < 0.0001;
 };
 
-const FILTER_CONFIG: { key: 'events' | 'communityPlaces' | 'osmPlaces' | 'googlePoi'; label: string; icon: any; color: string }[] = [
+const FILTER_CONFIG: { key: keyof MapFilters; label: string; icon: any; color: string }[] = [
     { key: 'events', label: 'Eventos', icon: 'calendar', color: '#F59E0B' },
+    { key: 'externalEvents', label: 'Eventos externos', icon: 'ticket', color: '#7C3AED' },
     { key: 'communityPlaces', label: 'Locais da Comunidade', icon: 'people', color: '#6366F1' },
     { key: 'osmPlaces', label: 'Descoberta (OSM)', icon: 'earth', color: '#10B981' },
     { key: 'googlePoi', label: 'Pontos do Google', icon: 'location', color: '#EC4899' },
@@ -328,6 +339,7 @@ export default function ExploreScreen() {
 
     // Filtros do Mapa — a escolha do usuário é gravada e vale até ele mudar.
     const [mapFilters, setMapFilters] = useState<MapFilters>(DEFAULT_MAP_FILTERS);
+    const [mapFiltersLoaded, setMapFiltersLoaded] = useState(false);
     const [mapInitialRegion, setMapInitialRegion] = useState<StoredMapRegion>(DEFAULT_MAP_REGION);
     const [searchRegion, setSearchRegion] = useState<StoredMapRegion>(DEFAULT_MAP_REGION);
     const [storedRegionStatus, setStoredRegionStatus] = useState<'loading' | 'available' | 'missing'>('loading');
@@ -349,6 +361,9 @@ export default function ExploreScreen() {
         retryLocation,
         refreshPlace,
     } = useExploreData(mapFilters.osmPlaces, mapFilters.communityPlaces, isFocused, mapActive, searchRegion);
+    const externalDiscovery = useExternalEvents(
+        mapActive && storedRegionStatus !== 'loading' && mapFiltersLoaded && mapFilters.externalEvents, searchRegion,
+    );
     const locationWarningText = locationIssue === 'permission-denied'
         ? canAskLocationPermissionAgain
             ? 'Permita o acesso à localização e toque para tentar novamente.'
@@ -392,6 +407,7 @@ export default function ExploreScreen() {
 
     const [filtersOpen, setFiltersOpen] = useState(false);
     const [headerHeight, setHeaderHeight] = useState(0);
+    const [exploreHeight, setExploreHeight] = useState(0);
 
     // Mantém o nome local, mas a leitura/gravação agora vem do hook compartilhado,
     // que também honra a chave legada `@reunionhub_has_seen_map_onboarding`.
@@ -407,13 +423,15 @@ export default function ExploreScreen() {
     });
 
     const [selectedPlace, setSelectedPlace] = useState<Place | null>(null);
+    const [selectedExternalEvent, setSelectedExternalEvent] = useState<ExternalEvent | null>(null);
+    const [suggestedMeetingLocation, setSuggestedMeetingLocation] = useState<{ latitude: number; longitude: number } | null>(null);
     const [showPlaceModal, setShowPlaceModal] = useState(false);
     const [frequentersProfiles, setFrequentersProfiles] = useState<User[]>([]);
     const [loadingProfiles, setLoadingProfiles] = useState(false);
 
-    // Carga única da preferência gravada. A Descoberta (OSM) nasce desligada, então
-    // nada é buscado antes desta leitura: se o usuário a tiver ligado, a busca começa
-    // ao chegar aqui, sem nenhuma consulta desperdiçada no meio.
+    // Carrega as preferências antes de buscar eventos externos: quem os desligou
+    // não deve fazer sequer uma chamada enquanto o AsyncStorage ainda responde.
+    // A Descoberta (OSM) continua desligada por padrão.
     useEffect(() => {
         let cancelled = false;
         AsyncStorage.getItem(MAP_FILTERS_KEY)
@@ -422,6 +440,9 @@ export default function ExploreScreen() {
             })
             .catch(() => {
                 console.warn('[Explore] map_filters_load_failed');
+            })
+            .finally(() => {
+                if (!cancelled) setMapFiltersLoaded(true);
             });
         return () => { cancelled = true; };
     }, []);
@@ -627,6 +648,7 @@ export default function ExploreScreen() {
 
     const handleCreateEventAtSelectedPlace = () => {
         if (!selectedPlace) return;
+        setSuggestedMeetingLocation(null);
         // Funcional: o spread do estado capturado no render descartava qualquer
         // alteração feita entre a renderização e este toque — data e hora inclusive.
         setNewMeeting((current) => ({
@@ -638,6 +660,28 @@ export default function ExploreScreen() {
             placeId: selectedPlace.id,
         }));
         setShowPlaceModal(false);
+        pendingCreateEventTask.current?.cancel();
+        pendingCreateEventTask.current = InteractionManager.runAfterInteractions(() => {
+            if (!isExploreMounted.current) return;
+            setModalVisible(true);
+            pendingCreateEventTask.current = null;
+        });
+    };
+
+    const handleCreateMeetingFromExternal = (externalEvent: ExternalEvent) => {
+        const suggestedSchedule = getExternalMeetingSchedule(externalEvent);
+        setSelectedExternalEvent(null);
+        setSelectedPlace(null);
+        setEventType('in-person');
+        setSuggestedMeetingLocation({ latitude: externalEvent.latitude, longitude: externalEvent.longitude });
+        setRepeatCount(0);
+        setRepeatStartDate('');
+        setNewMeeting({
+            title: `Encontro para ${externalEvent.title.trim()}`.slice(0, 100),
+            interests: [], description: '', locationName: externalEvent.venueName.slice(0, 150),
+            ...suggestedSchedule,
+            lat: externalEvent.latitude, lng: externalEvent.longitude, type: 'in-person', meetingLink: '', placeId: '',
+        });
         pendingCreateEventTask.current?.cancel();
         pendingCreateEventTask.current = InteractionManager.runAfterInteractions(() => {
             if (!isExploreMounted.current) return;
@@ -927,7 +971,7 @@ export default function ExploreScreen() {
     }
 
     return (
-        <View style={styles.container}>
+        <View style={styles.container} onLayout={(event) => setExploreHeight(event.nativeEvent.layout.height)}>
             <LinearGradient
                 colors={['#6366F1', '#8B5CF6']}
                 start={{ x: 0, y: 0 }}
@@ -1024,9 +1068,16 @@ export default function ExploreScreen() {
                         style={styles.filtersDismissOverlay}
                         onPress={() => setFiltersOpen(false)}
                     />
-                    <View style={[styles.filtersPanel, { top: headerHeight + 8 }]}>
+                    <ScrollView
+                        style={[styles.filtersPanel, {
+                            top: headerHeight + 8,
+                            maxHeight: Math.max(0, exploreHeight - headerHeight - 20),
+                        }]}
+                        contentContainerStyle={styles.filtersPanelContent}
+                        showsVerticalScrollIndicator={false}
+                    >
                         <Text style={styles.filtersPanelTitle}>O que mostrar no mapa</Text>
-                        {FILTER_CONFIG.map((f) => (
+                        {FILTER_CONFIG.filter((filter) => filter.key !== 'externalEvents' || (isTicketmasterConfigured && Platform.OS !== 'web')).map((f) => (
                             <View key={f.key} style={styles.filterRow}>
                                 <View style={styles.filterRowLeft}>
                                     <View style={[styles.filterIconChip, { backgroundColor: `${f.color}1A` }]}>
@@ -1036,6 +1087,7 @@ export default function ExploreScreen() {
                                 </View>
                                 <Switch
                                     value={mapFilters[f.key]}
+                                    disabled={!mapFiltersLoaded}
                                     onValueChange={() => toggleMapFilter(f.key)}
                                     trackColor={{ false: '#E5E7EB', true: f.color }}
                                     thumbColor="#fff"
@@ -1044,8 +1096,9 @@ export default function ExploreScreen() {
                             </View>
                         ))}
                         <Text style={styles.filterHint}>
-                            A Descoberta (OSM) busca locais em um serviço externo e vem desligada.
-                            Sua escolha fica salva para as próximas vezes.
+                            {isTicketmasterConfigured && Platform.OS !== 'web'
+                                ? STRINGS.EXPLORE_EXTERNAL_FILTER_HINT
+                                : STRINGS.EXPLORE_FILTER_HINT}
                         </Text>
                         {changedFilterCount > 0 && (
                             <TouchableOpacity
@@ -1058,7 +1111,7 @@ export default function ExploreScreen() {
                                 <Text style={styles.filterResetText}>Restaurar padrão</Text>
                             </TouchableOpacity>
                         )}
-                    </View>
+                    </ScrollView>
                 </>
             )}
 
@@ -1196,6 +1249,17 @@ export default function ExploreScreen() {
                                 />
                                 );
                             })}
+                            {mapFilters.externalEvents && externalDiscovery.events.map((externalEvent) => (
+                                <Marker
+                                    key={externalEvent.id}
+                                    coordinate={{ latitude: externalEvent.latitude, longitude: externalEvent.longitude }}
+                                    pinColor="#7C3AED"
+                                    title={externalEvent.title}
+                                    description={`${externalEvent.venueName} · Ticketmaster`}
+                                    onPress={() => setSelectedExternalEvent(externalEvent)}
+                                    zIndex={0}
+                                />
+                            ))}
                         </MapView>
                         <View style={styles.mapStatusContainer} pointerEvents="box-none">
                             {(locationStatus === 'denied' || locationStatus === 'error') && (
@@ -1228,6 +1292,18 @@ export default function ExploreScreen() {
                                     <Text style={styles.mapStatusErrorText}>Falha ao buscar locais do OpenStreetMap. Tentar novamente</Text>
                                 </TouchableOpacity>
                             )}
+                            {mapFilters.externalEvents && externalDiscovery.loading && (
+                                <View style={styles.mapStatusInfo}>
+                                    <ActivityIndicator size="small" color="#7C3AED" />
+                                    <Text style={styles.mapStatusInfoText}>Buscando eventos externos...</Text>
+                                </View>
+                            )}
+                            {mapFilters.externalEvents && externalDiscovery.error && !externalDiscovery.loading && (
+                                <TouchableOpacity style={styles.mapStatusError} onPress={externalDiscovery.retry}>
+                                    <Ionicons name="refresh" size={15} color="#B91C1C" />
+                                    <Text style={styles.mapStatusErrorText}>Falha ao buscar eventos externos. Tentar novamente</Text>
+                                </TouchableOpacity>
+                            )}
                         </View>
                         <View style={styles.mapActions}>
                             <TouchableOpacity style={styles.fab} onPress={() => {
@@ -1254,6 +1330,7 @@ export default function ExploreScreen() {
             <View style={styles.actions}>
                 <TouchableOpacity style={styles.createButton} onPress={() => {
                     setSelectedPlace(null);
+                    setSuggestedMeetingLocation(null);
                     setNewMeeting((current) => ({
                         ...current,
                         locationName: '',
@@ -1287,6 +1364,12 @@ export default function ExploreScreen() {
                 repeatStartDate={repeatStartDate}
                 setRepeatStartDate={setRepeatStartDate}
                 onCreated={setCreatedEventIdForInvite}
+            />
+
+            <ExternalEventModal
+                event={selectedExternalEvent}
+                onClose={() => setSelectedExternalEvent(null)}
+                onCreateMeeting={handleCreateMeetingFromExternal}
             />
 
             <PlaceModal
@@ -1323,8 +1406,10 @@ export default function ExploreScreen() {
                 location={location}
                 currentLat={newMeeting.lat}
                 currentLng={newMeeting.lng}
+                suggestedCoordinate={suggestedMeetingLocation}
                 onLocationChange={(lat, lng) => {
                     setSelectedPlace(null);
+                    setSuggestedMeetingLocation(null);
                     setNewMeeting((current) => ({ ...current, lat, lng, placeId: '' }));
                 }}
             />
@@ -1396,10 +1481,11 @@ const styles = StyleSheet.create({
     },
     filtersPanel: {
         position: 'absolute', right: 20, width: 250,
-        backgroundColor: '#fff', borderRadius: 20, padding: 18,
+        backgroundColor: '#fff', borderRadius: 20,
         shadowColor: '#000', shadowOpacity: 0.18, shadowRadius: 20,
         shadowOffset: { width: 0, height: 10 }, elevation: 12, zIndex: 50,
     },
+    filtersPanelContent: { padding: 18 },
     filtersPanelTitle: { fontSize: 11, fontWeight: '800', color: '#9CA3AF', textTransform: 'uppercase', letterSpacing: 0.6, marginBottom: 12 },
     filterHint: { fontSize: 11, color: '#9CA3AF', lineHeight: 15, marginTop: 8 },
     attendingNotice: { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: '#ECFDF5', borderRadius: 12, paddingVertical: 10, paddingHorizontal: 12, marginBottom: 12 },

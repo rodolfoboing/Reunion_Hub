@@ -125,6 +125,7 @@ export interface Notification {
     title: string;
     body: string;
     meetingId?: string;
+    eventChatId?: string;
     conversationId?: string;
     path?: string;
     createdAt?: Timestamp | null;

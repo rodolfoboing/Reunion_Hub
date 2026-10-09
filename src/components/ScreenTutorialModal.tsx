@@ -1,11 +1,16 @@
 import { Ionicons } from '@expo/vector-icons';
-import { Modal, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { Modal, Platform, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import type { TutorialScreen } from '@/src/hooks/useFirstVisitTutorial';
+import { STRINGS } from '@/src/constants/strings';
+import { isTicketmasterConfigured } from '@/src/services/ticketmasterEventService';
+
+const hasExternalEvents = isTicketmasterConfigured && Platform.OS !== 'web';
 
 type TutorialTopic = {
     icon: keyof typeof Ionicons.glyphMap;
     title: string;
     text: string;
+    color?: string;
 };
 
 type TutorialContent = {
@@ -15,16 +20,22 @@ type TutorialContent = {
     topics: TutorialTopic[];
 };
 
+const externalExploreTopic: TutorialTopic = {
+    icon: 'ticket', title: 'Ingresso', text: STRINGS.EXPLORE_TUTORIAL_EXTERNAL_EVENT, color: '#7C3AED',
+};
+
 /**
- * Conteúdo curto por tela, mostrado uma única vez na primeira visita. Três
- * tópicos no máximo: quem acabou de instalar não lê um manual, e o manual
- * completo continua disponível no Início e pelo Perfil.
+ * Conteúdo curto por tela, mostrado uma única vez na primeira visita.
+ * O Explorar usa uma legenda de ícones; o manual completo continua disponível
+ * no Início e pelo Perfil.
  */
 const TUTORIALS: Record<TutorialScreen, TutorialContent> = {
     inicio: {
         icon: 'home',
         title: 'Bem-vindo ao Reunion Hub',
-        intro: 'Esta é a sua tela inicial. Ela reúne três listas, e você passa o dedo para o lado em cada uma.',
+        intro: hasExternalEvents
+            ? STRINGS.HOME_TUTORIAL_INTRO_EXTERNAL
+            : 'Esta é a sua tela inicial. Ela reúne três listas, e você passa o dedo para o lado em cada uma.',
         topics: [
             { icon: 'sparkles-outline', title: 'Eventos do seu interesse', text: 'Escolhidos pelas tags do seu perfil. Quanto mais interesses você marcar, melhores ficam as sugestões.' },
             { icon: 'calendar-outline', title: 'Seus próximos eventos', text: 'O que você já confirmou. O selo mostra se é hoje, em breve ou se já começou.' },
@@ -34,11 +45,13 @@ const TUTORIALS: Record<TutorialScreen, TutorialContent> = {
     explorar: {
         icon: 'compass',
         title: 'Explorar',
-        intro: 'Aqui você encontra eventos e locais da comunidade, no mapa ou em lista.',
+        intro: STRINGS.EXPLORE_TUTORIAL_INTRO,
         topics: [
-            { icon: 'map-outline', title: 'Mapa e lista', text: 'Alterne entre os dois no topo. Toque num marcador para ver o que está acontecendo ali.' },
-            { icon: 'options-outline', title: 'Filtros', text: 'Escolha o que aparece no mapa. A Descoberta (OSM) vem desligada porque busca lugares num serviço externo; ligue quando quiser explorar mais. Sua escolha fica salva.' },
-            { icon: 'add-circle-outline', title: 'Criar evento', text: 'Presencial, marcando o local no mapa, ou online, com o link da reunião.' },
+            { icon: 'calendar', title: 'Calendário', text: STRINGS.EXPLORE_TUTORIAL_APP_EVENT, color: '#F59E0B' },
+            ...(hasExternalEvents ? [externalExploreTopic] : []),
+            { icon: 'people', title: 'Pessoas', text: STRINGS.EXPLORE_TUTORIAL_COMMUNITY_PLACE, color: '#6366F1' },
+            { icon: 'earth', title: 'Globo', text: STRINGS.EXPLORE_TUTORIAL_OSM_PLACE, color: '#10B981' },
+            { icon: 'location', title: 'Pino rosa', text: STRINGS.EXPLORE_TUTORIAL_GOOGLE_POI, color: '#EC4899' },
         ],
     },
     agenda: {
@@ -69,6 +82,18 @@ const TUTORIALS: Record<TutorialScreen, TutorialContent> = {
             { icon: 'pricetags-outline', title: 'Interesses', text: 'São eles que alimentam as sugestões no Início, no Explorar e na Agenda. Escolha até 10.' },
             { icon: 'lock-closed-outline', title: 'Privacidade', text: 'Em Editar Perfil você decide se mostra os lugares que frequenta e os que fundou. Os dois começam visíveis.' },
             { icon: 'star-outline', title: 'Reputação', text: 'Toque no número para entender como ela sobe e desce. Presença confirmada soma; faltar subtrai.' },
+        ],
+    },
+    evento: {
+        icon: 'calendar-outline',
+        title: 'Página do evento',
+        intro: 'Tudo para se organizar e encontrar outras pessoas está aqui.',
+        topics: [
+            { icon: 'people-outline', title: 'Participantes', text: 'Veja quem confirmou presença e abra o perfil das pessoas.' },
+            { icon: 'chatbubbles-outline', title: 'Chat do evento', text: 'Ao participar, combine detalhes com o grupo. No chat, você pode desligar os avisos deste evento.' },
+            { icon: 'person-add-outline', title: 'Convites', text: 'Convide pessoas para participar e compartilhe o evento.' },
+            { icon: 'checkmark-circle-outline', title: 'Presença', text: 'Confirme participação e faça check-in durante o evento. Depois, acompanhe o resultado.' },
+            { icon: 'ellipsis-horizontal', title: 'Outras ações', text: 'O organizador pode gerenciar o evento. Você também pode denunciar problemas.' },
         ],
     },
 };
@@ -104,8 +129,8 @@ export function ScreenTutorialModal({
                     <ScrollView style={styles.topicsScroll} contentContainerStyle={styles.topics} showsVerticalScrollIndicator={false}>
                         {content.topics.map((topic) => (
                             <View key={topic.title} style={styles.topic}>
-                                <View style={styles.topicIcon}>
-                                    <Ionicons name={topic.icon} size={16} color="#4F46E5" />
+                                <View style={[styles.topicIcon, topic.color && { backgroundColor: `${topic.color}1A` }]}>
+                                    <Ionicons name={topic.icon} size={16} color={topic.color || '#4F46E5'} />
                                 </View>
                                 <View style={styles.topicText}>
                                     <Text style={styles.topicTitle}>{topic.title}</Text>
@@ -146,9 +171,9 @@ const styles = StyleSheet.create({
     iconCircle: { alignSelf: 'center', width: 54, height: 54, borderRadius: 27, backgroundColor: '#EEF2FF', alignItems: 'center', justifyContent: 'center' },
     title: { marginTop: 12, fontSize: 20, fontWeight: '900', color: '#111827', textAlign: 'center' },
     intro: { marginTop: 6, fontSize: 14, lineHeight: 20, color: '#4B5563', textAlign: 'center' },
-    topicsScroll: { flexGrow: 0, marginTop: 16 },
+    topicsScroll: { flexGrow: 0, flexShrink: 1, minHeight: 0, marginTop: 12 },
     topics: { paddingBottom: 2 },
-    topic: { flexDirection: 'row', gap: 11, paddingVertical: 8 },
+    topic: { flexDirection: 'row', gap: 11, paddingVertical: 6 },
     topicIcon: { width: 32, height: 32, borderRadius: 11, backgroundColor: '#F5F3FF', alignItems: 'center', justifyContent: 'center' },
     topicText: { flex: 1 },
     topicTitle: { fontSize: 14, fontWeight: '800', color: '#312E81', marginBottom: 2 },
